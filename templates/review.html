@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}人工审核 · 文章质检台{% endblock %}
+{% block page_id %}review{% endblock %}
+{% block eyebrow %}内容流水线 / 人工节点{% endblock %}
+{% block heading %}人工审核{% endblock %}
+{% block topbar_actions %}<span class="queue-count"><i data-lucide="inbox"></i>待处理 <strong>{{ articles|length }}</strong></span>{% endblock %}
+
+{% block content %}
+  <div class="review-intro"><div><p class="lead">自动质检无法确认的内容会停在这里。</p><p class="muted">审核通过后，文章会进入待发队列；驳回的文章不会自动发布。</p></div><span class="review-rule"><i data-lucide="info"></i>正文异常、广告和脏内容需人工确认</span></div>
+  {% if articles %}
+    <section class="review-queue">
+      {% for article in articles %}
+      <article class="review-item" data-review-item data-article-id="{{ article.id }}">
+        <div class="review-item-head"><div class="article-kicker"><span class="source-code">{{ article.source }}</span><span class="muted">#{{ article.id }}</span><time>{{ article.updated_at|default(article.created_at|default('-')) }}</time></div><span class="status-pill status-{{ article.status|lower }}">{{ article.status_label|default('待人工审核') }}</span></div>
+        <h2><a href="{{ url_for('article_detail', article_id=article.id) }}">{{ article.title|default('未命名文章', true) }}</a></h2>
+        <div class="review-info-grid"><div><span>栏目</span><strong>{{ article.tab_name|default('未配置', true) }}</strong></div><div><span>质检提示</span><strong class="warning-text">{{ article.quality_reason|default('请检查标题、正文和广告内容', true) }}</strong></div><div><span>原文</span><a href="{{ article.source_url }}" target="_blank" rel="noreferrer">{{ article.source_url|default('-') }}</a></div></div>
+        <div class="review-excerpt">{{ article.body_excerpt|default(article.body|default('暂无正文', true), true) }}</div>
+        <div class="review-actions"><a class="button button-quiet" href="{{ url_for('article_detail', article_id=article.id) }}"><i data-lucide="eye"></i>查看详情</a><button class="button button-secondary" type="button" data-review-action="reject" data-id="{{ article.id }}"><i data-lucide="x"></i>驳回</button><button class="button button-secondary" type="button" data-open-fix data-id="{{ article.id }}" data-title="{{ article.title|default('', true)|e }}" data-body="{{ article.body|default(article.processed_body|default('', true), true)|e }}"><i data-lucide="pencil"></i>修正后通过</button><button class="button button-primary" type="button" data-review-action="pass" data-id="{{ article.id }}"><i data-lucide="check"></i>通过</button></div>
+      </article>
+      {% endfor %}
+    </section>
+  {% else %}
+    <section class="panel empty-state review-empty"><i data-lucide="badge-check"></i><strong>当前没有待审核文章</strong><p>自动质检通过的文章会直接进入待发队列。</p><a class="button button-secondary" href="{{ url_for('articles') }}"><i data-lucide="newspaper"></i>查看全部文章</a></section>
+  {% endif %}
+{% endblock %}
+
+{% block dialogs %}
+<dialog class="modal" id="fix-dialog">
+  <form method="dialog" class="modal-card" data-fix-form>
+    <div class="modal-head"><div><span class="eyebrow">人工修正</span><h2>修正后通过</h2></div><button class="icon-button subtle" type="submit" formnovalidate value="cancel" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <p class="muted">保存修正内容后，文章会进入待发队列。</p>
+    <input type="hidden" name="article_id">
+    <label class="field"><span>标题</span><input name="title" required maxlength="200"></label>
+    <label class="field"><span>正文</span><textarea name="body" required rows="10"></textarea></label>
+    <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="check"></i>保存并通过</button></div>
+  </form>
+</dialog>
+{% endblock %}

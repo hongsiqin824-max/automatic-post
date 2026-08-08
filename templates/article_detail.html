@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}{{ article.title|default('文章详情', true) }} · 文章质检台{% endblock %}
+{% block page_id %}article-detail{% endblock %}
+{% block eyebrow %}素材管理 / 文章详情{% endblock %}
+{% block heading %}文章详情{% endblock %}
+{% block topbar_actions %}
+  <a class="button button-quiet" href="{{ request.referrer or url_for('articles') }}"><i data-lucide="arrow-left"></i>返回列表</a>
+  {% if article.status|upper == 'NEEDS_REVIEW' %}<a class="button button-primary" href="{{ url_for('review', article_id=article.id) }}"><i data-lucide="clipboard-check"></i>去审核</a>{% endif %}
+{% endblock %}
+
+{% block content %}
+  <div class="detail-layout">
+    <div class="detail-main">
+      <section class="panel article-header-panel">
+        <div class="article-kicker"><span class="status-pill status-{{ article.status|lower }}">{{ status_label|default(article.status) }}</span><span class="source-code">{{ article.source }}</span><span class="muted">本地记录 #{{ article.id }}</span></div>
+        <h2 class="article-title">{{ article.title|default('未命名文章', true) }}</h2>
+        {% set original_title = article.original_title|default(article.title_original|default(''), true) %}
+        {% if original_title and original_title != article.title %}<p class="original-title">原始标题：{{ original_title }}</p>{% endif %}
+        <div class="article-meta-line"><span><i data-lucide="folder-open"></i>{{ tab.name|default('未配置栏目', true) }}</span><span><i data-lucide="clock-3"></i>进入 {{ article.created_at|default('-') }}</span><span><i data-lucide="refresh-cw"></i>更新 {{ article.updated_at|default('-') }}</span></div>
+      </section>
+
+      <section class="panel content-panel">
+        <div class="panel-head"><div><h2>正文预览</h2><p>当前用于质检和发布的内容</p></div><a class="external-link" href="{{ article.source_url }}" target="_blank" rel="noreferrer"><i data-lucide="external-link"></i>打开原文</a></div>
+        {% if article.cover_url %}<img class="article-cover" src="{{ article.cover_url }}" alt="文章封面" loading="lazy">{% endif %}
+        <div class="article-copy">{{ (article.body_text or article.processed_body or article.body or article.translate_body or '暂无正文')|striptags }}</div>
+      </section>
+
+      {% if (article.original_body or article.raw_body) and (article.original_body or article.raw_body) != article.body %}
+      <details class="panel disclosure-panel">
+        <summary><span><i data-lucide="file-input"></i>原始正文</span><i data-lucide="chevron-down"></i></summary>
+        <div class="raw-copy">{{ article.original_body or article.raw_body }}</div>
+      </details>
+      {% endif %}
+
+      <section class="panel payload-panel">
+        <div class="panel-head"><div><h2>接口原始信息</h2><p>保留本次素材接口返回，便于追溯</p></div></div>
+        <details class="raw-details"><summary>展开 JSON</summary><pre>{{ article.raw_payload|default(article.raw|default({}), true)|tojson(indent=2) }}</pre></details>
+      </section>
+    </div>
+
+    <aside class="detail-side">
+      <section class="panel quality-panel">
+        <div class="panel-head"><div><h2>质检结果</h2><p>本轮自动检查明细</p></div><span class="level-mark">B</span></div>
+        {% set issues = quality.get('issues', {}) if quality else {} %}
+        {% set checks = [('标题完整', not issues.get('title_problems'), false, '完整', '不完整'), ('正文完整', not issues.get('completeness_problems'), false, '完整', '不完整'), ('广告或脏内容', (issues.get('dirty_content') or [])|length > 0, true, '是', '否'), ('需要人工审核', quality.get('needs_review'), true, '是', '否')] if quality else [] %}
+        <div class="check-list">
+          {% for label, value, bad_when_true, true_label, false_label in checks %}
+            {% set is_bad = (bad_when_true and value) or (not bad_when_true and not value) %}
+            <div class="check-row"><span>{{ label }}</span><b class="{{ 'check-bad' if is_bad else 'check-good' }}">{{ true_label if value else false_label }}</b><i class="check-icon {{ 'bad' if is_bad else 'good' }}" data-lucide="{{ 'circle-alert' if is_bad else 'check-circle-2' }}"></i></div>
+          {% else %}
+            <div class="check-row"><span>尚未完成质检</span><b class="muted">未检测</b><i class="check-icon" data-lucide="minus-circle"></i></div>
+          {% endfor %}
+        </div>
+        {% if quality.reason %}<div class="quality-reason"><strong>说明</strong><p>{{ quality.reason }}</p></div>{% endif %}
+      </section>
+
+      <section class="panel routing-panel">
+        <div class="panel-head"><div><h2>归属与标签</h2><p>发布时将使用这些值</p></div></div>
+        <dl class="definition-list compact-def"><div><dt>栏目 tab</dt><dd>{{ tab.name|default('未配置', true) }}{% if tab.id %}<small>ID {{ tab.id }}</small>{% endif %}</dd></div><div><dt>来源 source</dt><dd><code>{{ article.source }}</code></dd></div><div><dt>channels</dt><dd>{% if channels %}<span class="chip-list">{% for channel in channels %}<span class="chip">{{ channel.title|default(channel.name|default(channel.id|default(channel))) }}</span>{% endfor %}</span>{% else %}<span class="muted">未返回标签</span>{% endif %}</dd></div></dl>
+      </section>
+
+      <section class="panel ids-panel">
+        <div class="panel-head"><div><h2>外部关联</h2><p>仅发布阶段使用</p></div></div>
+        <dl class="definition-list compact-def"><div><dt>素材接口 archive_id</dt><dd><code>{{ article.upstream_archive_id|default(article.archive_id|default(0)) }}</code></dd></div><div><dt>后台 source_id</dt><dd><code>{{ article.dqd_source_id|default('未映射', true) }}</code></dd></div><div><dt>后台 archive_id</dt><dd><code>{{ article.dqd_archive_id|default('未创建', true) }}</code></dd></div></dl>
+      </section>
+    </aside>
+  </div>
+
+  <section class="panel timeline-panel">
+    <div class="panel-head"><div><h2>处理时间线</h2><p>每次状态变化和人工操作都会记录</p></div></div>
+    {% if events %}<ol class="timeline">{% for event in events %}<li><span class="timeline-dot"></span><div><strong>{{ event.label|default(event.event_type|default('状态更新')) }}</strong><p>{{ event.message|default('') }}</p><time>{{ event.created_at|default('-') }}</time></div></li>{% endfor %}</ol>{% else %}<div class="empty-state compact"><i data-lucide="git-commit-horizontal"></i><strong>暂无时间线记录</strong></div>{% endif %}
+  </section>
+{% endblock %}

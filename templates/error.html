@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}出现问题 · 文章质检台{% endblock %}
+{% block page_id %}error{% endblock %}
+{% block eyebrow %}系统提示{% endblock %}
+{% block heading %}暂时无法完成请求{% endblock %}
+{% block content %}
+  <section class="panel error-state"><span class="error-code">{{ code|default(500) }}</span><h2>{{ message|default('系统遇到一个未预期的问题。') }}</h2><p>已有的文章和处理记录不会受到影响。返回上一页或回到运行总览继续操作。</p><div class="error-actions"><a class="button button-primary" href="{{ url_for('dashboard') }}"><i data-lucide="layout-dashboard"></i>回到总览</a><button class="button button-secondary" type="button" onclick="history.back()"><i data-lucide="arrow-left"></i>返回上一页</button></div>{% if request_id %}<small class="muted">请求编号：{{ request_id }}</small>{% endif %}</section>
+{% endblock %}

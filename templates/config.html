@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}栏目与来源 · 文章质检台{% endblock %}
+{% block page_id %}config{% endblock %}
+{% block eyebrow %}系统设置{% endblock %}
+{% block heading %}栏目与来源{% endblock %}
+{% block topbar_actions %}<button class="button button-primary" type="button" data-open-tab-dialog><i data-lucide="plus"></i>新增栏目</button>{% endblock %}
+
+{% block content %}
+  <div class="config-grid">
+    <section class="panel config-tabs-panel">
+      <div class="panel-head"><div><h2>栏目 tab</h2><p>系统根据来源映射栏目；一个栏目可以配置多个来源。</p></div><span class="count-label">{{ tabs|length }} 个</span></div>
+      <div class="config-list">
+        {% for tab in tabs %}
+        <div class="config-row" data-tab-row data-id="{{ tab.id }}"><div class="config-main"><span class="drag-handle"><i data-lucide="grip-vertical"></i></span><span class="tab-dot {% if not tab.enabled %}is-off{% endif %}"></span><div><strong>{{ tab.name }}</strong><small>后台栏目 ID：{{ tab.backend_tab_id|default('未绑定', true) }}</small></div></div><div class="config-controls"><span class="status-badge {{ 'status-enabled' if tab.enabled else 'status-disabled' }}"><span></span>{{ '启用' if tab.enabled else '停用' }}</span><button class="icon-button subtle" type="button" data-edit-tab data-id="{{ tab.id }}" data-name="{{ tab.name|e }}" data-backend-id="{{ tab.backend_tab_id|default('', true) }}" title="编辑栏目" aria-label="编辑栏目"><i data-lucide="pencil"></i></button><button class="icon-button subtle" type="button" data-toggle-tab data-id="{{ tab.id }}" data-enabled="{{ 'true' if tab.enabled else 'false' }}" title="{{ '停用栏目' if tab.enabled else '启用栏目' }}" aria-label="{{ '停用栏目' if tab.enabled else '启用栏目' }}"><i data-lucide="{{ 'pause' if tab.enabled else 'play' }}"></i></button></div></div>
+        {% else %}<div class="empty-state compact"><i data-lucide="folder-plus"></i><strong>还没有栏目</strong><p>新增一个栏目后再绑定来源。</p></div>{% endfor %}
+      </div>
+    </section>
+
+    <section class="panel config-sources-panel">
+      <div class="panel-head"><div><h2>来源 source</h2><p>每个来源当前只能归属一个栏目。</p></div><div class="config-head-actions"><label class="compact-search"><i data-lucide="search"></i><span class="sr-only">搜索来源</span><input type="search" data-source-search placeholder="搜索 source"></label><span class="count-label" data-source-count data-total="{{ sources|length }}">{{ sources|length }} 个</span></div></div>
+      <div class="source-list">
+        {% for source in sources %}
+        <div class="source-row"><div class="source-info"><span class="source-avatar">{{ source.name|default(source.code)|first|upper }}</span><div><strong>{{ source.name|default(source.code) }}</strong><code>{{ source.code }}</code></div></div><label class="source-select"><span class="sr-only">{{ source.code }} 所属栏目</span><select data-source-tab data-code="{{ source.code }}"><option value="">未配置栏目</option>{% for tab in tabs %}<option value="{{ tab.id }}" {% if source.tab_id|string == tab.id|string %}selected{% endif %}>{{ tab.name }}</option>{% endfor %}</select></label><label class="switch" title="{{ '停用来源' if source.enabled|default(true) else '启用来源' }}"><input type="checkbox" data-source-enabled data-code="{{ source.code }}" {% if source.enabled|default(true) %}checked{% endif %}><span></span></label></div>
+        {% else %}<div class="empty-state compact"><i data-lucide="radio-tower"></i><strong>还没有来源</strong><p>来源由素材接口提供，首次拉取后会出现在这里。</p></div>{% endfor %}
+      </div>
+    </section>
+  </div>
+
+  <section class="panel scheduler-config">
+    <div class="panel-head"><div><h2>自动运行</h2><p>控制素材拉取和发布 worker 是否自动执行。</p></div><button class="button button-secondary" type="button" data-scheduler-toggle data-enabled="{{ 'true' if settings.scheduler_enabled else 'false' }}"><i data-lucide="{{ 'pause' if settings.scheduler_enabled else 'play' }}"></i>{{ '暂停自动任务' if settings.scheduler_enabled else '恢复自动任务' }}</button></div>
+    <div class="setting-line"><div><strong>拉取周期</strong><span>系统会按此间隔请求已启用的来源</span></div><span class="setting-value">每 {{ settings.interval_minutes|default(10) }} 分钟</span></div>
+    <div class="setting-line"><div><strong>默认文章等级</strong><span>当前所有文章进入系统时使用固定等级</span></div><span class="level-mark">B</span></div>
+  </section>
+{% endblock %}
+
+{% block dialogs %}
+<dialog class="modal" id="tab-dialog">
+  <form method="dialog" class="modal-card" data-tab-form>
+    <div class="modal-head"><div><span class="eyebrow">栏目配置</span><h2 data-tab-dialog-title>新增栏目</h2></div><button class="icon-button subtle" type="submit" formnovalidate value="cancel" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <input type="hidden" name="id">
+    <label class="field"><span>栏目名称</span><input name="name" required maxlength="80" placeholder="例如：国际足球"></label>
+    <label class="field"><span>后台栏目 ID</span><input name="backend_tab_id" type="number" inputmode="numeric" required placeholder="发布时用于映射后台栏目"></label>
+    <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="save"></i>保存栏目</button></div>
+  </form>
+</dialog>
+{% endblock %}

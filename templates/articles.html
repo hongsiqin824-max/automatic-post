@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}全部文章 · 文章质检台{% endblock %}
+{% block page_id %}articles{% endblock %}
+{% block eyebrow %}素材管理{% endblock %}
+{% block heading %}全部文章{% endblock %}
+{% block topbar_actions %}
+  <button class="button button-primary" type="button" data-run-now><i data-lucide="refresh-cw"></i><span>立即拉取</span></button>
+{% endblock %}
+
+{% block content %}
+  <form class="filter-bar" method="get" action="{{ url_for('articles') }}">
+    <label class="search-field">
+      <i data-lucide="search"></i>
+      <span class="sr-only">搜索标题或原文地址</span>
+      <input type="search" name="q" value="{{ filters.q|default('') }}" placeholder="搜索标题或原文地址">
+    </label>
+    <label><span>处理状态</span><select name="status"><option value="">全部状态</option>{% for value, label in status_labels.items() %}<option value="{{ value }}" {% if filters.status == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <label><span>来源</span><select name="source"><option value="">全部来源</option>{% for source in sources %}<option value="{{ source.code }}" {% if filters.source == source.code %}selected{% endif %}>{{ source.name|default(source.code) }} ({{ source.code }})</option>{% endfor %}</select></label>
+    <label><span>栏目</span><select name="tab"><option value="">全部栏目</option>{% for item in tabs %}<option value="{{ item.id }}" {% if filters.tab|string == item.id|string %}selected{% endif %}>{{ item.name }}</option>{% endfor %}</select></label>
+    <button class="button button-secondary" type="submit"><i data-lucide="list-filter"></i>筛选</button>
+    {% if filters.q or filters.status or filters.source or filters.tab %}<a class="button button-quiet" href="{{ url_for('articles') }}"><i data-lucide="x"></i>清除</a>{% endif %}
+  </form>
+
+  <section class="panel table-panel">
+    <div class="table-summary"><span>共 <strong>{{ articles|length }}</strong> 篇文章</span><span class="muted">点击标题查看完整处理过程</span></div>
+    {% if articles %}
+      <div class="table-wrap">
+        <table class="data-table article-table">
+          <thead><tr><th>文章</th><th>来源</th><th>栏目</th><th>质检</th><th>状态</th><th>进入时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+          <tbody>
+          {% for article in articles %}
+            <tr>
+              <td class="article-cell">
+                <a href="{{ url_for('article_detail', article_id=article.id) }}">{{ article.title|default('未命名文章', true) }}</a>
+                <small><span>#{{ article.id }}</span><span>{{ article.source_url|default('') }}</span></small>
+              </td>
+              <td><span class="source-code">{{ article.source }}</span></td>
+              <td>{{ article.tab_name|default('未配置', true) }}</td>
+              <td>
+                {% set quality_passed = article.quality_passed if article.quality_passed is defined else article.quality.get('pass') if article.quality else none %}
+                {% if quality_passed is sameas true %}<span class="result-label result-ok"><i data-lucide="check"></i>通过</span>
+                {% elif quality_passed is sameas false %}<span class="result-label result-warn"><i data-lucide="flag"></i>需处理</span>
+                {% else %}<span class="result-label"><i data-lucide="minus"></i>未质检</span>{% endif %}
+              </td>
+              <td><span class="status-pill status-{{ article.status|lower }}">{{ article.status_label|default(status_labels.get(article.status, article.status)) }}</span></td>
+              <td class="muted nowrap">{{ article.created_at|default('-') }}</td>
+              <td><a class="icon-button subtle" href="{{ url_for('article_detail', article_id=article.id) }}" title="查看详情" aria-label="查看文章详情"><i data-lucide="chevron-right"></i></a></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="empty-state"><i data-lucide="search-x"></i><strong>没有符合条件的文章</strong><p>可以清除筛选条件后重新查看。</p></div>
+    {% endif %}
+  </section>
+{% endblock %}

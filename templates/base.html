@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{% block title %}文章质检台{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body data-page="{% block page_id %}{% endblock %}">
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="{{ url_for('dashboard') }}" aria-label="返回仪表盘">
+        <span class="brand-mark"><i data-lucide="scan-text"></i></span>
+        <span>
+          <strong>文章质检台</strong>
+          <small>内容自动化工作台</small>
+        </span>
+      </a>
+
+      <nav class="main-nav" aria-label="主导航">
+        <a href="{{ url_for('dashboard') }}" class="nav-item {% if request.endpoint == 'dashboard' %}is-active{% endif %}">
+          <i data-lucide="layout-dashboard"></i><span>运行总览</span>
+        </a>
+        <a href="{{ url_for('articles') }}" class="nav-item {% if request.endpoint in ['articles', 'article_detail'] %}is-active{% endif %}">
+          <i data-lucide="newspaper"></i><span>全部文章</span>
+        </a>
+        <a href="{{ url_for('review') }}" class="nav-item {% if request.endpoint == 'review' %}is-active{% endif %}">
+          <i data-lucide="clipboard-check"></i><span>人工审核</span>
+          {% if review_count is defined and review_count %}<span class="nav-count">{{ review_count }}</span>{% endif %}
+        </a>
+        <a href="{{ url_for('config') }}" class="nav-item {% if request.endpoint == 'config' %}is-active{% endif %}">
+          <i data-lucide="settings-2"></i><span>栏目与来源</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="system-indicator">
+          <span class="signal {% if settings is defined and settings.scheduler_enabled %}is-on{% endif %}"></span>
+          <span>
+            <strong>{% if settings is defined and settings.scheduler_enabled %}自动任务运行中{% else %}自动任务已暂停{% endif %}</strong>
+            <small>仅本机访问</small>
+          </span>
+        </div>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <button class="icon-button menu-button" type="button" data-sidebar-toggle title="打开导航" aria-label="打开导航">
+          <i data-lucide="menu"></i>
+        </button>
+        <div class="topbar-title">
+          <span class="eyebrow">{% block eyebrow %}内容流水线{% endblock %}</span>
+          <h1>{% block heading %}运行总览{% endblock %}</h1>
+        </div>
+        <div class="topbar-actions">{% block topbar_actions %}{% endblock %}</div>
+      </header>
+
+      <main class="main-content">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            <div class="flash-stack" aria-live="polite">
+              {% for category, message in messages %}
+                <div class="flash flash-{{ category }}">
+                  <i data-lucide="{% if category == 'error' %}circle-alert{% else %}circle-check{% endif %}"></i>
+                  <span>{{ message }}</span>
+                </div>
+              {% endfor %}
+            </div>
+          {% endif %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </div>
+
+  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <div class="mobile-backdrop" data-sidebar-toggle></div>
+  {% block dialogs %}{% endblock %}
+</body>
+</html>
