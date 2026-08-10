@@ -532,8 +532,12 @@ def list_articles(connection=None, *, status: Optional[str] = None,
         clauses.append("a.tab_id=?")
         params.append(tab_id)
     if query:
-        clauses.append("(a.title_final LIKE ? OR a.title_original LIKE ? OR a.source_url LIKE ?)")
-        pattern = f"%{str(query).strip()}%"
+        # 转义 LIKE 通配符，避免用户输入的 % 和 _ 被 SQLite 当作通配符处理
+        escaped = str(query).strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        clauses.append(
+            "(a.title_final LIKE ? ESCAPE '\\\\' OR a.title_original LIKE ? ESCAPE '\\\\' OR a.source_url LIKE ? ESCAPE '\\\\')"
+        )
         params.extend([pattern, pattern, pattern])
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     limit = max(1, min(int(limit), 500))
@@ -587,10 +591,16 @@ def transition_status(article_id: int, to_status: str, connection=None, *, messa
         raise ValueError("article not found")
     old_status = from_status or current["status"]
     now = _now()
+    preserve_error = to_status in {"ERROR", "PUBLISH_FAILED"}
     with conn:
         conn.execute(
             "UPDATE articles SET status=?, error=?, updated_at=? WHERE id=?",
-            (to_status, None if to_status != "ERROR" else (message or current.get("error")), now, article_id),
+            (
+                to_status,
+                (message or current.get("error")) if preserve_error else None,
+                now,
+                article_id,
+            ),
         )
         conn.execute(
             """
@@ -599,6 +609,72 @@ def transition_status(article_id: int, to_status: str, connection=None, *, messa
             VALUES (?,?,?,?,?,?,?)
             """,
             (article_id, old_status, to_status, event_type, message or None, _json(payload, {}), now),
+        )
+    return get_article(article_id, conn)
+
+
+def transition_status_if_current(
+    article_id: int,
+    to_status: str,
+    connection=None,
+    *,
+    allowed_from: Iterable[str] | None = None,
+    message: str = "",
+    event_type: str = "STATUS_CHANGED",
+    payload: Any = None,
+    current_updated_at: Optional[str] = None,
+) -> dict | None:
+    """Transition only if the row is still in one of the expected states.
+
+    This is used for draft creation and timeout recovery so concurrent retries
+    cannot both claim the same article.
+    """
+
+    to_status = str(to_status or "").upper().strip()
+    if to_status not in VALID_STATUSES:
+        raise ValueError("invalid article status")
+    conn = _conn(connection)
+    current = get_article(article_id, conn)
+    if current is None:
+        raise ValueError("article not found")
+
+    allowed = {str(status).upper().strip() for status in allowed_from} if allowed_from is not None else None
+    if allowed is not None and current["status"] not in allowed:
+        return None
+    if current_updated_at is not None and str(current.get("updated_at") or "") != str(current_updated_at):
+        return None
+
+    now = _now()
+    preserve_error = to_status in {"ERROR", "PUBLISH_FAILED"}
+    clauses = ["id=?"]
+    params: list[Any] = [article_id]
+    if allowed is not None:
+        placeholders = ",".join("?" for _ in allowed)
+        clauses.append(f"status IN ({placeholders})")
+        params.extend(sorted(allowed))
+    if current_updated_at is not None:
+        clauses.append("updated_at=?")
+        params.append(str(current_updated_at))
+
+    with conn:
+        cursor = conn.execute(
+            "UPDATE articles SET status=?, error=?, updated_at=? WHERE " + " AND ".join(clauses),
+            (
+                to_status,
+                (message or current.get("error")) if preserve_error else None,
+                now,
+                *params,
+            ),
+        )
+        if cursor.rowcount == 0:
+            return None
+        conn.execute(
+            """
+            INSERT INTO article_events
+            (article_id, from_status, to_status, event_type, message, payload_json, created_at)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (article_id, current["status"], to_status, event_type, message or None, _json(payload, {}), now),
         )
     return get_article(article_id, conn)
 

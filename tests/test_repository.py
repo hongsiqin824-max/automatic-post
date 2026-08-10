@@ -83,6 +83,34 @@ def test_manual_review_updates_content_and_status(app):
         assert len(repo.list_article_events(article["id"])) >= 3
 
 
+def test_transition_status_if_current_prevents_double_claim(app):
+    with app.app_context():
+        tab = repo.list_tabs()[0]
+        repo.update_source("marca", tab_id=tab["id"], enabled=True)
+        article = repo.upsert_material(_material())["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH")
+
+        first = repo.transition_status_if_current(
+            article["id"],
+            "PUBLISHING",
+            allowed_from={"READY_TO_PUBLISH"},
+            event_type="DRAFT_CREATE_STARTED",
+            message="开始创建草稿",
+        )
+        second = repo.transition_status_if_current(
+            article["id"],
+            "PUBLISHING",
+            allowed_from={"READY_TO_PUBLISH"},
+            event_type="DRAFT_CREATE_STARTED",
+            message="开始创建草稿",
+        )
+
+        assert first["status"] == "PUBLISHING"
+        assert second is None
+        events = repo.list_article_events(article["id"])
+        assert events[-1]["event_type"] == "DRAFT_CREATE_STARTED"
+
+
 def test_manual_review_only_accepts_articles_waiting_for_review(app):
     with app.app_context():
         article = repo.upsert_material(_material())['article']

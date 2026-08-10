@@ -30,6 +30,18 @@
     <div class="panel-head"><div><h2>自动运行</h2><p>控制素材拉取和发布 worker 是否自动执行。</p></div><button class="button button-secondary" type="button" data-scheduler-toggle data-enabled="{{ 'true' if settings.scheduler_enabled else 'false' }}"><i data-lucide="{{ 'pause' if settings.scheduler_enabled else 'play' }}"></i>{{ '暂停自动任务' if settings.scheduler_enabled else '恢复自动任务' }}</button></div>
     <div class="setting-line"><div><strong>拉取周期</strong><span>系统会按此间隔请求已启用的来源</span></div><span class="setting-value">每 {{ settings.interval_minutes|default(10) }} 分钟</span></div>
     <div class="setting-line"><div><strong>默认文章等级</strong><span>当前所有文章进入系统时使用固定等级</span></div><span class="level-mark">B</span></div>
+    <div class="setting-line"><div><strong>开放平台发布</strong><span>需同时配置开放平台并启用发布 worker</span></div><span class="setting-value">{{ '已启用' if settings.publisher_enabled and settings.dqd_open_configured else ('仅已配置' if settings.dqd_open_configured else '未配置') }}</span></div>
+  </section>
+
+  <section class="panel scheduler-config">
+    <div class="panel-head"><div><h2>开放平台授权</h2><p>这里完成登录授权、token 刷新和重置。</p></div><div class="config-head-actions"><span class="status-badge {{ 'status-enabled' if settings.open_platform_auth.auth_status == 'AUTHORIZED' else 'status-disabled' }}"><span></span>{{ settings.open_platform_auth.auth_status_label }}</span><button class="button button-primary" type="button" data-open-auth-start>发起授权</button></div></div>
+    <div class="setting-line"><div><strong>回调地址</strong><span>授权后会回到这个本地地址</span></div><span class="setting-value">{{ settings.dqd_open_redirect_uri }}</span></div>
+    <div class="setting-line"><div><strong>授权用户</strong><span>平台返回的用户信息</span></div><span class="setting-value">{{ settings.open_platform_auth.authorized_user|default({}, true)|tojson }}</span></div>
+    <div class="setting-line"><div><strong>最近错误</strong><span>方便定位授权或刷新失败</span></div><span class="setting-value">{{ settings.open_platform_auth.last_error or '无' }}</span></div>
+    <div class="setting-actions">
+      <button class="button button-secondary" type="button" data-open-auth-refresh>刷新 token</button>
+      <button class="button button-quiet" type="button" data-open-auth-reset>清空授权</button>
+    </div>
   </section>
 {% endblock %}
 

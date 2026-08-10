@@ -33,6 +33,8 @@ def test_pipeline_ingests_deduplicates_and_queues(app, monkeypatch):
         database_path=database,
         material_api_key="test-key",
         material_caller="test-caller",
+        llm_api_key="",
+        publisher_enabled=False,
         scheduler_enabled=False,
     )
     first = run_once(config)
@@ -51,7 +53,14 @@ def test_pipeline_ingests_deduplicates_and_queues(app, monkeypatch):
 
 
 def test_pipeline_records_missing_credentials(app):
-    config = AppConfig(database_path=app.config["DATABASE"], scheduler_enabled=False)
+    config = AppConfig(
+        database_path=app.config["DATABASE"],
+        material_api_key="",
+        material_caller="",
+        llm_api_key="",
+        publisher_enabled=False,
+        scheduler_enabled=False,
+    )
     conn = _connect(app.config["DATABASE"])
     try:
         tab = repo.list_tabs(conn)[0]
@@ -79,6 +88,8 @@ def test_pipeline_recovers_article_left_quality_checking(app, monkeypatch):
         database_path=database,
         material_api_key="test-key",
         material_caller="test-caller",
+        llm_api_key="",
+        publisher_enabled=False,
         scheduler_enabled=False,
     ))
 
@@ -105,6 +116,8 @@ def test_quality_item_error_marks_run_partial(app, monkeypatch):
         database_path=database,
         material_api_key="test-key",
         material_caller="test-caller",
+        llm_api_key="",
+        publisher_enabled=False,
         scheduler_enabled=False,
     ))
     assert result["errors"] == 1

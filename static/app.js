@@ -86,6 +86,34 @@
     });
   }
 
+  function initOpenPlatformAuth() {
+    const startButton = $('[data-open-auth-start]');
+    startButton?.addEventListener("click", () => withBusy(startButton, async () => {
+      try {
+        const result = await postJSON("/api/open/auth/start");
+        window.location.href = result.authorize_url;
+        toast("已打开开放平台授权页面");
+      } catch (error) { toast(error.message, "error"); }
+    }));
+
+    const refreshButton = $('[data-open-auth-refresh]');
+    refreshButton?.addEventListener("click", () => withBusy(refreshButton, async () => {
+      try {
+        const result = await postJSON("/api/open/auth/refresh");
+        reloadSoon(result.message || "token 已刷新");
+      } catch (error) { toast(error.message, "error"); }
+    }));
+
+    const resetButton = $('[data-open-auth-reset]');
+    resetButton?.addEventListener("click", () => withBusy(resetButton, async () => {
+      if (!window.confirm("确定要清空当前开放平台授权吗？")) return;
+      try {
+        const result = await postJSON("/api/open/auth/reset");
+        reloadSoon(result.message || "授权已清空");
+      } catch (error) { toast(error.message, "error"); }
+    }));
+  }
+
   function initReview() {
     $$('[data-review-action]').forEach((button) => {
       button.addEventListener("click", () => withBusy(button, async () => {
@@ -133,6 +161,20 @@
         } catch (error) { toast(error.message, "error"); }
       });
     });
+  }
+
+  function initDraftRetry() {
+    const button = $('[data-create-draft]');
+    button?.addEventListener("click", () => withBusy(button, async () => {
+      const confirmText = button.dataset.confirm || "确认执行草稿操作吗？";
+      if (!window.confirm(confirmText)) return;
+      try {
+        const result = await postJSON(`/api/articles/${button.dataset.id}/create-draft`);
+        reloadSoon(result.message || "草稿已重新创建");
+      } catch (error) {
+        toast(error.message, "error");
+      }
+    }));
   }
 
   function initTabs() {
@@ -236,10 +278,12 @@
 
   document.addEventListener("DOMContentLoaded", () => {
     refreshIcons();
-    initNavigation();
-    initPipelineActions();
-    initReview();
-    initTabs();
-    initSources();
+  initNavigation();
+  initPipelineActions();
+  initOpenPlatformAuth();
+  initReview();
+  initDraftRetry();
+  initTabs();
+  initSources();
   });
 })();

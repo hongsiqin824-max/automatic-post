@@ -1,8 +1,4 @@
-"""Ingestion and pre-publish quality workflow.
-
-This module intentionally stops at ``READY_TO_PUBLISH``.  The future DQD
-publisher can consume that queue without changing the local article model.
-"""
+"""Ingestion, quality workflow, and optional draft creation orchestration."""
 
 from __future__ import annotations
 
@@ -16,6 +12,7 @@ from ..config import AppConfig
 from ..db import _connect
 from ..statuses import STATUS_LABELS
 from .material_client import MaterialClient, MaterialClientError, normalize_item
+from .publisher import publish_ready_articles
 from .quality import LLMService, evaluate
 
 logger = logging.getLogger(__name__)
@@ -30,12 +27,8 @@ def _quality_eligible(article: dict[str, Any]) -> bool:
 
 
 def _update_content(article_id: int, *, title: str | None = None,
-                    body: str | None = None, connection=None) -> None:
+                    body: str | None = None, connection) -> None:
     conn = connection
-    if conn is None:
-        from ..db import get_db
-
-        conn = get_db()
     current = repo.get_article(article_id, conn)
     if current is None:
         raise ValueError("article not found")
@@ -141,7 +134,11 @@ def run_once(config: AppConfig, *, database_path: str | None = None) -> dict[str
     """Fetch enabled sources, upsert materials and process eligible articles."""
     database_path = database_path or config.database_path
     conn = _connect(database_path)
-    run_id = repo.start_run_log("INGEST", conn, details={"started_at": _utc_now()})
+    try:
+        run_id = repo.start_run_log("INGEST", conn, details={"started_at": _utc_now()})
+    except Exception:
+        conn.close()
+        raise
     fetched = inserted = updated = errors = 0
     status_counts: dict[str, int] = {}
     failed_items: list[dict[str, str]] = []
@@ -196,6 +193,21 @@ def run_once(config: AppConfig, *, database_path: str | None = None) -> dict[str
                     "source_url": str(raw.get("source_url") or "") if isinstance(raw, dict) else "",
                     "error": str(exc)[:300],
                 })
+        publish_result: dict[str, Any] = publish_ready_articles(config, conn)
+        # 无论 publisher 是否启用，publish_ready_articles 都会执行 recovery（P2-4 修复）
+        if publish_result.get("draft_created"):
+            status_counts["DRAFT_CREATED"] = status_counts.get("DRAFT_CREATED", 0) + int(publish_result["draft_created"])
+        if publish_result.get("failed"):
+            status_counts["PUBLISH_FAILED"] = status_counts.get("PUBLISH_FAILED", 0) + int(publish_result["failed"])
+        if publish_result.get("skipped"):
+            status_counts["MAPPING_BLOCKED"] = status_counts.get("MAPPING_BLOCKED", 0) + int(publish_result["skipped"])
+        message = f"本轮完成，草稿创建 {publish_result.get('draft_created', 0)} 篇"
+        if publish_result.get("recovered"):
+            message += f"，自动恢复 {publish_result.get('recovered', 0)} 篇"
+        if publish_result.get("timed_out"):
+            message += f"，超时恢复 {publish_result.get('timed_out', 0)} 篇"
+        if publish_result.get("failed"):
+            message += f"，失败 {publish_result.get('failed', 0)} 篇"
         result = {
             "run_id": run_id,
             "fetched": fetched,
@@ -204,8 +216,9 @@ def run_once(config: AppConfig, *, database_path: str | None = None) -> dict[str
             "errors": errors,
             "status_counts": status_counts,
             "failed_items": failed_items,
-            "message": "本轮完成",
+            "message": message,
         }
+        result["publish"] = publish_result
         repo.finish_run_log(
             run_id,
             conn,

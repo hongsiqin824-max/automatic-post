@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -31,6 +33,25 @@ def _env_int(name: str, default: int) -> int:
         return int(value) if value is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def _env_json_object(name: str) -> dict[str, str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        value: Any = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"环境变量 {name} 必须是 JSON 对象") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"环境变量 {name} 必须是 JSON 对象")
+    return {str(key): str(val) for key, val in value.items()}
+
+
+def _default_redirect_uri() -> str:
+    host = os.getenv("AUTOMATIC_POST_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = os.getenv("AUTOMATIC_POST_PORT", "8890").strip() or "8890"
+    return f"http://{host}:{port}/api/open/auth/callback"
 
 
 @dataclass(frozen=True)
@@ -69,7 +90,11 @@ class AppConfig:
     dqd_open_api_name: str = os.getenv(
         "DQD_OPEN_API_NAME", "admin-archive-createarticle"
     ).strip()
-    dqd_open_enname: str = os.getenv("DQD_OPEN_ENNAME", "hongsiqin").strip()
+    dqd_headers: dict[str, str] = field(default_factory=lambda: _env_json_object("DQD_OPEN_API_HEADERS_JSON"))
+    dqd_open_redirect_uri: str = os.getenv(
+        "DQD_OPEN_REDIRECT_URI", _default_redirect_uri()
+    ).strip()
+    dqd_open_enname: str = os.getenv("DQD_OPEN_ENNAME", "").strip()
     dqd_open_status: int = _env_int("DQD_OPEN_STATUS", 0)
     dqd_open_timeout: int = max(5, _env_int("DQD_OPEN_TIMEOUT_SECONDS", 30))
     dqd_open_archive_level: str = os.getenv("DQD_OPEN_ARCHIVE_LEVEL", "B").strip().upper() or "B"
@@ -79,9 +104,8 @@ class AppConfig:
         60, _env_int("AUTOMATIC_POST_INTERVAL_SECONDS", 600)
     )
 
-    # The v1 app stops at READY_TO_PUBLISH. This flag is intentionally kept
-    # separate so the future DQD publisher can be enabled without changing the
-    # ingestion and quality state machine.
+    # Open-platform article creation is a write operation, so it stays behind
+    # an explicit flag even when credentials are present.
     publisher_enabled: bool = _env_bool("AUTOMATIC_POST_PUBLISHER", False)
 
     @property

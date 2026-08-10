@@ -6,12 +6,12 @@
 {% block topbar_actions %}<span class="queue-count"><i data-lucide="inbox"></i>待处理 <strong>{{ articles|length }}</strong></span>{% endblock %}
 
 {% block content %}
-  <div class="review-intro"><div><p class="lead">自动质检无法确认的内容会停在这里。</p><p class="muted">审核通过后，文章会进入待发队列；驳回的文章不会自动发布。</p></div><span class="review-rule"><i data-lucide="info"></i>正文异常、广告和脏内容需人工确认</span></div>
+  <div class="review-intro"><div><p class="lead">自动质检无法确认的内容会停在这里。</p><p class="muted">审核通过后，文章会进入待发队列；驳回的文章不会自动发布。时间均为北京时间。</p></div><span class="review-rule"><i data-lucide="info"></i>正文异常、广告和脏内容需人工确认</span></div>
   {% if articles %}
     <section class="review-queue">
       {% for article in articles %}
       <article class="review-item" data-review-item data-article-id="{{ article.id }}">
-        <div class="review-item-head"><div class="article-kicker"><span class="source-code">{{ article.source }}</span><span class="muted">#{{ article.id }}</span><time>{{ article.updated_at|default(article.created_at|default('-')) }}</time></div><span class="status-pill status-{{ article.status|lower }}">{{ article.status_label|default('待人工审核') }}</span></div>
+        <div class="review-item-head"><div class="article-kicker"><span class="source-code">{{ article.source }}</span><span class="muted">#{{ article.id }}</span><time>{{ article.updated_at|beijing_time|default(article.created_at|beijing_time|default('-', true), true) }}</time></div><span class="status-pill status-{{ article.status|lower }}">{{ article.status_label|default('待人工审核') }}</span></div>
         <h2><a href="{{ url_for('article_detail', article_id=article.id) }}">{{ article.title|default('未命名文章', true) }}</a></h2>
         <div class="review-info-grid"><div><span>栏目</span><strong>{{ article.tab_name|default('未配置', true) }}</strong></div><div><span>质检提示</span><strong class="warning-text">{{ article.quality_reason|default('请检查标题、正文和广告内容', true) }}</strong></div><div><span>原文</span><a href="{{ article.source_url }}" target="_blank" rel="noreferrer">{{ article.source_url|default('-') }}</a></div></div>
         <div class="review-excerpt">{{ article.body_excerpt|default(article.body|default('暂无正文', true), true) }}</div>

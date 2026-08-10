@@ -7,14 +7,20 @@ are stored in separate columns.
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from flask import current_app, g
 
 
 PathLike = Union[str, Path]
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 SCHEMA_SQL = """
@@ -107,6 +113,23 @@ CREATE TABLE IF NOT EXISTS settings (
     value_json TEXT NOT NULL DEFAULT 'null',
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS open_platform_auth (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    auth_status TEXT NOT NULL DEFAULT 'UNAUTHORIZED',
+    pending_state TEXT NOT NULL DEFAULT '',
+    pending_state_expires_at TEXT,
+    access_token TEXT NOT NULL DEFAULT '',
+    refresh_token TEXT NOT NULL DEFAULT '',
+    token_type TEXT NOT NULL DEFAULT 'Bearer',
+    token_expires_at TEXT,
+    refresh_token_expires_at TEXT,
+    authorized_user_json TEXT NOT NULL DEFAULT '{}',
+    last_authorize_url TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -171,10 +194,88 @@ def init_db(database: Optional[PathLike] = None) -> None:
     connection = _connect(database) if owns_connection else get_db()
     try:
         connection.executescript(SCHEMA_SQL)
+        current = now_iso()
+        connection.execute(
+            """INSERT OR IGNORE INTO open_platform_auth
+               (id,auth_status,pending_state,pending_state_expires_at,access_token,refresh_token,token_type,token_expires_at,refresh_token_expires_at,authorized_user_json,last_authorize_url,last_error,created_at,updated_at)
+               VALUES(1,'UNAUTHORIZED','','', '','','Bearer',NULL,NULL,'{}','','',?,?)""",
+            (current, current),
+        )
         connection.commit()
     finally:
         if owns_connection:
             connection.close()
+
+
+def _decode_open_platform_auth(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    item = dict(row)
+    try:
+        item["authorized_user"] = json.loads(item.pop("authorized_user_json") or "{}")
+    except json.JSONDecodeError:
+        item["authorized_user"] = {}
+    return item
+
+
+def get_open_platform_auth(db_path: PathLike) -> dict | None:
+    with _connect(db_path) as conn:
+        return _decode_open_platform_auth(conn.execute("SELECT * FROM open_platform_auth WHERE id=1").fetchone())
+
+
+def update_open_platform_auth(db_path: PathLike, **fields: Any) -> dict:
+    allowed = {
+        "auth_status",
+        "pending_state",
+        "pending_state_expires_at",
+        "access_token",
+        "refresh_token",
+        "token_type",
+        "token_expires_at",
+        "refresh_token_expires_at",
+        "authorized_user",
+        "last_authorize_url",
+        "last_error",
+    }
+    updates = {key: value for key, value in fields.items() if key in allowed}
+    if not updates:
+        current = get_open_platform_auth(db_path)
+        if current is None:
+            raise KeyError("open_platform_auth 不存在")
+        return current
+    encoded: dict[str, Any] = {}
+    for key, value in updates.items():
+        if key == "authorized_user":
+            encoded["authorized_user_json"] = json.dumps(value or {}, ensure_ascii=False, separators=(",", ":"))
+        else:
+            encoded[key] = value
+    encoded["updated_at"] = now_iso()
+    assignments = ", ".join(f"{key}=?" for key in encoded)
+    with _connect(db_path) as conn:
+        conn.execute(f"UPDATE open_platform_auth SET {assignments} WHERE id=1", [*encoded.values()])
+        row = conn.execute("SELECT * FROM open_platform_auth WHERE id=1").fetchone()
+    result = _decode_open_platform_auth(row)
+    if result is None:
+        raise KeyError("open_platform_auth 不存在")
+    return result
+
+
+def reset_open_platform_auth(db_path: PathLike) -> dict:
+    current = now_iso()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """UPDATE open_platform_auth
+               SET auth_status='UNAUTHORIZED', pending_state='', pending_state_expires_at=NULL,
+                   access_token='', refresh_token='', token_type='Bearer', token_expires_at=NULL,
+                   refresh_token_expires_at=NULL, authorized_user_json='{}',
+                   last_authorize_url='', last_error='', updated_at=?
+               WHERE id=1""",
+            (current,),
+        )
+    current_row = get_open_platform_auth(db_path)
+    if current_row is None:
+        raise KeyError("open_platform_auth 不存在")
+    return current_row
 
 
 def init_app(app) -> None:

@@ -4,7 +4,7 @@
 {% block eyebrow %}素材管理 / 文章详情{% endblock %}
 {% block heading %}文章详情{% endblock %}
 {% block topbar_actions %}
-  <a class="button button-quiet" href="{{ request.referrer or url_for('articles') }}"><i data-lucide="arrow-left"></i>返回列表</a>
+  <a class="button button-quiet" href="{{ safe_back_url(url_for('articles')) }}"><i data-lucide="arrow-left"></i>返回列表</a>
   {% if article.status|upper == 'NEEDS_REVIEW' %}<a class="button button-primary" href="{{ url_for('review', article_id=article.id) }}"><i data-lucide="clipboard-check"></i>去审核</a>{% endif %}
 {% endblock %}
 
@@ -16,7 +16,7 @@
         <h2 class="article-title">{{ article.title|default('未命名文章', true) }}</h2>
         {% set original_title = article.original_title|default(article.title_original|default(''), true) %}
         {% if original_title and original_title != article.title %}<p class="original-title">原始标题：{{ original_title }}</p>{% endif %}
-        <div class="article-meta-line"><span><i data-lucide="folder-open"></i>{{ tab.name|default('未配置栏目', true) }}</span><span><i data-lucide="clock-3"></i>进入 {{ article.created_at|default('-') }}</span><span><i data-lucide="refresh-cw"></i>更新 {{ article.updated_at|default('-') }}</span></div>
+        <div class="article-meta-line"><span><i data-lucide="folder-open"></i>{{ tab.name|default('未配置栏目', true) }}</span><span><i data-lucide="clock-3"></i>进入 {{ article.created_at|beijing_time|default('-', true) }}</span><span><i data-lucide="refresh-cw"></i>更新 {{ article.updated_at|beijing_time|default('-', true) }}</span><span class="muted">时间为北京时间</span></div>
       </section>
 
       <section class="panel content-panel">
@@ -39,6 +39,22 @@
     </div>
 
     <aside class="detail-side">
+      {% if article.status_key in ['ready_to_publish', 'publish_failed'] %}
+      <section class="panel draft-panel">
+        <div class="panel-head"><div><h2>草稿操作</h2><p>会记录请求地址、请求字段、返回结果和失败原因</p></div></div>
+        {% if can_create_draft %}
+          <button class="button button-primary" type="button" data-create-draft data-id="{{ article.id }}" data-confirm="{{ article.draft_action_confirm|e }}"><i data-lucide="sparkles"></i>{{ article.draft_action_label }}</button>
+        {% else %}
+          <button class="button button-primary" type="button" disabled><i data-lucide="sparkles"></i>{{ article.draft_action_label }}</button>
+          <p class="muted">开放平台授权或发布配置未就绪，暂不能执行。</p>
+        {% endif %}
+        {% if article.draft_recovered %}
+          <div class="inline-alert"><i data-lucide="badge-check"></i><span>{{ article.draft_notice }}</span></div>
+        {% endif %}
+        <p class="muted">每次操作都会写入下方时间线，便于回查失败原因。</p>
+      </section>
+      {% endif %}
+
       <section class="panel quality-panel">
         <div class="panel-head"><div><h2>质检结果</h2><p>本轮自动检查明细</p></div><span class="level-mark">B</span></div>
         {% set issues = quality.get('issues', {}) if quality else {} %}
@@ -61,13 +77,14 @@
 
       <section class="panel ids-panel">
         <div class="panel-head"><div><h2>外部关联</h2><p>仅发布阶段使用</p></div></div>
-        <dl class="definition-list compact-def"><div><dt>素材接口 archive_id</dt><dd><code>{{ article.upstream_archive_id|default(article.archive_id|default(0)) }}</code></dd></div><div><dt>后台 source_id</dt><dd><code>{{ article.dqd_source_id|default('未映射', true) }}</code></dd></div><div><dt>后台 archive_id</dt><dd><code>{{ article.dqd_archive_id|default('未创建', true) }}</code></dd></div></dl>
+        <dl class="definition-list compact-def"><div><dt>素材接口 archive_id</dt><dd><code>{{ article.upstream_archive_id|default(article.archive_id|default(0)) }}</code></dd></div><div><dt>后台 source_id</dt><dd><code>{{ article.dqd_source_id|default('未映射', true) }}</code></dd></div><div><dt>后台 archive_id</dt><dd>{% if article.draft_url %}<a class="external-link" href="{{ article.draft_url }}" target="_blank" rel="noreferrer"><code>{{ article.dqd_archive_id }}</code></a>{% else %}<code>{{ article.dqd_archive_id|default('未创建', true) }}</code>{% endif %}</dd></div></dl>
+        {% if article.draft_recovered %}<p class="muted">提示：这条记录显示为创建失败，但草稿链接已经生成，可直接打开后台草稿页。</p>{% endif %}
       </section>
     </aside>
   </div>
 
   <section class="panel timeline-panel">
-    <div class="panel-head"><div><h2>处理时间线</h2><p>每次状态变化和人工操作都会记录</p></div></div>
-    {% if events %}<ol class="timeline">{% for event in events %}<li><span class="timeline-dot"></span><div><strong>{{ event.label|default(event.event_type|default('状态更新')) }}</strong><p>{{ event.message|default('') }}</p><time>{{ event.created_at|default('-') }}</time></div></li>{% endfor %}</ol>{% else %}<div class="empty-state compact"><i data-lucide="git-commit-horizontal"></i><strong>暂无时间线记录</strong></div>{% endif %}
+    <div class="panel-head"><div><h2>处理时间线</h2><p>每次状态变化和人工操作都会记录，时间均为北京时间</p></div></div>
+    {% if events %}<ol class="timeline">{% for event in events %}<li><span class="timeline-dot"></span><div><strong>{{ event.label|default(event.event_type|default('状态更新')) }}</strong><p>{{ event.message|default('') }}</p>{% if event.payload %}<details class="event-payload"><summary>查看记录</summary><pre>{{ event.payload|tojson(indent=2) }}</pre></details>{% endif %}<time>{{ event.created_at|beijing_time|default('-', true) }}</time></div></li>{% endfor %}</ol>{% else %}<div class="empty-state compact"><i data-lucide="git-commit-horizontal"></i><strong>暂无时间线记录</strong></div>{% endif %}
   </section>
 {% endblock %}

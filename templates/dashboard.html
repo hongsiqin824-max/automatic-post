@@ -32,7 +32,7 @@
     </a>
     <a class="metric" href="{{ url_for('articles', status='ERROR') }}">
       <span class="metric-icon tone-red"><i data-lucide="circle-alert"></i></span>
-      <span><small>处理失败</small><strong>{{ stats.failed|default(stats.ERROR|default(0)) }}</strong></span>
+      <span><small>处理失败</small><strong>{{ stats.error|default(0) }}</strong></span>
       <i class="metric-arrow" data-lucide="arrow-up-right"></i>
     </a>
   </section>
@@ -45,7 +45,7 @@
       </div>
       {% if status_groups %}
         <div class="pipeline-list">
-          {% set status_icons = {'received':'inbox','quality_checking':'scan-search','needs_review':'user-round-check','ready_to_publish':'send','already_published':'badge-check','rejected':'circle-x','error':'triangle-alert'} %}
+          {% set status_icons = {'received':'inbox','quality_checking':'scan-search','needs_review':'user-round-check','ready_to_publish':'send','publishing':'loader-circle','draft_created':'badge-check','publish_failed':'triangle-alert','already_published':'badge-check','rejected':'circle-x','error':'triangle-alert'} %}
           {% for group in status_groups %}
             {% set group_key = group.status|lower %}
             <a class="pipeline-row" href="{{ url_for('articles', status=group.status) }}">
@@ -62,12 +62,13 @@
     </div>
 
     <div class="panel schedule-panel">
-      <div class="panel-head"><div><h2>自动任务</h2><p>素材接口拉取状态</p></div><span class="status-badge {{ 'status-running' if settings.scheduler_enabled else 'status-paused' }}"><span></span>{{ '运行中' if settings.scheduler_enabled else '已暂停' }}</span></div>
+      <div class="panel-head"><div><h2>自动任务</h2><p>素材接口拉取状态，时间均为北京时间</p></div><span class="status-badge {{ 'status-running' if settings.scheduler_enabled else 'status-paused' }}"><span></span>{{ '运行中' if settings.scheduler_enabled else '已暂停' }}</span></div>
       <dl class="definition-list">
         <div><dt>执行周期</dt><dd>{{ settings.interval_minutes|default(10) }} 分钟</dd></div>
-        <div><dt>上次执行</dt><dd>{{ settings.last_run_at|default('尚未执行', true) }}</dd></div>
-        <div><dt>下次执行</dt><dd>{{ settings.next_run_at|default('等待调度', true) }}</dd></div>
+        <div><dt>上次执行</dt><dd>{{ settings.last_run_at|beijing_time|default('尚未执行', true) }}</dd></div>
+        <div><dt>下次执行</dt><dd>{{ settings.next_run_at|beijing_time|default('等待调度', true) }}</dd></div>
         <div><dt>启用来源</dt><dd>{{ settings.enabled_sources|default(0) }} 个</dd></div>
+        <div><dt>开放平台发布</dt><dd>{{ '已启用' if settings.publisher_enabled and settings.dqd_open_configured else ('仅已配置' if settings.dqd_open_configured else '未配置') }}</dd></div>
       </dl>
       {% if settings.last_error %}
         <div class="inline-alert"><i data-lucide="triangle-alert"></i><span>{{ settings.last_error }}</span></div>
@@ -77,7 +78,7 @@
 
   <section class="panel">
     <div class="panel-head">
-      <div><h2>最近进入的文章</h2><p>按进入系统的时间倒序</p></div>
+      <div><h2>最近进入的文章</h2><p>按进入系统的时间倒序，时间均为北京时间</p></div>
       <a class="text-link" href="{{ url_for('articles') }}">文章库 <i data-lucide="arrow-right"></i></a>
     </div>
     {% if recent %}
@@ -91,7 +92,7 @@
               <td><span class="source-code">{{ article.source }}</span></td>
               <td>{{ article.tab_name|default('未配置', true) }}</td>
               <td><span class="status-pill status-{{ article.status|lower }}">{{ article.status_label|default(article.status) }}</span></td>
-              <td class="muted nowrap">{{ article.updated_at|default('-') }}</td>
+              <td class="muted nowrap">{{ article.updated_at|beijing_time|default('-', true) }}</td>
               <td><a class="icon-button subtle" href="{{ url_for('article_detail', article_id=article.id) }}" title="查看详情" aria-label="查看文章详情"><i data-lucide="chevron-right"></i></a></td>
             </tr>
           {% endfor %}
@@ -110,8 +111,8 @@
         {% for run in runs %}
           <div class="run-row">
             <span class="run-state status-{{ run.status|lower }}"><i data-lucide="{{ 'circle-check' if run.status|lower == 'success' else ('loader-circle' if run.status|lower == 'running' else 'circle-x') }}"></i></span>
-            <div><strong>{{ run.started_at }}</strong><small>{{ run.message|default('任务执行完成') }}</small></div>
-            <div class="run-numbers"><span>获取 <b>{{ run.fetched|default(0) }}</b></span><span>新增 <b>{{ run.created|default(0) }}</b></span><span>重复 <b>{{ run.duplicates|default(0) }}</b></span></div>
+            <div><strong>{{ run.started_at|beijing_time|default('-', true) }}</strong><small>{{ run.message|default('任务执行完成') }}</small></div>
+            <div class="run-numbers"><span>获取 <b>{{ run.fetched|default(0) }}</b></span><span>新增 <b>{{ run.created|default(0) }}</b></span><span>重复 <b>{{ run.duplicates|default(0) }}</b></span><span>草稿 <b>{{ run.drafts|default(0) }}</b></span></div>
             <span class="status-pill status-{{ run.status|lower }}">{{ run.status_label|default(run.status) }}</span>
           </div>
         {% endfor %}

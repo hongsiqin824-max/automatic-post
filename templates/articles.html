@@ -22,11 +22,11 @@
   </form>
 
   <section class="panel table-panel">
-    <div class="table-summary"><span>共 <strong>{{ articles|length }}</strong> 篇文章</span><span class="muted">点击标题查看完整处理过程</span></div>
+    <div class="table-summary"><span>共 <strong>{{ articles|length }}</strong> 篇文章</span><span class="muted">点击标题查看完整处理过程 · 时间均为北京时间</span></div>
     {% if articles %}
       <div class="table-wrap">
         <table class="data-table article-table">
-          <thead><tr><th>文章</th><th>来源</th><th>栏目</th><th>质检</th><th>状态</th><th>进入时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+          <thead><tr><th>文章</th><th>来源</th><th>栏目</th><th>质检</th><th>状态</th><th>进入时间（北京时间）</th><th><span class="sr-only">操作</span></th></tr></thead>
           <tbody>
           {% for article in articles %}
             <tr>
@@ -43,7 +43,7 @@
                 {% else %}<span class="result-label"><i data-lucide="minus"></i>未质检</span>{% endif %}
               </td>
               <td><span class="status-pill status-{{ article.status|lower }}">{{ article.status_label|default(status_labels.get(article.status, article.status)) }}</span></td>
-              <td class="muted nowrap">{{ article.created_at|default('-') }}</td>
+              <td class="muted nowrap">{{ article.created_at|beijing_time|default('-', true) }}</td>
               <td><a class="icon-button subtle" href="{{ url_for('article_detail', article_id=article.id) }}" title="查看详情" aria-label="查看文章详情"><i data-lucide="chevron-right"></i></a></td>
             </tr>
           {% endfor %}
