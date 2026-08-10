@@ -7,6 +7,8 @@ import json
 import os
 import sqlite3
 from urllib.parse import urlparse
+
+import requests as _requests
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +22,7 @@ from .catalog import seed_catalog
 from .config import AppConfig, ensure_instance_dir
 from .db import get_db, init_app as init_db_app, init_db
 from .services.material_client import cdn_url
-from .services.open_platform import OpenPlatformClient, auth_record_summary, build_draft_url
+from .services.open_platform import AUTH_STATUS_LABELS, OpenPlatformClient, auth_record_summary, build_draft_url
 from .services.pipeline import RunController
 from .services.scheduler import Scheduler
 from .services.publisher import DraftClaimSkipped, create_draft_for_article
@@ -179,7 +181,37 @@ def _settings_view(app: Flask) -> dict:
     scheduler: Scheduler = app.extensions["scheduler"]
     conn = get_db()
     enabled_sources = len(repo.list_sources(conn, include_disabled=False))
-    open_auth = auth_record_summary(db.get_open_platform_auth(cfg.database_path))
+    token_service_url = os.getenv("TOKEN_SERVICE_URL", "").rstrip("/")
+    if token_service_url:
+        # 统一授权模式：从 token-service 读取真实授权状态和回调地址
+        try:
+            resp = _requests.get(f"{token_service_url}/auth/status", timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            ts_status = data.get("auth_status", "UNKNOWN")
+            open_auth = {
+                "configured": True,
+                "auth_status": ts_status,
+                "auth_status_label": AUTH_STATUS_LABELS.get(ts_status, ts_status),
+                "has_access_token": data.get("has_access_token", False),
+                "has_refresh_token": data.get("has_refresh_token", False),
+                "pending_state": "",
+                "pending_state_expires_at": None,
+                "token_expires_at": data.get("token_expires_at"),
+                "refresh_token_expires_at": data.get("refresh_token_expires_at"),
+                "expires_in_seconds": data.get("expires_in_seconds"),
+                "refresh_expires_in_seconds": data.get("refresh_expires_in_seconds"),
+                "authorized_user": data.get("authorized_user") or {},
+                "last_error": data.get("last_error") or "",
+                "last_authorize_url": data.get("last_authorize_url") or "",
+            }
+            open_redirect_uri = f"{token_service_url}/auth/callback"
+        except Exception:
+            open_auth = auth_record_summary(db.get_open_platform_auth(cfg.database_path))
+            open_redirect_uri = cfg.dqd_open_redirect_uri
+    else:
+        open_auth = auth_record_summary(db.get_open_platform_auth(cfg.database_path))
+        open_redirect_uri = cfg.dqd_open_redirect_uri
     return {
         "scheduler_enabled": bool(scheduler.enabled),
         "interval_minutes": max(1, cfg.scheduler_interval_seconds // 60),
@@ -191,7 +223,7 @@ def _settings_view(app: Flask) -> dict:
         "llm_configured": cfg.llm_configured,
         "dqd_configured": cfg.dqd_configured,
         "dqd_open_configured": cfg.dqd_open_configured,
-        "dqd_open_redirect_uri": cfg.dqd_open_redirect_uri,
+        "dqd_open_redirect_uri": open_redirect_uri,
         "open_platform_auth": open_auth,
         "publisher_enabled": cfg.publisher_enabled,
     }
@@ -414,6 +446,37 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/api/open/auth/status")
     def api_open_auth_status():
         cfg: AppConfig = app.extensions["app_config"]
+        token_service_url = os.getenv("TOKEN_SERVICE_URL", "").rstrip("/")
+        if token_service_url:
+            # 统一授权模式：从 token-service 读取真实授权状态
+            try:
+                resp = _requests.get(f"{token_service_url}/auth/status", timeout=5)
+                resp.raise_for_status()
+                data = resp.json()
+                ts_status = data.get("auth_status", "UNKNOWN")
+                return jsonify({
+                    "success": True,
+                    "configured": bool(cfg.dqd_open_appid and cfg.dqd_open_appsecret),
+                    "redirect_uri": f"{token_service_url}/auth/callback",
+                    "auth": {
+                        "configured": True,
+                        "auth_status": ts_status,
+                        "auth_status_label": AUTH_STATUS_LABELS.get(ts_status, ts_status),
+                        "has_access_token": data.get("has_access_token", False),
+                        "has_refresh_token": data.get("has_refresh_token", False),
+                        "pending_state": "",
+                        "pending_state_expires_at": None,
+                        "token_expires_at": data.get("token_expires_at"),
+                        "refresh_token_expires_at": data.get("refresh_token_expires_at"),
+                        "expires_in_seconds": data.get("expires_in_seconds"),
+                        "refresh_expires_in_seconds": data.get("refresh_expires_in_seconds"),
+                        "authorized_user": data.get("authorized_user") or {},
+                        "last_error": data.get("last_error") or "",
+                        "last_authorize_url": data.get("last_authorize_url") or "",
+                    },
+                })
+            except Exception as exc:
+                return jsonify({"success": False, "error": f"token-service 不可达: {exc}"}), 502
         return jsonify({
             "success": True,
             "configured": bool(cfg.dqd_open_appid and cfg.dqd_open_appsecret),
@@ -424,6 +487,18 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.post("/api/open/auth/start")
     def api_open_auth_start():
         cfg: AppConfig = app.extensions["app_config"]
+        token_service_url = os.getenv("TOKEN_SERVICE_URL", "").rstrip("/")
+        if token_service_url:
+            # 统一授权模式：将授权发起委托给 token-service，
+            # 使 redirect_uri 指向 :9000/auth/callback，token 统一存在 token-service 的 DB。
+            try:
+                resp = _requests.post(f"{token_service_url}/auth/start", timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                return jsonify({"success": True, "authorize_url": data["authorize_url"]})
+            except Exception as exc:
+                return jsonify({"success": False, "error": f"token-service 不可达: {exc}"}), 502
+        # 未配置 TOKEN_SERVICE_URL 时降级到本地授权流程
         try:
             result = OpenPlatformClient(cfg).start_authorization()
             return jsonify({"success": True, **result})

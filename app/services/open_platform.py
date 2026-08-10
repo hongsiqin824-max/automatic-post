@@ -11,10 +11,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import os
+
 import requests
 
 from .. import db
 from ..config import AppConfig
+
+_TOKEN_SERVICE_URL = os.getenv("TOKEN_SERVICE_URL", "").rstrip("/")
 
 
 logger = logging.getLogger(__name__)
@@ -419,6 +423,35 @@ class OpenPlatformClient:
         return token["access_token"]
 
     def ensure_access_token(self, *, force_refresh: bool = False) -> str:
+        # --- Token Service 集中模式 ---
+        # 若配置了 TOKEN_SERVICE_URL，优先从 Token Service 获取 access_token。
+        # 降级：Token Service 不可达时，回退到本地 DB 逻辑（保证单机仍可运行）。
+        token_service_url = _TOKEN_SERVICE_URL
+        if token_service_url:
+            params = "?force=1" if force_refresh else ""
+            try:
+                resp = self.session.get(
+                    f"{token_service_url}/token{params}",
+                    timeout=5,
+                )
+                payload = resp.json()
+                if resp.status_code == 200 and payload.get("ok"):
+                    return str(payload["access_token"])
+                if resp.status_code == 401:
+                    authorize_url = payload.get("authorize_url") or token_service_url
+                    raise OpenPlatformAuthError(
+                        f"Token Service 未授权，请访问 {token_service_url}/auth/start 重新授权",
+                        status="AUTH_REQUIRED",
+                        authorize_url=authorize_url,
+                    )
+                # 其他错误（5xx等）降级到本地
+                logger.warning("Token Service 返回错误 %s，降级到本地 DB: %s", resp.status_code, payload)
+            except OpenPlatformAuthError:
+                raise
+            except Exception as exc:
+                logger.warning("Token Service 不可达，降级到本地 DB: %s", exc)
+
+        # --- 本地 DB 模式（降级 / 未配置 TOKEN_SERVICE_URL 时使用）---
         record = db.get_open_platform_auth(self.settings.database_path)
         if record is None:
             raise OpenPlatformAuthError(
