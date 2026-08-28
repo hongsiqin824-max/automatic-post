@@ -35,7 +35,7 @@
                 <small><span>#{{ article.id }}</span><span>{{ article.source_url|default('') }}</span></small>
               </td>
               <td><span class="source-code">{{ article.source }}</span></td>
-              <td>{{ article.tab_name|default('未配置', true) }}</td>
+              <td>{{ article.tab_names|default(article.tab_name|default('未配置', true), true) }}</td>
               <td>
                 {% set quality_passed = article.quality_passed if article.quality_passed is defined else article.quality.get('pass') if article.quality else none %}
                 {% if quality_passed is sameas true %}<span class="result-label result-ok"><i data-lucide="check"></i>通过</span>

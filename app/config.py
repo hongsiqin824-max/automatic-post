@@ -98,6 +98,19 @@ class AppConfig:
     dqd_open_status: int = _env_int("DQD_OPEN_STATUS", 0)
     dqd_open_timeout: int = max(5, _env_int("DQD_OPEN_TIMEOUT_SECONDS", 30))
     dqd_open_archive_level: str = os.getenv("DQD_OPEN_ARCHIVE_LEVEL", "B").strip().upper() or "B"
+    dqd_open_idempotency_enabled: bool = _env_bool(
+        "DQD_OPEN_IDEMPOTENCY_ENABLED", False
+    )
+    dqd_open_idempotency_field: str = (
+        os.getenv("DQD_OPEN_IDEMPOTENCY_FIELD", "client_request_id").strip()
+        or "client_request_id"
+    )
+    dqd_open_502_retry_enabled: bool = _env_bool(
+        "DQD_OPEN_502_RETRY_ENABLED", True
+    )
+    dqd_open_502_retry_delay_seconds: int = max(
+        1, min(300, _env_int("DQD_OPEN_502_RETRY_DELAY_SECONDS", 5))
+    )
 
     scheduler_enabled: bool = _env_bool("AUTOMATIC_POST_SCHEDULER", True)
     scheduler_interval_seconds: int = max(

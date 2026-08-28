@@ -3,9 +3,264 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+import requests
+
 from app import db
-from app.services.dqd_open_client import DqdOpenClient
-from app.services.open_platform import OpenPlatformClient, build_draft_url
+import app.services.dqd_open_client as dqd_open_client_module
+from app.services.dqd_open_client import (
+    DqdOpenClient,
+    DqdOpenClientError,
+    build_create_article_form,
+)
+from app.services.article_images import first_image_src
+from app.services.dqd_publish_html import DqdPublishHtmlError
+from app.services.open_platform import (
+    OpenPlatformClient,
+    OpenPlatformRequestError,
+    build_draft_url,
+)
+
+
+def test_first_image_src_selects_first_safe_image():
+    body = (
+        '<p><img src="javascript:alert(1)"></p>'
+        '<p><IMG alt="正文首图" src="/fastdfs8/body-cover.jpg"></p>'
+        '<p><img src="/fastdfs8/second.jpg"></p>'
+    )
+
+    assert first_image_src(body) == "/fastdfs8/body-cover.jpg"
+
+
+def test_first_image_src_rejects_empty_and_unsafe_values():
+    assert first_image_src('<img src="data:image/png;base64,abc">') is None
+    assert first_image_src('<img src="">') is None
+
+
+def test_create_article_form_prefers_body_first_image_over_material_cover(app):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+    article = {
+        "title_final": "正文首图作为后台封面",
+        "body_html": '<p><img src="/fastdfs8/body-cover.jpg"></p>',
+        "litpic": "/fastdfs7/material-cover.jpg",
+    }
+
+    form = build_create_article_form(article, {"backend_tab_id": 284}, config)
+
+    assert ("litpic", "/fastdfs8/body-cover.jpg") in form
+    assert article["litpic"] == "/fastdfs7/material-cover.jpg"
+
+
+def test_create_article_form_falls_back_to_material_cover_without_body_image(app):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+
+    form = build_create_article_form(
+        {
+            "title_final": "回退素材封面",
+            "body_html": "<p>没有图片的正文</p>",
+            "litpic": "/fastdfs7/material-cover.jpg",
+        },
+        {"backend_tab_id": 284},
+        config,
+    )
+
+    assert ("litpic", "/fastdfs7/material-cover.jpg") in form
+
+
+@pytest.mark.parametrize("status", [0, 1])
+def test_create_article_form_inserts_cover_into_body_for_both_publish_modes(app, status):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+
+    form = build_create_article_form(
+        {
+            "title_final": "提交前补正文图片",
+            "body_html": "<p>第一段</p><p>第二段</p>",
+            "litpic": "/fastdfs7/material-cover.jpg",
+        },
+        {"backend_tab_id": 284},
+        config,
+        status=status,
+    )
+
+    fields = dict(form)
+    assert fields["status"] == str(status)
+    assert fields["body"] == (
+        '<p>第一段</p><p><img src="/fastdfs7/material-cover.jpg"></p><p>第二段</p>'
+    )
+    assert fields["litpic"] == "/fastdfs7/material-cover.jpg"
+
+
+@pytest.mark.parametrize("status", [True, False, -1, 2, "publish"])
+def test_create_article_form_rejects_invalid_publish_status(app, status):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+
+    with pytest.raises(DqdOpenClientError, match="status 必须是 0"):
+        build_create_article_form(
+            {
+                "title_final": "非法发布模式",
+                "body_html": "<p>用于验证 status 参数校验的正文。</p>",
+            },
+            {"backend_tab_id": 284},
+            config,
+            status=status,
+        )
+
+
+def test_create_article_form_keeps_existing_body_image_and_does_not_duplicate(app):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+    body = ' \n<p>第一段</p><p><img src="/fastdfs8/body-cover.jpg"></p><p>末段</p>\n '
+    article = {
+        "title_final": "已有正文图片",
+        "body_html": body,
+        "litpic": "/fastdfs7/material-cover.jpg",
+    }
+
+    first_body = dict(
+        build_create_article_form(article, {"backend_tab_id": 284}, config)
+    )["body"]
+    second_body = dict(
+        build_create_article_form(
+            {**article, "body_html": first_body},
+            {"backend_tab_id": 284},
+            config,
+        )
+    )["body"]
+
+    assert first_body == body
+    assert second_body == body
+    assert second_body.count("<img") == 1
+
+
+def test_create_article_form_removes_linked_text_but_preserves_linked_images(app):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+    body = (
+        '<p>正文内容，包含比赛信息和赛后采访。</p>'
+        '<p><a href="https://example.com/related">澳超相关新闻</a></p>'
+        '<p><a href="https://example.com/image"><img src="/body.jpg"></a></p>'
+    )
+
+    fields = dict(build_create_article_form(
+        {"title_final": "去除可跳转内容", "body_html": body},
+        {"backend_tab_id": 284},
+        config,
+    ))
+
+    assert "href=" not in fields["body"]
+    assert "澳超相关新闻" not in fields["body"]
+    assert '<img src="/body.jpg">' in fields["body"]
+
+
+def test_create_article_form_uses_shared_default_when_publish_image_is_missing(app):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+
+    form = build_create_article_form(
+        {
+            "title_final": "没有可用图片",
+            "body_html": "<p>纯文字正文</p>",
+            "litpic": "javascript:alert(1)",
+        },
+        {"backend_tab_id": 284},
+        config,
+    )
+    assert dict(form)["litpic"] == "/fastdfs7/M00/71/51/rBUC6Gh3f-uAJ3PaAABRUJ73Hek971.jpg"
+
+
+@pytest.mark.parametrize("status", [0, 1])
+def test_create_article_form_cleans_wordpress_metadata_for_both_modes(app, status):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+    body = (
+        '<p>澳超正文</p><img src="https://img.example/aleagues.jpg" '
+        "data-image-meta='{" + '"camera":"Canon EOS R5"' + "}' "
+        'data-orig-file="https://img.example/original.jpg" class="wp-image-1">'
+    )
+
+    fields = dict(
+        build_create_article_form(
+            {"title_final": "提交前清理", "body_html": body},
+            {"backend_tab_id": 284},
+            config,
+            status=status,
+        )
+    )
+
+    assert fields["status"] == str(status)
+    assert "data-image-meta" not in fields["body"]
+    assert "data-orig-file" not in fields["body"]
+    assert 'src="https://img.example/aleagues.jpg"' in fields["body"]
+    assert 'class="wp-image-1"' in fields["body"]
+
+
+def test_html_validation_failure_stops_before_open_platform_request(app, monkeypatch):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+    client = DqdOpenClient(config)
+    request_called = False
+
+    def fail_cleanup(body):
+        raise DqdPublishHtmlError("校验失败")
+
+    def unexpected_request(**kwargs):
+        nonlocal request_called
+        request_called = True
+        raise AssertionError("不应调用懂球帝接口")
+
+    monkeypatch.setattr(dqd_open_client_module, "sanitize_dqd_publish_html", fail_cleanup)
+    monkeypatch.setattr(client.open_platform, "post_signed", unexpected_request)
+
+    with pytest.raises(DqdOpenClientError, match="懂球帝正文安全校验失败：校验失败"):
+        client.create_article(
+            {
+                "title_final": "不应提交",
+                "body_html": '<p>正文</p><img src="/one.jpg">',
+            },
+            {"backend_tab_id": 284},
+        )
+
+    assert request_called is False
 
 
 def test_start_authorization_persists_state(app):
@@ -174,6 +429,276 @@ def test_create_article_extracts_nested_article_id_alias(app, monkeypatch):
         draft = client.create_article(article, tab)
 
     assert draft.archive_id == 6141777
+
+
+@pytest.mark.parametrize(
+    ("inner_data", "expected_message"),
+    [
+        (
+            {
+                "code": 3,
+                "message": "创建失败",
+                "data": {"result": {"success": False, "message": "重复请求"}},
+            },
+            "懂球帝创建草稿失败：重复请求",
+        ),
+        (
+            {
+                "code": 5,
+                "message": "服务异常",
+                "data": {"err": "internal database detail"},
+            },
+            "懂球帝创建草稿失败：服务异常",
+        ),
+    ],
+)
+def test_create_article_reports_nested_business_failure(
+    app,
+    monkeypatch,
+    inner_data,
+    expected_message,
+):
+    class FakeResponse:
+        status_code = 200
+
+    response_payload = {
+        "code": 0,
+        "message": "success",
+        "data": inner_data,
+        "request_id": "request-123",
+    }
+    with app.app_context():
+        cfg = replace(
+            app.extensions["app_config"],
+            dqd_open_appid="appid-test",
+            dqd_open_appsecret="secret-test",
+            dqd_open_enname="hongsiqin",
+        )
+        client = DqdOpenClient(cfg)
+        monkeypatch.setattr(
+            client.open_platform,
+            "post_signed",
+            lambda **kwargs: (
+                FakeResponse(),
+                response_payload,
+                "https://platform.dongqiudi.com/open/v1/do",
+            ),
+        )
+        tab = {"backend_tab_id": 1}
+        article = {"title_final": "demo", "body_html": '<p><img src="x.jpg"></p>', "channels": []}
+
+        with pytest.raises(DqdOpenClientError, match=expected_message) as raised:
+            client.create_article(article, tab)
+
+    assert raised.value.payload == response_payload
+    assert raised.value.status_code == 200
+    assert raised.value.diagnostics["request_id"] == "request-123"
+    assert raised.value.result_unknown is (inner_data.get("code") == 5)
+    assert raised.value.diagnostics["result_unknown"] is (inner_data.get("code") == 5)
+
+
+def test_create_article_keeps_missing_archive_id_fallback_for_ambiguous_success(app, monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+    with app.app_context():
+        cfg = replace(
+            app.extensions["app_config"],
+            dqd_open_appid="appid-test",
+            dqd_open_appsecret="secret-test",
+            dqd_open_enname="hongsiqin",
+        )
+        client = DqdOpenClient(cfg)
+        monkeypatch.setattr(
+            client.open_platform,
+            "post_signed",
+            lambda **kwargs: (
+                FakeResponse(),
+                {"code": 0, "message": "success", "data": {}},
+                "https://platform.dongqiudi.com/open/v1/do",
+            ),
+        )
+        tab = {"backend_tab_id": 1}
+        article = {"title_final": "demo", "body_html": '<p><img src="x.jpg"></p>', "channels": []}
+
+        with pytest.raises(
+            DqdOpenClientError,
+            match="创建草稿成功但没有返回 archive_id",
+        ) as raised:
+            client.create_article(article, tab)
+
+    assert raised.value.result_unknown is True
+    assert raised.value.diagnostics["result_unknown"] is True
+
+
+def test_create_article_marks_http_502_as_result_unknown(app, monkeypatch):
+    payload = {
+        "code": 50001,
+        "message": "内部接口调用失败",
+        "request_id": "upstream-request-502",
+    }
+    with app.app_context():
+        cfg = replace(
+            app.extensions["app_config"],
+            dqd_open_appid="appid-test",
+            dqd_open_appsecret="secret-test",
+            dqd_open_enname="hongsiqin",
+            dqd_open_idempotency_enabled=True,
+        )
+        client = DqdOpenClient(cfg)
+
+        def raise_502(**kwargs):
+            raise OpenPlatformRequestError(
+                "创建文章接口返回 HTTP 502: 内部接口调用失败",
+                payload=payload,
+                status_code=502,
+                diagnostics={"request_url": "https://platform.dongqiudi.com/open/v1/do"},
+            )
+
+        monkeypatch.setattr(client.open_platform, "post_signed", raise_502)
+        tab = {"backend_tab_id": 1}
+        article = {"title_final": "demo", "body_html": '<p><img src="x.jpg"></p>'}
+
+        with pytest.raises(DqdOpenClientError, match="HTTP 502") as raised:
+            client.create_article(article, tab, client_request_id="draft-request-1")
+
+    assert raised.value.status_code == 502
+    assert raised.value.result_unknown is True
+    assert raised.value.diagnostics["result_unknown"] is True
+    assert raised.value.diagnostics["request_id"] == "upstream-request-502"
+    assert raised.value.diagnostics["client_request_id"] == "draft-request-1"
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [requests.Timeout("request timed out"), requests.ConnectionError("connection reset")],
+)
+def test_create_article_marks_transport_interruption_as_result_unknown(
+    app,
+    monkeypatch,
+    transport_error,
+):
+    with app.app_context():
+        cfg = replace(
+            app.extensions["app_config"],
+            dqd_open_appid="appid-test",
+            dqd_open_appsecret="secret-test",
+            dqd_open_enname="hongsiqin",
+        )
+        client = DqdOpenClient(cfg)
+
+        def raise_transport_error(**kwargs):
+            raise transport_error
+
+        monkeypatch.setattr(client.open_platform, "post_signed", raise_transport_error)
+        tab = {"backend_tab_id": 1}
+        article = {"title_final": "demo", "body_html": '<p><img src="x.jpg"></p>'}
+
+        with pytest.raises(DqdOpenClientError, match="创建草稿请求失败") as raised:
+            client.create_article(article, tab)
+
+    assert raised.value.result_unknown is True
+    assert raised.value.diagnostics["result_unknown"] is True
+    assert raised.value.diagnostics["exception_type"] == type(transport_error).__name__
+
+
+def test_create_article_marks_non_json_response_as_result_unknown(app, monkeypatch):
+    with app.app_context():
+        cfg = replace(
+            app.extensions["app_config"],
+            dqd_open_appid="appid-test",
+            dqd_open_appsecret="secret-test",
+            dqd_open_enname="hongsiqin",
+        )
+        client = DqdOpenClient(cfg)
+
+        def raise_non_json(**kwargs):
+            raise OpenPlatformRequestError(
+                "创建文章接口返回不是 JSON",
+                status_code=200,
+                diagnostics={"response_text": "upstream gateway error"},
+            )
+
+        monkeypatch.setattr(client.open_platform, "post_signed", raise_non_json)
+        tab = {"backend_tab_id": 1}
+        article = {"title_final": "demo", "body_html": '<p><img src="x.jpg"></p>'}
+
+        with pytest.raises(DqdOpenClientError, match="不是 JSON") as raised:
+            client.create_article(article, tab)
+
+    assert raised.value.result_unknown is True
+    assert raised.value.diagnostics["result_unknown"] is True
+    assert raised.value.diagnostics["response_text"] == "upstream gateway error"
+
+
+def test_create_article_submits_configured_idempotency_field(app, monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+    submitted = {}
+    with app.app_context():
+        cfg = replace(
+            app.extensions["app_config"],
+            dqd_open_appid="appid-test",
+            dqd_open_appsecret="secret-test",
+            dqd_open_enname="hongsiqin",
+            dqd_open_idempotency_enabled=True,
+            dqd_open_idempotency_field="external_request_id",
+        )
+        client = DqdOpenClient(cfg)
+
+        def post_signed(**kwargs):
+            submitted.update(kwargs)
+            return (
+                FakeResponse(),
+                {"code": 0, "data": {"archive_id": 6141888}},
+                "https://platform.dongqiudi.com/open/v1/do",
+            )
+
+        monkeypatch.setattr(client.open_platform, "post_signed", post_signed)
+        tab = {"backend_tab_id": 1}
+        article = {"title_final": "demo", "body_html": '<p><img src="x.jpg"></p>'}
+        draft = client.create_article(
+            article,
+            tab,
+            client_request_id="draft-request-2",
+        )
+
+    assert ("external_request_id", "draft-request-2") in submitted["data"]
+    assert draft.diagnostics["client_request_id"] == "draft-request-2"
+    assert draft.diagnostics["idempotency_field"] == "external_request_id"
+
+
+def test_create_article_omits_idempotency_field_until_enabled(app, monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+    submitted = {}
+    with app.app_context():
+        cfg = replace(
+            app.extensions["app_config"],
+            dqd_open_appid="appid-test",
+            dqd_open_appsecret="secret-test",
+            dqd_open_enname="hongsiqin",
+            dqd_open_idempotency_enabled=False,
+        )
+        client = DqdOpenClient(cfg)
+
+        def post_signed(**kwargs):
+            submitted.update(kwargs)
+            return (
+                FakeResponse(),
+                {"code": 0, "data": {"archive_id": 6141999}},
+                "https://platform.dongqiudi.com/open/v1/do",
+            )
+
+        monkeypatch.setattr(client.open_platform, "post_signed", post_signed)
+        tab = {"backend_tab_id": 1}
+        article = {"title_final": "demo", "body_html": '<p><img src="x.jpg"></p>'}
+        client.create_article(article, tab, client_request_id="draft-request-3")
+
+    submitted_keys = {key for key, _ in submitted["data"]}
+    assert "client_request_id" not in submitted_keys
 
 
 def test_build_draft_url_returns_backend_article_page():

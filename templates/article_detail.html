@@ -16,13 +16,27 @@
         <h2 class="article-title">{{ article.title|default('未命名文章', true) }}</h2>
         {% set original_title = article.original_title|default(article.title_original|default(''), true) %}
         {% if original_title and original_title != article.title %}<p class="original-title">原始标题：{{ original_title }}</p>{% endif %}
-        <div class="article-meta-line"><span><i data-lucide="folder-open"></i>{{ tab.name|default('未配置栏目', true) }}</span><span><i data-lucide="clock-3"></i>进入 {{ article.created_at|beijing_time|default('-', true) }}</span><span><i data-lucide="refresh-cw"></i>更新 {{ article.updated_at|beijing_time|default('-', true) }}</span><span class="muted">时间为北京时间</span></div>
+        <div class="article-meta-line"><span><i data-lucide="folder-open"></i>{% if tabs %}{% for item in tabs %}{{ item.name }}{% if not loop.last %}、{% endif %}{% endfor %}{% else %}未配置栏目{% endif %}</span><span><i data-lucide="clock-3"></i>进入 {{ article.created_at|beijing_time|default('-', true) }}</span><span><i data-lucide="refresh-cw"></i>更新 {{ article.updated_at|beijing_time|default('-', true) }}</span><span class="muted">时间为北京时间</span></div>
       </section>
 
       <section class="panel content-panel">
         <div class="panel-head"><div><h2>正文预览</h2><p>当前用于质检和发布的内容</p></div><a class="external-link" href="{{ article.source_url }}" target="_blank" rel="noreferrer"><i data-lucide="external-link"></i>打开原文</a></div>
-        {% if article.cover_url %}<img class="article-cover" src="{{ article.cover_url }}" alt="文章封面" loading="lazy">{% endif %}
-        <div class="article-copy">{{ (article.body_text or article.processed_body or article.body or article.translate_body or '暂无正文')|striptags }}</div>
+        <nav class="detail-view-tabs" aria-label="文章详情视图">
+          <a class="detail-view-tab{% if active_view == 'quality' %} is-active{% endif %}" href="{{ url_for('article_detail', article_id=article.id, view='quality') }}"{% if active_view == 'quality' %} aria-current="page"{% endif %}><i data-lucide="scan-search"></i>质检视图</a>
+          <a class="detail-view-tab{% if active_view == 'preview' %} is-active{% endif %}" href="{{ url_for('article_detail', article_id=article.id, view='preview') }}"{% if active_view == 'preview' %} aria-current="page"{% endif %}><i data-lucide="eye"></i>发布预览</a>
+        </nav>
+        {% if active_view == 'preview' %}
+          <div class="publish-preview">
+            <div class="publish-preview-bar"><span><i data-lucide="file-check-2"></i>懂球帝草稿预览</span><span class="level-mark">B</span></div>
+            <div class="publish-preview-routing"><span><i data-lucide="folder-open"></i>{% if tabs %}{% for item in tabs %}<span class="preview-chip">{{ item.name }}</span>{% endfor %}{% else %}未配置栏目{% endif %}</span>{% if channels %}<span class="preview-channel-list">{% for channel in channels %}<span class="preview-chip">标签 {{ channel.id }}</span>{% endfor %}</span>{% else %}<span class="muted">未返回标签</span>{% endif %}</div>
+            <h1 class="publish-preview-title">{{ article.title|default('未命名文章', true) }}</h1>
+            {% if article.publish_cover_url %}<figure class="publish-cover"><img src="{{ article.publish_cover_url }}" alt="文章封面" loading="lazy"><figcaption>后台封面（将提交）</figcaption></figure>{% endif %}
+            <article class="publish-body">{% if preview_html %}{{ preview_html }}{% else %}<p class="preview-empty">暂无正文</p>{% endif %}</article>
+          </div>
+        {% else %}
+          {% if article.cover_url %}<img class="article-cover" src="{{ article.cover_url }}" alt="文章封面" loading="lazy">{% endif %}
+          <div class="article-copy">{{ (article.body_text or article.processed_body or article.body or article.translate_body or '暂无正文')|striptags }}</div>
+        {% endif %}
       </section>
 
       {% if (article.original_body or article.raw_body) and (article.original_body or article.raw_body) != article.body %}
@@ -39,9 +53,22 @@
     </div>
 
     <aside class="detail-side">
-      {% if article.status_key in ['ready_to_publish', 'publish_failed'] %}
+      {% if article.status_key in ['ready_to_publish', 'publish_failed', 'mapping_blocked', 'draft_confirming'] %}
       <section class="panel draft-panel">
-        <div class="panel-head"><div><h2>草稿操作</h2><p>会记录请求地址、请求字段、返回结果和失败原因</p></div></div>
+        {% if article.draft_confirming %}
+          <div class="panel-head"><div><h2>草稿结果自动处理中</h2><p>上一次创建结果暂不确定</p></div></div>
+          <div class="inline-alert"><i data-lucide="refresh-cw"></i><span>{% if article.draft_confirmation_scheduled %}系统已安排再次调用创建接口；非幂等模式下 HTTP 502 最多自动重试一次，无需人工操作。{% else %}自动处理已经结束，系统不会继续重发；可根据 request_id 在上游核对结果。{% endif %}</span></div>
+          <dl class="definition-list compact-def">
+            <div><dt>上游 request_id</dt><dd><code>{{ article.upstream_request_id|default('-', true) }}</code></dd></div>
+            <div><dt>client_request_id</dt><dd><code>{{ article.client_request_id|default('-', true) }}</code></dd></div>
+            <div><dt>自动核对次数</dt><dd>{{ article.draft_confirm_attempts|default(0, true) }}</dd></div>
+            <div><dt>最近尝试时间</dt><dd>{{ article.draft_last_attempt_at|beijing_time|default('-', true) }}</dd></div>
+            <div><dt>下次核对时间</dt><dd>{% if article.draft_next_confirm_at %}{{ article.draft_next_confirm_at|beijing_time }}{% else %}未安排自动重试{% endif %}</dd></div>
+          </dl>
+        {% else %}
+        <div class="panel-head"><div><h2>懂球帝提交</h2><p>会记录请求地址、请求字段、返回结果和失败原因</p></div></div>
+        {% if article.effective_publish_mode == 1 %}<div class="inline-alert"><i data-lucide="triangle-alert"></i><span>当前栏目配置为直接发布，操作成功后文章会立即上线。</span></div>{% endif %}
+        {% if article.publish_mode_conflict %}<div class="inline-alert"><i data-lucide="circle-alert"></i><span>文章关联栏目的发布模式不一致，请先在“栏目与来源”中统一模式或设置来源例外。</span></div>{% endif %}
         {% if can_create_draft %}
           <button class="button button-primary" type="button" data-create-draft data-id="{{ article.id }}" data-confirm="{{ article.draft_action_confirm|e }}"><i data-lucide="sparkles"></i>{{ article.draft_action_label }}</button>
         {% else %}
@@ -52,6 +79,7 @@
           <div class="inline-alert"><i data-lucide="badge-check"></i><span>{{ article.draft_notice }}</span></div>
         {% endif %}
         <p class="muted">每次操作都会写入下方时间线，便于回查失败原因。</p>
+        {% endif %}
       </section>
       {% endif %}
 
@@ -72,7 +100,7 @@
 
       <section class="panel routing-panel">
         <div class="panel-head"><div><h2>归属与标签</h2><p>发布时将使用这些值</p></div></div>
-        <dl class="definition-list compact-def"><div><dt>栏目 tab</dt><dd>{{ tab.name|default('未配置', true) }}{% if tab.id %}<small>ID {{ tab.id }}</small>{% endif %}</dd></div><div><dt>来源 source</dt><dd><code>{{ article.source }}</code></dd></div><div><dt>channels</dt><dd>{% if channels %}<span class="chip-list">{% for channel in channels %}<span class="chip">{{ channel.title|default(channel.name|default(channel.id|default(channel))) }}</span>{% endfor %}</span>{% else %}<span class="muted">未返回标签</span>{% endif %}</dd></div></dl>
+        <dl class="definition-list compact-def"><div><dt>栏目 tab</dt><dd>{% if tabs %}<span class="chip-list">{% for item in tabs %}<span class="chip">{{ item.name }}<small>ID {{ item.backend_tab_id }}</small></span>{% endfor %}</span>{% else %}<span class="muted">未配置</span>{% endif %}</dd></div><div><dt>来源 source</dt><dd><code>{{ article.source }}</code></dd></div><div><dt>channels</dt><dd>{% if channels %}<span class="chip-list">{% for channel in channels %}<span class="chip">{{ channel.title|default(channel.name|default(channel.id|default(channel))) }}</span>{% endfor %}</span>{% else %}<span class="muted">未返回标签</span>{% endif %}</dd></div></dl>
       </section>
 
       <section class="panel ids-panel">
@@ -85,6 +113,27 @@
 
   <section class="panel timeline-panel">
     <div class="panel-head"><div><h2>处理时间线</h2><p>每次状态变化和人工操作都会记录，时间均为北京时间</p></div></div>
-    {% if events %}<ol class="timeline">{% for event in events %}<li><span class="timeline-dot"></span><div><strong>{{ event.label|default(event.event_type|default('状态更新')) }}</strong><p>{{ event.message|default('') }}</p>{% if event.payload %}<details class="event-payload"><summary>查看记录</summary><pre>{{ event.payload|tojson(indent=2) }}</pre></details>{% endif %}<time>{{ event.created_at|beijing_time|default('-', true) }}</time></div></li>{% endfor %}</ol>{% else %}<div class="empty-state compact"><i data-lucide="git-commit-horizontal"></i><strong>暂无时间线记录</strong></div>{% endif %}
+    {% if events %}
+      <ol class="timeline">
+        {% for event in events %}
+          <li class="timeline-event timeline-event-{{ event.event_type|default('status')|lower }}">
+            <span class="timeline-dot"></span>
+            <div class="timeline-event-content">
+              <strong>{{ event.label|default(event.event_type|default('状态更新')) }}</strong>
+              {% if event.message %}<p>{{ event.message }}</p>{% endif %}
+              {% if event.summary_rows %}
+                <dl class="event-summary">
+                  {% for row in event.summary_rows %}
+                    <div><dt>{{ row.label }}</dt><dd class="{% if row.tone %}summary-{{ row.tone }}{% endif %}">{{ row.value }}</dd></div>
+                  {% endfor %}
+                </dl>
+              {% endif %}
+              {% if event.payload %}<details class="event-payload"><summary>查看原始记录</summary><pre>{{ event.payload|tojson(indent=2) }}</pre></details>{% endif %}
+              <time>{{ event.created_at|beijing_time|default('-', true) }}</time>
+            </div>
+          </li>
+        {% endfor %}
+      </ol>
+    {% else %}<div class="empty-state compact"><i data-lucide="git-commit-horizontal"></i><strong>暂无时间线记录</strong></div>{% endif %}
   </section>
 {% endblock %}

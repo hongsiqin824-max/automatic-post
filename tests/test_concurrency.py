@@ -64,6 +64,17 @@ class _FakeController:
         return True
 
 
+class _FakeMaintenanceController:
+    def __init__(self):
+        self.called = threading.Event()
+        self.calls = 0
+
+    def start(self):
+        self.calls += 1
+        self.called.set()
+        return True
+
+
 def test_scheduler_uses_controller_and_can_pause_resume():
     controller = _FakeController()
     scheduler = Scheduler(controller, interval_seconds=60)
@@ -80,3 +91,20 @@ def test_scheduler_uses_controller_and_can_pause_resume():
     finally:
         assert scheduler.shutdown() is True
 
+
+def test_scheduler_runs_maintenance_controller_on_short_interval():
+    controller = _FakeController()
+    maintenance = _FakeMaintenanceController()
+    scheduler = Scheduler(
+        controller,
+        interval_seconds=60,
+        maintenance_controller=maintenance,
+        maintenance_interval_seconds=1,
+    )
+    try:
+        scheduler.start()
+        assert maintenance.called.wait(2)
+        assert maintenance.calls == 1
+        assert controller.calls == 0
+    finally:
+        assert scheduler.shutdown() is True

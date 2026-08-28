@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.services.quality import evaluate, html_to_text
+from app.services.quality import analyze_body_language, evaluate, html_to_text
 
 
 def test_clean_article_passes_without_llm():
@@ -41,6 +41,58 @@ def test_truncated_title_without_llm_goes_to_review():
 
 def test_html_to_text_removes_markup():
     assert html_to_text("<p>第一段</p><p>第二段</p>") == "第一段 第二段"
+
+
+def test_language_check_flags_more_than_sixty_percent_non_chinese():
+    language = analyze_body_language("<p>中文abcd</p>")
+
+    assert language["chinese_chars"] == 2
+    assert language["non_chinese_chars"] == 4
+    assert language["non_chinese_ratio"] == 0.6667
+    assert language["exceeds_threshold"] is True
+
+
+def test_language_check_does_not_flag_exactly_sixty_percent_non_chinese():
+    language = analyze_body_language("<p>中文abc</p>")
+
+    assert language["text_chars"] == 5
+    assert language["non_chinese_ratio"] == 0.6
+    assert language["threshold"] == 0.6
+    assert language["exceeds_threshold"] is False
+
+
+def test_language_check_ignores_html_whitespace_punctuation_and_numbers():
+    language = analyze_body_language(
+        "<div> 中 \n 文 </div><p>abc 123，！? - 2026</p>"
+    )
+
+    assert language["chinese_chars"] == 2
+    assert language["non_chinese_chars"] == 3
+    assert language["text_chars"] == 5
+    assert language["non_chinese_ratio"] == 0.6
+
+
+def test_evaluate_records_normal_chinese_language_result_without_blocking():
+    result = evaluate(
+        title="主队在联赛中取得关键胜利",
+        body="<p>这是一段完整的中文体育新闻正文，介绍了比赛过程、球员表现以及赛后信息。</p>",
+        channels=[1],
+    )
+
+    assert result["pass"] is True
+    assert result["language_check"]["non_chinese_chars"] == 0
+    assert result["language_check"]["non_chinese_ratio"] == 0.0
+    assert result["language_check"]["exceeds_threshold"] is False
+
+
+def test_language_check_treats_body_without_letters_as_zero_ratio():
+    language = analyze_body_language("<p>12345，！? 2026-08-27</p>")
+
+    assert language["chinese_chars"] == 0
+    assert language["non_chinese_chars"] == 0
+    assert language["text_chars"] == 0
+    assert language["non_chinese_ratio"] == 0.0
+    assert language["exceeds_threshold"] is False
 
 
 class _SemanticLLM:

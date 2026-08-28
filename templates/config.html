@@ -8,29 +8,131 @@
 {% block content %}
   <div class="config-grid">
     <section class="panel config-tabs-panel">
-      <div class="panel-head"><div><h2>栏目 tab</h2><p>系统根据来源映射栏目；一个栏目可以配置多个来源。</p></div><span class="count-label">{{ tabs|length }} 个</span></div>
+      <div class="panel-head"><div><h2>栏目 tab</h2><p>栏目可分配给多个来源，一个来源也可以选择多个栏目；每个栏目独立设置草稿或发布模式。</p></div><span class="count-label">{{ tabs|length }} 个</span></div>
       <div class="config-list">
         {% for tab in tabs %}
-        <div class="config-row" data-tab-row data-id="{{ tab.id }}"><div class="config-main"><span class="drag-handle"><i data-lucide="grip-vertical"></i></span><span class="tab-dot {% if not tab.enabled %}is-off{% endif %}"></span><div><strong>{{ tab.name }}</strong><small>后台栏目 ID：{{ tab.backend_tab_id|default('未绑定', true) }}</small></div></div><div class="config-controls"><span class="status-badge {{ 'status-enabled' if tab.enabled else 'status-disabled' }}"><span></span>{{ '启用' if tab.enabled else '停用' }}</span><button class="icon-button subtle" type="button" data-edit-tab data-id="{{ tab.id }}" data-name="{{ tab.name|e }}" data-backend-id="{{ tab.backend_tab_id|default('', true) }}" title="编辑栏目" aria-label="编辑栏目"><i data-lucide="pencil"></i></button><button class="icon-button subtle" type="button" data-toggle-tab data-id="{{ tab.id }}" data-enabled="{{ 'true' if tab.enabled else 'false' }}" title="{{ '停用栏目' if tab.enabled else '启用栏目' }}" aria-label="{{ '停用栏目' if tab.enabled else '启用栏目' }}"><i data-lucide="{{ 'pause' if tab.enabled else 'play' }}"></i></button></div></div>
+        <div class="config-row" data-tab-row data-id="{{ tab.id }}">
+          <div class="config-main"><span class="drag-handle"><i data-lucide="grip-vertical"></i></span><span class="tab-dot {% if not tab.enabled %}is-off{% endif %}"></span><div><strong>{{ tab.name }}</strong><small>后台栏目 ID：{{ tab.backend_tab_id|default('未绑定', true) }}</small></div></div>
+          <div class="config-controls">
+            <span class="tab-publish-mode" data-tab-publish-mode><span class="status-badge {{ 'status-enabled' if tab.publish_mode|default(0) == 1 else 'status-disabled' }}" data-tab-publish-mode-badge><span></span>{{ '直接发布' if tab.publish_mode|default(0) == 1 else '创建草稿' }}</span></span>
+            <button class="icon-button subtle" type="button" data-toggle-tab-publish-mode data-id="{{ tab.id }}" data-current-mode="{{ tab.publish_mode|default(0) }}" title="切换发布模式" aria-label="切换 {{ tab.name|e }} 的发布模式"><i data-lucide="repeat"></i></button>
+            <span class="status-badge {{ 'status-enabled' if tab.enabled else 'status-disabled' }}"><span></span>{{ '启用' if tab.enabled else '停用' }}</span>
+            <button class="icon-button subtle" type="button" data-edit-tab data-id="{{ tab.id }}" data-name="{{ tab.name|e }}" data-backend-id="{{ tab.backend_tab_id|default('', true) }}" data-fallback-litpic="{{ tab.fallback_litpic|default('', true)|e }}" title="编辑栏目" aria-label="编辑栏目"><i data-lucide="pencil"></i></button>
+            <button class="icon-button subtle" type="button" data-toggle-tab data-id="{{ tab.id }}" data-enabled="{{ 'true' if tab.enabled else 'false' }}" title="{{ '停用栏目' if tab.enabled else '启用栏目' }}" aria-label="{{ '停用栏目' if tab.enabled else '启用栏目' }}"><i data-lucide="{{ 'pause' if tab.enabled else 'play' }}"></i></button>
+          </div>
+        </div>
         {% else %}<div class="empty-state compact"><i data-lucide="folder-plus"></i><strong>还没有栏目</strong><p>新增一个栏目后再绑定来源。</p></div>{% endfor %}
       </div>
     </section>
 
     <section class="panel config-sources-panel">
-      <div class="panel-head"><div><h2>来源 source</h2><p>每个来源当前只能归属一个栏目。</p></div><div class="config-head-actions"><label class="compact-search"><i data-lucide="search"></i><span class="sr-only">搜索来源</span><input type="search" data-source-search placeholder="搜索 source"></label><span class="count-label" data-source-count data-total="{{ sources|length }}">{{ sources|length }} 个</span></div></div>
+      <div class="panel-head"><div><h2>来源 source</h2><p>手动为每个来源选择一个或多个栏目；默认跟随栏目，也可单独覆盖为草稿或直接发布。</p></div><div class="config-head-actions"><button class="button button-secondary" type="button" data-open-source-dialog><i data-lucide="plus"></i>新增来源</button><label class="compact-search"><i data-lucide="search"></i><span class="sr-only">搜索来源</span><input type="search" data-source-search placeholder="搜索 source"></label><span class="count-label" data-source-count data-total="{{ sources|length }}">{{ sources|length }} 个</span></div></div>
       <div class="source-list">
         {% for source in sources %}
-        <div class="source-row"><div class="source-info"><span class="source-avatar">{{ source.name|default(source.code)|first|upper }}</span><div><strong>{{ source.name|default(source.code) }}</strong><code>{{ source.code }}</code></div></div><label class="source-select"><span class="sr-only">{{ source.code }} 所属栏目</span><select data-source-tab data-code="{{ source.code }}"><option value="">未配置栏目</option>{% for tab in tabs %}<option value="{{ tab.id }}" {% if source.tab_id|string == tab.id|string %}selected{% endif %}>{{ tab.name }}</option>{% endfor %}</select></label><label class="switch" title="{{ '停用来源' if source.enabled|default(true) else '启用来源' }}"><input type="checkbox" data-source-enabled data-code="{{ source.code }}" {% if source.enabled|default(true) %}checked{% endif %}><span></span></label></div>
+        <div class="source-row" data-source-row data-code="{{ source.code }}">
+          <div class="source-info"><span class="source-avatar">{{ source.name|default(source.code)|first|upper }}</span><div><strong>{{ source.name|default(source.code) }}</strong><code>{{ source.code }}</code></div></div>
+          <div class="source-tab-summary" data-source-tab-summary>{% if source.tabs %}{% for tab in source.tabs %}<span class="chip">{{ tab.name }}</span>{% endfor %}{% else %}<span class="muted">未配置栏目</span>{% endif %}</div>
+          <div class="source-publish-mode" data-source-publish-mode>
+            <span class="status-badge {{ 'status-enabled' if source.publish_mode_effective == 1 else 'status-disabled' }}" data-source-publish-mode-label><span></span>{{ source.publish_mode_label|default('跟随栏目') }}</span>
+            <select class="source-mode-select" data-source-publish-mode-select data-code="{{ source.code }}" data-current-override="{{ '' if source.publish_mode_override is none else source.publish_mode_override }}" aria-label="{{ source.name|default(source.code) }} 发布模式">
+              <option value="" {% if source.publish_mode_override is none %}selected{% endif %}>跟随栏目</option>
+              <option value="0" {% if source.publish_mode_override == 0 %}selected{% endif %}>强制创建草稿</option>
+              <option value="1" {% if source.publish_mode_override == 1 %}selected{% endif %}>强制直接发布</option>
+            </select>
+          </div>
+          <button class="icon-button subtle" type="button" data-edit-source-tabs data-code="{{ source.code }}" data-name="{{ source.name|default(source.code)|e }}" data-tab-ids='{{ source.tab_ids|default([])|tojson }}' title="选择栏目" aria-label="选择 {{ source.name|default(source.code) }} 的栏目"><i data-lucide="list-checks"></i></button>
+          <label class="switch" title="{{ '停用来源' if source.enabled|default(true) else '启用来源' }}"><input type="checkbox" data-source-enabled data-code="{{ source.code }}" {% if source.enabled|default(true) %}checked{% endif %}><span></span></label>
+        </div>
         {% else %}<div class="empty-state compact"><i data-lucide="radio-tower"></i><strong>还没有来源</strong><p>来源由素材接口提供，首次拉取后会出现在这里。</p></div>{% endfor %}
       </div>
     </section>
   </div>
+
+  <section class="panel competition-rules-panel">
+    <div class="panel-head">
+      <div>
+        <h2>赛事栏目规则</h2>
+        <p>按素材的 league / team 短码修正新文章栏目；规则可应用于全部来源或指定来源，并可单独设置发布动作。</p>
+      </div>
+      <div class="competition-rule-head-actions">
+        <label class="compact-search competition-rule-search"><i data-lucide="search"></i><span class="sr-only">搜索赛事规则</span><input type="search" data-competition-rule-search placeholder="搜索短码或栏目"></label>
+        <label class="pending-rule-filter"><input type="checkbox" data-pending-rule-filter><span>只看待配置</span></label>
+        <span class="count-label" data-competition-rule-count data-total="{{ event_tab_rules|default([])|length }}">{{ event_tab_rules|default([])|length }} 条</span>
+        <button class="button button-secondary" type="button" data-open-competition-rule-dialog><i data-lucide="plus"></i>新增规则</button>
+      </div>
+    </div>
+    <div class="competition-rule-note"><i data-lucide="route"></i><span>先判断 team，再判断 league；同一字段和短码下，指定来源规则优先于全部来源规则。栏目修改只影响之后新入库的文章，发布动作在文章首次提交时确定。</span></div>
+    <div class="competition-rule-list" data-competition-rule-list>
+      {% for rule in event_tab_rules|default([]) %}
+      {% set rule_publish_mode = rule.publish_mode_override|default(none) %}
+      <div class="competition-rule-row" data-competition-rule-row data-id="{{ rule.id }}" data-marker-type="{{ rule.marker_type }}" data-marker-code="{{ rule.marker_code|e }}" data-tab-id="{{ rule.tab_id|default('', true) }}" data-source-code="{{ rule.source_code|default('', true)|e }}" data-publish-mode-override="{{ '' if rule_publish_mode is none else rule_publish_mode }}" data-enabled="{{ 'true' if rule.enabled else 'false' }}" data-pending="{{ 'false' if rule.tab_id else 'true' }}" data-search-text="{{ rule.marker_type|lower }} {{ rule.marker_code|lower }} {{ rule.tab_name|default('', true)|lower }} {{ rule.backend_tab_id|default('', true) }} {{ rule.source_code|default('全部来源', true)|lower }} {{ rule.source_display_name|default('', true)|lower }} {{ rule.sample_source|default('', true)|lower }}">
+        <div class="competition-rule-marker">
+          <span class="rule-type-badge rule-type-{{ rule.marker_type }}">{{ rule.marker_type }}</span>
+          <div><strong><code>{{ rule.marker_code }}</code></strong><small>{% if rule.source_code %}来源：{{ rule.source_display_name|default(rule.source_code, true) }} · {{ rule.source_code }}{% else %}适用全部来源{% endif %}</small></div>
+        </div>
+        <div class="competition-rule-target" data-competition-rule-target>
+          {% if rule.tab_id %}
+          <strong>{{ rule.tab_name|default('栏目已删除', true) }}</strong>
+          <small>后台栏目 ID：{{ rule.backend_tab_id|default('未知', true) }} · {{ '直接发布' if rule_publish_mode == 1 else ('创建草稿' if rule_publish_mode == 0 else '跟随原配置') }}</small>
+          {% else %}
+          <strong class="pending-text">待配置</strong>
+          <small>沿用来源原栏目 · {{ '直接发布' if rule_publish_mode == 1 else ('创建草稿' if rule_publish_mode == 0 else '跟随原配置') }}</small>
+          {% endif %}
+        </div>
+        <div class="competition-rule-seen">
+          <span>最近发现</span>
+          <strong>{% if rule.last_seen_at %}{{ rule.last_seen_at|beijing_time }}{% else %}尚无文章{% endif %}</strong>
+        </div>
+        <div class="competition-rule-actions">
+          <span class="status-badge {{ 'status-enabled' if rule.enabled else 'status-disabled' }}" data-competition-rule-status><span></span>{{ '启用' if rule.enabled else '停用' }}</span>
+          <button class="icon-button subtle" type="button" data-clear-competition-rule {% if not rule.tab_id %}disabled{% endif %} title="清空目标栏目" aria-label="清空 {{ rule.marker_code|e }} 的目标栏目"><i data-lucide="unlink"></i></button>
+          <button class="icon-button subtle" type="button" data-edit-competition-rule title="编辑赛事规则" aria-label="编辑 {{ rule.marker_code|e }} 赛事规则"><i data-lucide="pencil"></i></button>
+          <label class="switch" title="{{ '停用规则' if rule.enabled else '启用规则' }}"><input type="checkbox" data-competition-rule-enabled {% if rule.enabled %}checked{% endif %} aria-label="{{ '停用' if rule.enabled else '启用' }} {{ rule.marker_code|e }} 规则"><span></span></label>
+        </div>
+      </div>
+      {% else %}
+      <div class="empty-state compact competition-rule-empty" data-competition-rule-empty><i data-lucide="route"></i><strong>还没有赛事栏目规则</strong><p>新增规则，或等待接口返回新的 league 短码。</p></div>
+      {% endfor %}
+    </div>
+    <div class="empty-state compact competition-rule-filter-empty" data-competition-rule-filter-empty hidden><i data-lucide="search-x"></i><strong>没有符合条件的规则</strong><p>调整搜索词或关闭“只看待配置”。</p></div>
+  </section>
+
+  <section class="panel publish-account-panel">
+    <div class="panel-head">
+      <div><h2>发布账号池</h2><p>创建草稿时自动分配已启用账号；同一文章重试时沿用原账号。</p></div>
+      <div class="publish-account-head-actions">
+        <span class="status-badge {{ 'status-enabled' if settings.publish_account_pool_enabled else 'status-disabled' }}"><span></span>{{ '已启用' if settings.publish_account_pool_enabled else '已停用' }}</span>
+        <label class="pool-master-control">
+          <span>总开关</span>
+          <span class="switch"><input type="checkbox" data-publish-account-pool-toggle aria-label="启用发布账号池" {% if settings.publish_account_pool_enabled %}checked{% endif %}><span></span></span>
+        </label>
+        <button class="button button-secondary" type="button" data-open-publish-account-dialog><i data-lucide="user-plus"></i>添加账号</button>
+      </div>
+    </div>
+    <div class="publish-account-note"><i data-lucide="shield-check"></i><span>这里只保存后台账号 ID 和账号名称，不保存密码、cookie 或 token。</span></div>
+    <div class="publish-account-list">
+      {% for account in publish_accounts %}
+      <div class="publish-account-row" data-publish-account-row data-id="{{ account.id }}">
+        <div class="publish-account-identity"><span class="publish-account-avatar"><i data-lucide="user-round"></i></span><div><strong>{{ account.user_name }}</strong><small>后台账号 ID：{{ account.dqd_user_id }}</small></div></div>
+        <div class="publish-account-usage"><span>已分配</span><strong>{{ account.assignment_count|default(0) }} 篇</strong><small>{% if account.last_assigned_at %}最近 {{ account.last_assigned_at|beijing_time }}{% else %}尚未分配{% endif %}</small></div>
+        <div class="publish-account-actions">
+          <span class="status-badge {{ 'status-enabled' if account.enabled else 'status-disabled' }}"><span></span>{{ '启用' if account.enabled else '停用' }}</span>
+          <button class="icon-button subtle" type="button" data-edit-publish-account data-id="{{ account.id }}" data-user-id="{{ account.dqd_user_id }}" data-user-name="{{ account.user_name|e }}" data-enabled="{{ 'true' if account.enabled else 'false' }}" title="编辑发布账号" aria-label="编辑发布账号 {{ account.user_name|e }}"><i data-lucide="pencil"></i></button>
+          <label class="switch" title="{{ '停用账号' if account.enabled else '启用账号' }}"><input type="checkbox" data-publish-account-enabled data-id="{{ account.id }}" aria-label="{{ '停用' if account.enabled else '启用' }}发布账号 {{ account.user_name|e }}" {% if account.enabled %}checked{% endif %}><span></span></label>
+        </div>
+      </div>
+      {% else %}
+      <div class="empty-state compact publish-account-empty"><i data-lucide="users"></i><strong>还没有发布账号</strong><p>添加并启用至少一个账号后，才能开启账号池。</p></div>
+      {% endfor %}
+    </div>
+  </section>
 
   <section class="panel scheduler-config">
     <div class="panel-head"><div><h2>自动运行</h2><p>控制素材拉取和发布 worker 是否自动执行。</p></div><button class="button button-secondary" type="button" data-scheduler-toggle data-enabled="{{ 'true' if settings.scheduler_enabled else 'false' }}"><i data-lucide="{{ 'pause' if settings.scheduler_enabled else 'play' }}"></i>{{ '暂停自动任务' if settings.scheduler_enabled else '恢复自动任务' }}</button></div>
     <div class="setting-line"><div><strong>拉取周期</strong><span>系统会按此间隔请求已启用的来源</span></div><span class="setting-value">每 {{ settings.interval_minutes|default(10) }} 分钟</span></div>
     <div class="setting-line"><div><strong>默认文章等级</strong><span>当前所有文章进入系统时使用固定等级</span></div><span class="level-mark">B</span></div>
     <div class="setting-line"><div><strong>开放平台发布</strong><span>需同时配置开放平台并启用发布 worker</span></div><span class="setting-value">{{ '已启用' if settings.publisher_enabled and settings.dqd_open_configured else ('仅已配置' if settings.dqd_open_configured else '未配置') }}</span></div>
+    <div class="setting-line"><div><strong>草稿结果自动确认</strong><span>仅在上游支持 client_request_id 幂等后启用</span></div><span class="setting-value">{{ '已启用' if settings.dqd_open_idempotency_enabled else '安全模式：不自动重发' }}</span></div>
   </section>
 
   <section class="panel scheduler-config">
@@ -52,7 +154,73 @@
     <input type="hidden" name="id">
     <label class="field"><span>栏目名称</span><input name="name" required maxlength="80" placeholder="例如：国际足球"></label>
     <label class="field"><span>后台栏目 ID</span><input name="backend_tab_id" type="number" inputmode="numeric" required placeholder="发布时用于映射后台栏目"></label>
+    <label class="field"><span>栏目兜底图片（可选）</span><input name="fallback_litpic" type="text" maxlength="2000" placeholder="CDN 地址或图片路径，例如 https://img.example.com/league.jpg"><small class="field-hint">正文和素材没有有效图片时使用；留空则使用系统绿色公共图。精选栏目不使用栏目兜底图。</small></label>
     <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="save"></i>保存栏目</button></div>
+  </form>
+</dialog>
+
+<dialog class="modal" id="source-tabs-dialog">
+  <form method="dialog" class="modal-card source-tabs-card" data-source-tabs-form>
+    <div class="modal-head"><div><span class="eyebrow">来源栏目</span><h2 data-source-tabs-title>选择栏目</h2></div><button class="icon-button subtle" type="submit" formnovalidate value="cancel" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <input type="hidden" name="source_code">
+    <label class="field source-tab-search"><span>搜索栏目</span><input type="search" data-source-tab-search placeholder="输入栏目名称或后台 ID"></label>
+    <div class="source-tab-options" data-source-tab-options>
+      {% for tab in tabs %}
+      <label class="source-tab-option" data-search-text="{{ tab.name|lower }} {{ tab.backend_tab_id }}">
+        <input type="checkbox" name="tab_ids" value="{{ tab.id }}" {% if not tab.enabled %}disabled{% endif %}>
+        <span><strong>{{ tab.name }}</strong><small>后台 ID {{ tab.backend_tab_id }}{% if not tab.enabled %} · 已停用{% endif %}</small></span>
+      </label>
+      {% endfor %}
+    </div>
+    <p class="field-hint">栏目顺序按当前列表保存；修改只影响之后新获取的文章。</p>
+    <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="save"></i>保存栏目</button></div>
+  </form>
+</dialog>
+
+<dialog class="modal" id="source-dialog">
+  <form method="dialog" class="modal-card source-tabs-card source-create-card" data-source-form>
+    <div class="modal-head"><div><span class="eyebrow">来源配置</span><h2>新增来源</h2></div><button class="icon-button subtle" type="submit" formnovalidate value="cancel" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <label class="field"><span>来源代码 source</span><input name="code" required maxlength="100" spellcheck="false" placeholder="例如：kleague"></label>
+    <label class="field"><span>显示名称</span><input name="display_name" required maxlength="80" placeholder="例如：K 联赛官方"></label>
+    <label class="field source-tab-search"><span>选择栏目（可多选）</span><input type="search" data-new-source-tab-search placeholder="搜索栏目名称或后台 ID"></label>
+    <div class="source-tab-options" data-new-source-tab-options>
+      {% for tab in tabs %}
+      <label class="source-tab-option" data-search-text="{{ tab.name|lower }} {{ tab.backend_tab_id }}">
+        <input type="checkbox" name="tab_ids" value="{{ tab.id }}" {% if not tab.enabled %}disabled{% endif %}>
+        <span><strong>{{ tab.name }}</strong><small>后台 ID {{ tab.backend_tab_id }}{% if not tab.enabled %} · 已停用{% endif %}</small></span>
+      </label>
+      {% endfor %}
+    </div>
+    <label class="field"><span>发布模式覆盖</span><select name="publish_mode_override"><option value="">跟随栏目</option><option value="0">强制创建草稿</option><option value="1">强制直接发布</option></select><small class="field-hint">跟随栏目时，使用所选栏目当前的发布模式。</small></label>
+    <label class="account-enabled-field"><span><strong>立即启用来源</strong><small>启用后会在下一轮抓取时请求该 source；需要至少选择一个启用栏目。</small></span><span class="switch"><input type="checkbox" name="enabled" aria-label="立即启用来源"><span></span></span></label>
+    <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="save"></i>保存来源</button></div>
+  </form>
+</dialog>
+
+<dialog class="modal" id="competition-rule-dialog">
+  <form method="dialog" class="modal-card competition-rule-card" data-competition-rule-form>
+    <div class="modal-head"><div><span class="eyebrow">赛事栏目规则</span><h2 data-competition-rule-dialog-title>新增规则</h2></div><button class="icon-button subtle" type="submit" formnovalidate value="cancel" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <input type="hidden" name="id">
+    <div class="competition-rule-fields">
+      <label class="field"><span>字段类型</span><select name="marker_type" required><option value="league">league</option><option value="team">team</option></select></label>
+      <label class="field"><span>接口短码</span><input name="marker_code" required maxlength="80" spellcheck="false" autocomplete="off" placeholder="输入接口返回的短码"></label>
+    </div>
+    <label class="field"><span>目标栏目</span><select name="tab_id"><option value="">待配置（沿用来源原栏目）</option>{% for tab in tabs %}<option value="{{ tab.id }}" {% if not tab.enabled %}disabled{% endif %}>{{ tab.name }} · 后台 ID {{ tab.backend_tab_id }}{% if not tab.enabled %}（已停用）{% endif %}</option>{% endfor %}</select><small class="field-hint">清空或暂不选择栏目时，这类文章继续使用来源原栏目。</small></label>
+    <label class="field"><span>适用来源</span><select name="source_code"><option value="">全部来源</option>{% for source in sources %}<option value="{{ source.code|e }}">{{ source.name|default(source.code) }} · {{ source.code }}</option>{% endfor %}</select><small class="field-hint">指定来源后只匹配该 source；选择全部来源时保持现有全局规则行为。</small></label>
+    <label class="field"><span>发布动作</span><select name="publish_mode_override"><option value="">跟随原配置</option><option value="0">创建草稿</option><option value="1">直接发布</option></select><small class="field-hint">跟随原配置时，继续按来源覆盖和栏目模式决定；直接发布会在文章首次提交后立即上线。</small></label>
+    <label class="account-enabled-field"><span><strong>启用规则</strong><small>停用后视为未命中，文章继续沿用后续规则或来源原栏目。</small></span><span class="switch"><input type="checkbox" name="enabled" checked aria-label="启用赛事栏目规则"><span></span></span></label>
+    <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="save"></i>保存规则</button></div>
+  </form>
+</dialog>
+
+<dialog class="modal" id="publish-account-dialog">
+  <form method="dialog" class="modal-card" data-publish-account-form>
+    <div class="modal-head"><div><span class="eyebrow">发布账号</span><h2 data-publish-account-dialog-title>添加账号</h2></div><button class="icon-button subtle" type="submit" formnovalidate value="cancel" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <input type="hidden" name="id">
+    <label class="field"><span>后台账号 ID</span><input name="dqd_user_id" type="number" inputmode="numeric" min="1" step="1" required placeholder="例如：13421038"></label>
+    <label class="field"><span>账号名称</span><input name="user_name" required maxlength="200" placeholder="例如：足球实战技巧"></label>
+    <label class="account-enabled-field"><span><strong>启用账号</strong><small>仅启用账号参与新文章分配</small></span><span class="switch"><input type="checkbox" name="enabled" checked aria-label="启用发布账号"><span></span></span></label>
+    <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="save"></i>保存账号</button></div>
   </form>
 </dialog>
 {% endblock %}

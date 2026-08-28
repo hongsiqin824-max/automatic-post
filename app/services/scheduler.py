@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 
@@ -11,15 +12,27 @@ logger = logging.getLogger(__name__)
 
 
 class Scheduler:
-    def __init__(self, controller, interval_seconds: int):
+    def __init__(
+        self,
+        controller,
+        interval_seconds: int,
+        *,
+        maintenance_controller=None,
+        maintenance_interval_seconds: int = 15,
+    ):
         self.controller = controller
         self.interval_seconds = interval_seconds
+        self.maintenance_controller = maintenance_controller
+        self.maintenance_interval_seconds = max(1, int(maintenance_interval_seconds))
         self._wake = threading.Event()
         self._shutdown = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._enabled = False
         self._next_run_at: str | None = None
+        self._main_due_monotonic: float | None = None
+        self._maintenance_due_monotonic: float | None = None
+        self._trigger_requested = False
 
     @property
     def enabled(self) -> bool:
@@ -34,11 +47,18 @@ class Scheduler:
     def _schedule_next_locked(self) -> None:
         next_run = datetime.now(timezone.utc) + timedelta(seconds=self.interval_seconds)
         self._next_run_at = next_run.isoformat(timespec="seconds").replace("+00:00", "Z")
+        self._main_due_monotonic = time.monotonic() + self.interval_seconds
 
     def start(self) -> None:
         with self._lock:
             self._enabled = True
             self._schedule_next_locked()
+            self._maintenance_due_monotonic = (
+                time.monotonic() + self.maintenance_interval_seconds
+                if self.maintenance_controller is not None
+                else None
+            )
+            self._wake.set()
             if self._thread and self._thread.is_alive():
                 return
             self._shutdown.clear()
@@ -51,12 +71,16 @@ class Scheduler:
         with self._lock:
             self._enabled = False
             self._next_run_at = None
-            self._wake.clear()
+            self._main_due_monotonic = None
+            self._maintenance_due_monotonic = None
+            self._trigger_requested = False
+            self._wake.set()
 
     def trigger(self) -> bool:
         with self._lock:
             if not self._enabled:
                 return False
+            self._trigger_requested = True
             self._wake.set()
             return True
 
@@ -66,6 +90,9 @@ class Scheduler:
         with self._lock:
             self._enabled = False
             self._next_run_at = None
+            self._main_due_monotonic = None
+            self._maintenance_due_monotonic = None
+            self._trigger_requested = False
             self._shutdown.set()
             self._wake.set()
             thread = self._thread
@@ -82,17 +109,41 @@ class Scheduler:
         # Do not immediately call the remote API on a fresh process. The UI can
         # trigger the first run, and the first scheduled run follows the interval.
         while not self._shutdown.is_set():
-            self._wake.wait(self.interval_seconds)
+            with self._lock:
+                now = time.monotonic()
+                deadlines = [
+                    value
+                    for value in (self._main_due_monotonic, self._maintenance_due_monotonic)
+                    if self._enabled and value is not None
+                ]
+                wait_seconds = max(0.05, min(deadlines) - now) if deadlines else 60.0
+            self._wake.wait(wait_seconds)
             with self._lock:
                 self._wake.clear()
                 if self._shutdown.is_set():
                     return
                 if not self._enabled:
                     continue
-                self._schedule_next_locked()
-                # Keep the scheduler lock through the quick start decision so
-                # stop() guarantees no new run begins after it returns.
-                try:
-                    self.controller.start()
-                except Exception:  # noqa: BLE001 - keep future schedule ticks alive
-                    logger.exception("定时任务启动失败")
+                now = time.monotonic()
+                run_main = self._trigger_requested or (
+                    self._main_due_monotonic is not None
+                    and self._main_due_monotonic <= now
+                )
+                run_maintenance = (
+                    self.maintenance_controller is not None
+                    and self._maintenance_due_monotonic is not None
+                    and self._maintenance_due_monotonic <= now
+                )
+                self._trigger_requested = False
+                if run_main:
+                    self._schedule_next_locked()
+                    try:
+                        self.controller.start()
+                    except Exception:  # noqa: BLE001 - keep future schedule ticks alive
+                        logger.exception("定时任务启动失败")
+                if run_maintenance:
+                    self._maintenance_due_monotonic = now + self.maintenance_interval_seconds
+                    try:
+                        self.maintenance_controller.start()
+                    except Exception:  # noqa: BLE001 - keep future maintenance ticks alive
+                        logger.exception("草稿结果确认任务启动失败")

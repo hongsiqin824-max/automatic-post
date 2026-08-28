@@ -67,6 +67,10 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "source": source,
         "source_url": source_url,
+        # Keep the material marker separate from publish-account user_name.
+        "material_user_name": str(
+            item.get("user_name") or item.get("username") or ""
+        ).strip(),
         "title_original": title,
         "title_current": title,
         "body_original": body,

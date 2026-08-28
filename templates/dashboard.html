@@ -45,7 +45,7 @@
       </div>
       {% if status_groups %}
         <div class="pipeline-list">
-          {% set status_icons = {'received':'inbox','quality_checking':'scan-search','needs_review':'user-round-check','ready_to_publish':'send','publishing':'loader-circle','draft_created':'badge-check','publish_failed':'triangle-alert','already_published':'badge-check','rejected':'circle-x','error':'triangle-alert'} %}
+          {% set status_icons = {'received':'inbox','quality_checking':'scan-search','needs_review':'user-round-check','ready_to_publish':'send','publishing':'loader-circle','draft_confirming':'refresh-cw','draft_created':'badge-check','publish_failed':'triangle-alert','already_published':'badge-check','rejected':'circle-x','error':'triangle-alert'} %}
           {% for group in status_groups %}
             {% set group_key = group.status|lower %}
             <a class="pipeline-row" href="{{ url_for('articles', status=group.status) }}">
@@ -90,7 +90,7 @@
             <tr>
               <td class="article-cell"><a href="{{ url_for('article_detail', article_id=article.id) }}">{{ article.title|default('未命名文章', true) }}</a><small>{{ article.source_url|default('') }}</small></td>
               <td><span class="source-code">{{ article.source }}</span></td>
-              <td>{{ article.tab_name|default('未配置', true) }}</td>
+              <td>{{ article.tab_names|default(article.tab_name|default('未配置', true), true) }}</td>
               <td><span class="status-pill status-{{ article.status|lower }}">{{ article.status_label|default(article.status) }}</span></td>
               <td class="muted nowrap">{{ article.updated_at|beijing_time|default('-', true) }}</td>
               <td><a class="icon-button subtle" href="{{ url_for('article_detail', article_id=article.id) }}" title="查看详情" aria-label="查看文章详情"><i data-lucide="chevron-right"></i></a></td>
@@ -112,7 +112,7 @@
           <div class="run-row">
             <span class="run-state status-{{ run.status|lower }}"><i data-lucide="{{ 'circle-check' if run.status|lower == 'success' else ('loader-circle' if run.status|lower == 'running' else 'circle-x') }}"></i></span>
             <div><strong>{{ run.started_at|beijing_time|default('-', true) }}</strong><small>{{ run.message|default('任务执行完成') }}</small></div>
-            <div class="run-numbers"><span>获取 <b>{{ run.fetched|default(0) }}</b></span><span>新增 <b>{{ run.created|default(0) }}</b></span><span>重复 <b>{{ run.duplicates|default(0) }}</b></span><span>草稿 <b>{{ run.drafts|default(0) }}</b></span></div>
+            <div class="run-numbers"><span>获取 <b>{{ run.fetched|default(0) }}</b></span><span>新增 <b>{{ run.created|default(0) }}</b></span><span>重复 <b>{{ run.duplicates|default(0) }}</b></span><span>草稿 <b>{{ run.drafts|default(0) }}</b></span><span>发布 <b>{{ run.published|default(0) }}</b></span></div>
             <span class="status-pill status-{{ run.status|lower }}">{{ run.status_label|default(run.status) }}</span>
           </div>
         {% endfor %}

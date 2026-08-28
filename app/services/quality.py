@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from html.parser import HTMLParser
 from typing import Any
 
 logger = logging.getLogger(__name__)
+NON_CHINESE_RATIO_THRESHOLD = 0.60
 
 
 class _TextParser(HTMLParser):
@@ -30,6 +32,45 @@ def html_to_text(value: str | None) -> str:
         return " ".join(parser.parts).strip()
     except Exception:
         return re.sub(r"<[^>]+>", " ", str(value or "")).strip()
+
+
+def _is_chinese_character(value: str) -> bool:
+    codepoint = ord(value)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x2FA1F
+        or 0x30000 <= codepoint <= 0x323AF
+    )
+
+
+def analyze_body_language(
+    body: str | None,
+    *,
+    threshold: float = NON_CHINESE_RATIO_THRESHOLD,
+) -> dict[str, Any]:
+    """Measure Chinese versus other letters in the visible article text."""
+
+    text = html_to_text(body)
+    chinese_chars = 0
+    non_chinese_chars = 0
+    for character in text:
+        if _is_chinese_character(character):
+            chinese_chars += 1
+        elif unicodedata.category(character).startswith("L"):
+            non_chinese_chars += 1
+
+    text_chars = chinese_chars + non_chinese_chars
+    non_chinese_ratio = non_chinese_chars / text_chars if text_chars else 0.0
+    return {
+        "chinese_chars": chinese_chars,
+        "non_chinese_chars": non_chinese_chars,
+        "text_chars": text_chars,
+        "non_chinese_ratio": round(non_chinese_ratio, 4),
+        "threshold": float(threshold),
+        "exceeds_threshold": bool(text_chars and non_chinese_ratio > threshold),
+    }
 
 
 DIRTY_PATTERNS = (
@@ -175,6 +216,7 @@ def evaluate(
     channel_issues: list[str] = []
     semantic_issues: list[str] = []
     semantic: dict[str, Any] = {}
+    language_check = analyze_body_language(body)
     if channels is None:
         channel_issues.append("channels 缺失")
     elif not isinstance(channels, list):
@@ -228,6 +270,7 @@ def evaluate(
         "title_before": title,
         "title_after": fixed_title,
         "title_fix_method": title_method,
+        "language_check": language_check,
         "weak_channel_check": True,
         "semantic_check": semantic,
         "semantic_check_used": bool(llm is not None and llm.configured),

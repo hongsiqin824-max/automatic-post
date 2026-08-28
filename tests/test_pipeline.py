@@ -52,6 +52,80 @@ def test_pipeline_ingests_deduplicates_and_queues(app, monkeypatch):
         conn.close()
 
 
+def test_pipeline_removes_links_and_linked_text_before_quality_check(app, monkeypatch):
+    database = app.config["DATABASE"]
+    with app.app_context():
+        tab = repo.list_tabs()[0]
+        repo.update_source("marca", tab_id=tab["id"], enabled=True)
+
+    item = {
+        **ITEM,
+        "source_url": "https://example.com/pipeline/link-cleanup",
+        "translate_body": (
+            '<p>这是一篇足够长的正文，包含比赛经过、球员表现以及赛后采访等信息。</p>'
+            '<p><a href="https://example.com/related">相关阅读推荐</a></p>'
+        ),
+    }
+    monkeypatch.setattr(
+        "app.services.pipeline.MaterialClient.fetch_all",
+        lambda self, sources, **kwargs: MaterialFetchResult(items=[item], total=1, pages=1),
+    )
+
+    result = run_once(AppConfig(
+        database_path=database,
+        material_api_key="test-key",
+        material_caller="test-caller",
+        llm_api_key="",
+        publisher_enabled=False,
+        scheduler_enabled=False,
+    ))
+
+    assert result["inserted"] == 1
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert "相关阅读推荐" not in article["body_html"]
+        assert "href=" not in article["body_html"]
+        assert article["status"] == "READY_TO_PUBLISH"
+        # Keep the unmodified material response for diagnostics.
+        assert "相关阅读推荐" in article["raw"]["translate_body"]
+    finally:
+        conn.close()
+
+
+def test_pipeline_deduplicates_kbs_url_aliases_in_one_fetch(app, monkeypatch):
+    database = app.config["DATABASE"]
+    with app.app_context():
+        tab = repo.list_tabs()[0]
+        repo.update_source("kbs", tab_id=tab["id"], enabled=True)
+
+    items = [
+        {**ITEM, "source": "kbs", "source_url": "https://news.kbs.co.kr/news/pc/view/view.do?ncd=8635111"},
+        {**ITEM, "source": "kbs", "source_url": "https://news.kbs.co.kr/news/view.do?ncd=8635111"},
+    ]
+    monkeypatch.setattr(
+        "app.services.pipeline.MaterialClient.fetch_all",
+        lambda self, sources, **kwargs: MaterialFetchResult(items=items, total=2, pages=1),
+    )
+
+    result = run_once(AppConfig(
+        database_path=database,
+        material_api_key="test-key",
+        material_caller="test-caller",
+        llm_api_key="",
+        publisher_enabled=False,
+        scheduler_enabled=False,
+    ))
+
+    assert result["inserted"] == 1
+    assert result["updated"] == 1
+    conn = _connect(database)
+    try:
+        assert repo.count_articles(conn) == 1
+    finally:
+        conn.close()
+
+
 def test_pipeline_records_missing_credentials(app):
     config = AppConfig(
         database_path=app.config["DATABASE"],
