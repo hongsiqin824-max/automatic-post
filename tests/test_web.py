@@ -250,6 +250,27 @@ def test_review_api_moves_article_to_ready_queue(app, client):
     assert response.get_json()["article"]["status"] == "READY_TO_PUBLISH"
 
 
+def test_quality_recheck_api_is_exposed_for_review_items(app, client, monkeypatch):
+    with app.app_context():
+        tab = repo.list_tabs()[0]
+        repo.update_source("marca", tab_id=tab["id"], enabled=True)
+        article = repo.upsert_material({
+            "source": "marca",
+            "source_url": "https://example.com/web-recheck",
+            "translate_title": "需要重新质检的文章",
+            "translate_body": "<p>这是一段足够长的正文，用于验证重新优化和质检入口。</p>",
+            "channels": [],
+        })["article"]
+        repo.transition_status(article["id"], "NEEDS_REVIEW")
+
+    monkeypatch.setattr("app.web.recheck_article", lambda article_id, cfg, conn: "NEEDS_REVIEW")
+    response = client.post(f"/api/articles/{article['id']}/recheck-quality")
+    assert response.status_code == 200
+    assert response.get_json()["status"] == "NEEDS_REVIEW"
+    review_html = client.get("/review").get_data(as_text=True)
+    assert "data-quality-recheck" in review_html
+
+
 def test_create_draft_retry_api_records_attempt_and_archive_id(app, client, monkeypatch):
     class FakeClient:
         def __init__(self, config):

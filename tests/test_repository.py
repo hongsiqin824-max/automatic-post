@@ -657,6 +657,27 @@ def test_manual_review_only_accepts_articles_waiting_for_review(app):
             repo.manual_review_update(article["id"], "pass")
 
 
+def test_quality_recheck_claim_is_atomic_and_clears_previous_attempt_marker(app):
+    with app.app_context():
+        article = repo.upsert_material(_material())["article"]
+        repo.save_quality(
+            article["id"],
+            {
+                "pass": False,
+                "needs_review": True,
+                "promotion_repair": {"attempted": True, "outcome": "failed"},
+            },
+            status="NEEDS_REVIEW",
+        )
+
+        claimed = repo.claim_quality_recheck(article["id"])
+        assert claimed["status"] == "RECEIVED"
+        assert "promotion_repair" not in claimed["quality"]
+        assert repo.claim_quality_recheck(article["id"]) is None
+        events = repo.list_article_events(article["id"])
+        assert events[-1]["event_type"] == "QUALITY_RECHECK_REQUESTED"
+
+
 def test_catalog_seed_survives_operator_tab_edits_and_restart(app):
     with app.app_context():
         tab = repo.list_tabs()[0]

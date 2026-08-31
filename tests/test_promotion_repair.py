@@ -1,11 +1,225 @@
 from __future__ import annotations
 
 from app.services.promotion_repair import (
+    apply_repair_plan,
     body_safety_stats,
+    content_blocks,
     find_promotional_blocks,
+    find_promotional_lines,
     normalize_photo_credits,
     remove_promotional_blocks,
 )
+
+
+VIDEO_TEASER = "【视频】佐藤龙之介送出引发进球的凶狠逼抢，以及他的威胁场面"
+
+
+def test_ai_repair_plan_removes_10878_video_line_only() -> None:
+    before = "西甲第3轮，瓦伦西亚客场作战，佐藤龙之介首发出场约60分钟。"
+    after = "佐藤从赛季开局起连续3场首发，并在第26分钟参与了前场逼抢。"
+    image = '<p><img src="/fastdfs8/story.jpg" alt="比赛图片" /></p>'
+    context_text = (
+        "瓦伦西亚当地媒体随后分析了球队的整体表现，并逐一评价了首发球员。"
+        "报道肯定了球员回撤接应以及在前场施压的做法，同时指出球队控球不足。"
+    ) * 3
+    context = f"<p>{context_text}</p>"
+    body = f"<p>{before}\n{VIDEO_TEASER}\n{after}</p>{image}{context}"
+    segment = content_blocks(body)[0]["segments"][1]
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "segment_id": segment["segment_id"],
+        "action": "remove_text_line",
+        "evidence": VIDEO_TEASER,
+        "confidence": 0.99,
+    })
+
+    assert error is None
+    assert cleaned == f"<p>{before}\n{after}</p>{image}{context}"
+    assert matches == [{
+        "rule": "ai_targeted_repair",
+        "action": "remove_text_line",
+        "block_id": "b1",
+        "tag": "p",
+        "text": VIDEO_TEASER,
+        "segment_id": "b1.s2",
+    }]
+
+
+def test_ai_repair_plan_accepts_explicit_br_line_boundary() -> None:
+    before = "球队上半场占据主动并率先取得进球。"
+    after = "主教练赛后肯定了全队的防守表现。"
+    context_text = (
+        "报道还详细回顾了双方在中场的争夺、换人调整和终场前的攻防过程，"
+        "并收录了两队主教练在赛后的完整评价。"
+    ) * 4
+    context = f"<p>{context_text}</p>"
+    body = f"<p>{before}<br class='feed'>{VIDEO_TEASER}<BR>{after}</p>{context}"
+
+    segment = content_blocks(body)[0]["segments"][1]
+    cleaned, matches, error = apply_repair_plan(body, {
+        "segment_id": segment["segment_id"],
+        "action": "remove_text_line",
+        "evidence": VIDEO_TEASER,
+        "confidence": 0.98,
+    })
+
+    assert error is None
+    assert matches[0]["segment_id"] == "b1.s2"
+    assert cleaned == f"<p>{before}<br class='feed'>{after}</p>{context}"
+
+
+def test_ai_line_repair_rejects_inline_sentence_without_boundary() -> None:
+    body = (
+        "<p>球队在第26分钟取得进球，"
+        f"{VIDEO_TEASER}，随后对手加强了进攻。</p>"
+    )
+
+    assert find_promotional_lines(body) == []
+    cleaned, matches, error = apply_repair_plan(body, {
+        "segment_id": "b1.s1",
+        "action": "remove_text_line",
+        "evidence": VIDEO_TEASER,
+        "confidence": 0.99,
+    })
+    assert cleaned == body
+    assert matches == []
+    assert error
+
+
+def test_ai_line_repair_rejects_duplicate_evidence() -> None:
+    body = (
+        f"<p>正常新闻前文。\n{VIDEO_TEASER}\n正常新闻后文。</p>"
+        f"<p>另一段正常新闻。\n{VIDEO_TEASER}\n报道结束。</p>"
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "segment_id": "b1.s2",
+        "action": "remove_text_line",
+        "evidence": VIDEO_TEASER,
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "不是唯一" in str(error)
+
+
+def test_ai_line_repair_rejects_excessive_deletion_ratio() -> None:
+    body = f"<p>正常新闻前文只有很少内容。\n{VIDEO_TEASER}\n简短结尾。</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "segment_id": "b1.s2",
+        "action": "remove_text_line",
+        "evidence": VIDEO_TEASER,
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "删除比例" in str(error)
+
+
+def test_ai_line_repair_operation_alias_cannot_bypass_deletion_ratio() -> None:
+    body = f"<p>很短前文。\n{VIDEO_TEASER}\n很短后文。</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "segment_id": "b1.s2",
+        "operation": "remove_text_line",
+        "evidence": VIDEO_TEASER,
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "删除比例" in str(error)
+
+
+def test_video_teaser_whole_block_waits_for_ai_line_plan() -> None:
+    body = f"<p>{VIDEO_TEASER}</p>"
+
+    assert find_promotional_blocks(body) == []
+    assert remove_promotional_blocks(body) == (body, [])
+
+
+def test_ai_repair_plan_requires_allowlisted_tail_promotion_and_exact_evidence() -> None:
+    body = (
+        '<p>这是一段完整的比赛报道，包含比赛过程、球员表现和赛后采访信息。</p>'
+        '<img src="/story.jpg" alt="比赛图片">'
+        '<p>点击这里关注 WhatsApp 频道，获取最新消息</p>'
+        '<p>观看 ge、Globo 和 sportv 上的全部内容</p>'
+    )
+    blocks = content_blocks(body)
+    plan = [
+        {
+            "block_id": blocks[1]["block_id"],
+            "action": "remove_block",
+            "evidence": blocks[1]["text"],
+            "confidence": 0.97,
+        },
+        {
+            "block_id": blocks[2]["block_id"],
+            "action": "remove_block",
+            "evidence": blocks[2]["text"],
+            "confidence": 0.96,
+        },
+    ]
+
+    cleaned, matches, error = apply_repair_plan(body, plan)
+
+    assert error is None
+    assert cleaned == '<p>这是一段完整的比赛报道，包含比赛过程、球员表现和赛后采访信息。</p><img src="/story.jpg" alt="比赛图片">'
+    assert [item["block_id"] for item in matches] == ["b2", "b3"]
+
+
+def test_ai_repair_plan_rejects_non_promotion_or_untrusted_plan() -> None:
+    body = '<p>这是一段完整的比赛报道，包含比赛过程、球员表现和赛后采访信息。</p>'
+    block = content_blocks(body)[0]
+
+    for plan in (
+        {
+            "block_id": block["block_id"],
+            "action": "remove_block",
+            "evidence": block["text"],
+            "confidence": 0.99,
+        },
+        {
+            "block_id": block["block_id"],
+            "action": "remove_block",
+            "evidence": "其他文本",
+            "confidence": 0.99,
+        },
+        {
+            "block_id": block["block_id"],
+            "action": "remove_block",
+            "evidence": block["text"],
+            "confidence": 0.5,
+        },
+    ):
+        cleaned, matches, error = apply_repair_plan(body, plan)
+        assert cleaned == body
+        assert matches == []
+        assert error
+
+
+def test_ai_repair_plan_does_not_confuse_duplicate_middle_and_tail_text() -> None:
+    promotion = "点击这里关注 WhatsApp 频道，获取最新消息"
+    body = (
+        f"<p>{promotion}</p>"
+        "<p>这是一段完整的比赛报道，包含比赛过程、球员表现和赛后采访信息。</p>"
+        f"<p>{promotion}</p>"
+    )
+    blocks = content_blocks(body)
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": blocks[0]["block_id"],
+        "action": "remove_block",
+        "evidence": promotion,
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "未命中高置信" in str(error)
 
 
 def test_removes_only_high_confidence_standalone_plain_text_block() -> None:

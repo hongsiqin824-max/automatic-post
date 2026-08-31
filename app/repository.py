@@ -2314,6 +2314,49 @@ def save_quality(article_id: int, quality: Mapping[str, Any], connection=None, *
     return get_article(article_id, conn)
 
 
+def claim_quality_recheck(article_id: int, connection=None) -> dict | None:
+    """Atomically return one reviewed article to the automatic quality stage."""
+
+    conn = _conn(connection)
+    current = get_article(article_id, conn)
+    if current is None:
+        raise ValueError("article not found")
+    if current["status"] != "NEEDS_REVIEW":
+        return None
+    stored_quality = current.get("quality")
+    quality = dict(stored_quality) if isinstance(stored_quality, Mapping) else {}
+    quality.pop("promotion_repair", None)
+    now = _now()
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE articles
+            SET status='RECEIVED', quality_json=?, error=NULL, updated_at=?
+            WHERE id=? AND status='NEEDS_REVIEW'
+            """,
+            (_json(quality, {}), now, article_id),
+        )
+        if cursor.rowcount != 1:
+            return None
+        conn.execute(
+            """
+            INSERT INTO article_events
+            (article_id, from_status, to_status, event_type, message, payload_json, created_at)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                article_id,
+                "NEEDS_REVIEW",
+                "RECEIVED",
+                "QUALITY_RECHECK_REQUESTED",
+                "人工触发重新优化与完整质检",
+                _json({"previous_quality_reason": current.get("quality_reason") or ""}, {}),
+                now,
+            ),
+        )
+    return get_article(article_id, conn)
+
+
 def manual_review_update(article_id: int, action: str, connection=None, *,
                          title: Optional[str] = None, body_html: Optional[str] = None,
                          litpic: Optional[str] = None, channels: Optional[Iterable[int]] = None,

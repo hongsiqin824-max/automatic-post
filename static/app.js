@@ -115,6 +115,16 @@
   }
 
   function initReview() {
+    $$('[data-quality-recheck]').forEach((button) => {
+      button.addEventListener("click", () => withBusy(button, async () => {
+        if (!window.confirm("重新按当前规则执行一次局部优化和完整质检？只有完整质检明确通过才会进入待发队列。")) return;
+        try {
+          const result = await postJSON(`/api/articles/${button.dataset.id}/recheck-quality`);
+          reloadSoon(result.message || "重新质检已完成");
+        } catch (error) { toast(error.message, "error"); }
+      }));
+    });
+
     $$('[data-review-action]').forEach((button) => {
       button.addEventListener("click", () => withBusy(button, async () => {
         const action = button.dataset.reviewAction;

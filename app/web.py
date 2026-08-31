@@ -29,7 +29,7 @@ from .services.article_images import (
     fallback_litpic_for_tabs,
 )
 from .services.open_platform import AUTH_STATUS_LABELS, OpenPlatformClient, auth_record_summary, build_draft_url
-from .services.pipeline import RunController
+from .services.pipeline import RunController, recheck_article
 from .services.scheduler import Scheduler
 from .services.dqd_open_client import DqdOpenClientError
 from .services.publisher import (
@@ -72,6 +72,7 @@ EVENT_LABELS = {
     "AUTO_REPAIR_TRIGGERED": "已触发自动优化",
     "AUTO_REPAIR_APPLIED": "已应用自动优化",
     "AUTO_REPAIR_FINISHED": "自动优化完成",
+    "QUALITY_RECHECK_REQUESTED": "重新执行自动质检",
     "MANUAL_REVIEW": "人工审核",
     "ALREADY_PUBLISHED_DETECTED": "发现已有文章 ID",
     "DRAFT_CREATE_STARTED": "开始创建草稿",
@@ -369,6 +370,8 @@ def _event_summary_rows(event_type: str, payload: dict[str, Any]) -> list[dict[s
             "standalone_link_prompt": "独立链接提示",
             "standalone_cooperation_contact": "独立合作联系方式",
             "standalone_media_call_to_action": "独立音视频引流段落",
+            "standalone_video_teaser": "独立视频引流行",
+            "ai_targeted_repair": "AI 定向局部优化",
             "standalone_branded_podcast_prompt": "独立品牌播客引流段落",
             "standalone_branded_watch_prompt": "独立品牌观看引流段落",
             "photo_credit_marker": "图片署名格式",
@@ -444,7 +447,7 @@ def _event_summary_rows(event_type: str, payload: dict[str, Any]) -> list[dict[s
         if removed_count is None and isinstance(removed_blocks, list):
             removed_count = len(removed_blocks)
         if removed_count:
-            add("删除段落数", removed_count)
+            add("删除内容数", removed_count)
             add("删除的推广内容", text_list(removed_blocks, key="text"))
 
         normalized_count = payload.get("attribution_normalized_count")
@@ -987,6 +990,29 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify({"success": True, "message": "审核操作已保存", "article": _article_view(result)})
         except (ValueError, TypeError) as exc:
             return jsonify({"success": False, "error": str(exc)}), 400
+
+    @app.post("/api/articles/<int:article_id>/recheck-quality")
+    def api_recheck_quality(article_id: int):
+        cfg: AppConfig = app.extensions["app_config"]
+        conn = get_db()
+        try:
+            final_status = recheck_article(article_id, cfg, conn)
+            article = _article_view(repo.get_article(article_id, conn))
+            message = (
+                "重新优化并质检通过，文章已进入待发队列"
+                if final_status in {"READY_TO_PUBLISH", "ALREADY_PUBLISHED"}
+                else "重新优化与质检已完成，文章仍需人工审核"
+                if final_status == "NEEDS_REVIEW"
+                else "重新质检执行完成"
+            )
+            return jsonify({
+                "success": True,
+                "message": message,
+                "status": final_status,
+                "article": article,
+            })
+        except (ValueError, TypeError) as exc:
+            return jsonify({"success": False, "error": str(exc)}), 409
 
     @app.post("/api/articles/<int:article_id>/create-draft")
     def api_create_draft(article_id: int):

@@ -16,6 +16,7 @@ from .publisher import publish_ready_articles
 from .quality import LLMService, evaluate
 from .link_sanitizer import remove_clickable_links
 from .promotion_repair import (
+    apply_repair_plan,
     body_safety_stats,
     find_promotional_blocks,
     normalize_photo_credits,
@@ -71,12 +72,59 @@ def _audit_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "rule": str(item.get("rule") or ""),
             "tag": str(item.get("tag") or ""),
         }
-        for key in ("text", "caption", "source", "before", "after"):
+        for key in (
+            "block_id", "segment_id", "action", "text", "caption", "source", "before", "after"
+        ):
             value = str(item.get(key) or "")[:300]
             if value:
                 entry[key] = value
         audited.append(entry)
     return audited
+
+
+def _audit_repair_plans(plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Persist only bounded, non-HTML repair-plan evidence."""
+
+    audited: list[dict[str, Any]] = []
+    for item in plans[:3]:
+        entry: dict[str, Any] = {
+            "block_id": str(item.get("block_id") or "")[:40],
+            "segment_id": str(item.get("segment_id") or "")[:40],
+            "action": str(item.get("action") or item.get("operation") or "")[:40],
+            "evidence": str(item.get("evidence") or item.get("before") or "")[:300],
+        }
+        if item.get("after") is not None or item.get("replacement") is not None:
+            entry["after"] = str(item.get("after") or item.get("replacement") or "")[:300]
+        try:
+            entry["confidence"] = float(item.get("confidence"))
+        except (TypeError, ValueError):
+            entry["confidence"] = None
+        audited.append(entry)
+    return audited
+
+
+def _quality_passes(quality: Any) -> bool:
+    """Require an explicit, empty-issues pass before entering publication."""
+
+    if not isinstance(quality, dict):
+        return False
+    if quality.get("pass") is not True or quality.get("needs_review") is not False:
+        return False
+    if quality.get("repair_plans") or quality.get("repair_plan_error"):
+        return False
+    issues = quality.get("issues")
+    if not isinstance(issues, dict):
+        return False
+    required_keys = {
+        "title_problems",
+        "dirty_content",
+        "completeness_problems",
+        "channel_problems",
+        "semantic_problems",
+    }
+    if set(issues) != required_keys:
+        return False
+    return all(isinstance(values, list) and not values for values in issues.values())
 
 
 def _record_quality_result(
@@ -182,13 +230,82 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
         dirty_content = (first_quality.get("issues") or {}).get("dirty_content") or []
         first_failed = bool(first_quality.get("needs_review") or not first_quality.get("pass"))
         body_before = str(current.get("body_html") or "")
-        if first_failed and dirty_content and not previous_repair.get("attempted"):
+        raw_repair_plans = first_quality.get("repair_plans")
+        if isinstance(raw_repair_plans, dict):
+            repair_plans = [raw_repair_plans]
+        elif isinstance(raw_repair_plans, list):
+            repair_plans = [item for item in raw_repair_plans if isinstance(item, dict)]
+        else:
+            repair_plans = []
+        repair_plan_error = first_quality.get("repair_plan_error")
+        ai_plan_error: str | None = None
+        ai_plan_matches: list[dict[str, Any]] = []
+        ai_body_after = body_before
+        promotion_candidates: list[dict[str, Any]] = []
+        attribution_candidates: list[dict[str, Any]] = []
+        if first_failed and repair_plan_error and not previous_repair.get("attempted"):
+            ai_plan_error = str(repair_plan_error)[:300]
+        elif (
+            first_failed
+            and repair_plans
+            and isinstance(first_quality.get("semantic_check"), dict)
+            and first_quality["semantic_check"].get("has_ad_or_dirty") is True
+            and not previous_repair.get("attempted")
+        ):
+            ai_body_after, ai_plan_matches, ai_plan_error = apply_repair_plan(
+                body_before, repair_plans
+            )
+            promotion_candidates = []
+            attribution_candidates = []
+        elif first_failed and repair_plans and not previous_repair.get("attempted"):
+            ai_plan_error = "仅广告或脏内容质检失败允许执行局部自动修复"
+            promotion_candidates = []
+            attribution_candidates = []
+        elif (
+            first_failed
+            and isinstance(first_quality.get("semantic_check"), dict)
+            and first_quality["semantic_check"].get("has_ad_or_dirty") is True
+            and not previous_repair.get("attempted")
+        ):
+            ai_plan_error = "AI 发现广告或脏内容，但未提供可验证的局部修复计划"
+            promotion_candidates = []
+            attribution_candidates = []
+        elif first_failed and dirty_content and not previous_repair.get("attempted"):
             promotion_candidates = find_promotional_blocks(body_before)
             _, attribution_candidates = normalize_photo_credits(body_before)
         else:
             promotion_candidates = []
             attribution_candidates = []
         candidates = [*promotion_candidates, *attribution_candidates]
+        if ai_plan_error:
+            repair = {
+                "attempted": True,
+                "applied": False,
+                "outcome": "failed",
+                "plan_error": ai_plan_error,
+                "repair_plans": _audit_repair_plans(repair_plans),
+                "first_quality": first_quality,
+            }
+            final_quality = {**first_quality, "promotion_repair": repair}
+            repo.save_quality(article_id, final_quality, connection, status="NEEDS_REVIEW")
+            repo.add_article_event(
+                article_id,
+                "AUTO_REPAIR_FINISHED",
+                connection,
+                message="AI 局部修复计划无法验证，已转人工审核",
+                payload={
+                    "outcome": "failed",
+                    "final_status": "NEEDS_REVIEW",
+                    "destination": "人工审核",
+                    "error": ai_plan_error,
+                    "repair_plans": _audit_repair_plans(repair_plans),
+                },
+                from_status="NEEDS_REVIEW",
+                to_status="NEEDS_REVIEW",
+            )
+            return "NEEDS_REVIEW"
+        if ai_plan_matches:
+            candidates = ai_plan_matches
         if not candidates:
             final_quality = dict(first_quality)
             if previous_repair.get("attempted"):
@@ -214,7 +331,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 return "NEEDS_REVIEW"
 
             _apply_quality_title(article_id, current, first_quality, connection)
-            target = "NEEDS_REVIEW" if first_quality.get("needs_review") else "READY_TO_PUBLISH"
+            target = "NEEDS_REVIEW" if not _quality_passes(first_quality) else "READY_TO_PUBLISH"
             repo.save_quality(article_id, final_quality, connection, status=target)
             if target == "READY_TO_PUBLISH" and int(current.get("upstream_archive_id") or 0) > 0:
                 repo.transition_status(
@@ -245,27 +362,44 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             article_id,
             "AUTO_REPAIR_TRIGGERED",
             connection,
-            message="首轮质检命中可安全处理的固定格式，准备自动优化一次",
+            message=(
+                "首轮 AI 质检定位到高置信推广内容，准备定向清理一次"
+                if ai_plan_matches
+                else "首轮质检命中可安全处理的固定格式，准备自动优化一次"
+            ),
             payload={
                 "quality_round": 1,
-                "trigger_reason": "首轮完整质检未通过，且命中高置信固定格式",
+                "trigger_reason": (
+                    "首轮 AI 质检失败，计划目标通过高置信规则交叉验证"
+                    if ai_plan_matches
+                    else "首轮完整质检未通过，且命中高置信固定格式"
+                ),
                 "match_count": len(audit_matches),
                 "rules": list(dict.fromkeys(item["rule"] for item in audit_matches)),
                 "matched_texts": [
                     item.get("text") or item.get("before") or ""
                     for item in audit_matches
                 ],
+                "repair_plans": _audit_repair_plans(repair_plans),
                 "first_quality": first_quality,
             },
             from_status="QUALITY_CHECKING",
             to_status="QUALITY_CHECKING",
         )
 
-        body_normalized, normalized_attributions = normalize_photo_credits(body_before)
-        body_after, removed = remove_promotional_blocks(body_normalized)
+        if ai_plan_matches:
+            body_normalized = body_before
+            normalized_attributions = []
+            body_after, removed = ai_body_after, ai_plan_matches
+        else:
+            body_normalized, normalized_attributions = normalize_photo_credits(body_before)
+            body_after, removed = remove_promotional_blocks(body_normalized)
         before_stats = body_safety_stats(body_before)
         after_stats = body_safety_stats(body_after)
         images_unchanged = before_stats["image_sources"] == after_stats["image_sources"]
+        image_attributes_unchanged = (
+            before_stats["image_attributes"] == after_stats["image_attributes"]
+        )
         safe_to_apply = bool(
             (removed or normalized_attributions)
             and body_after != body_before
@@ -274,6 +408,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             and after_stats["parse_ok"]
             and before_stats["image_count"] == after_stats["image_count"]
             and images_unchanged
+            and image_attributes_unchanged
         )
         repair.update({
             "removed_count": len(removed) if safe_to_apply else 0,
@@ -315,7 +450,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             connection,
             message=(
                 f"已规范化 {len(normalized_attributions)} 处图片署名，"
-                f"删除 {len(removed)} 个高置信独立推广段落"
+                f"删除 {len(removed)} 处高置信推广文字"
             ),
             payload={
                 "removed_blocks": _audit_matches(removed),
@@ -329,6 +464,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 "image_count_before": before_stats["image_count"],
                 "image_count_after": after_stats["image_count"],
                 "image_sources_unchanged": images_unchanged,
+                "image_attributes_unchanged": image_attributes_unchanged,
                 "title_unchanged": True,
             },
             from_status="QUALITY_CHECKING",
@@ -370,14 +506,19 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
         _record_quality_result(
             article_id, second_quality, 2, connection, status="QUALITY_CHECKING"
         )
+        second_passed = second_error is None and _quality_passes(second_quality)
         repair.update({
-            "outcome": "error" if second_error else ("passed" if not second_quality.get("needs_review") else "failed"),
+            "outcome": "error" if second_error else ("passed" if second_passed else "failed"),
             "second_quality": second_quality,
         })
         if second_error is not None:
             repair["error"] = str(second_error)[:300]
         final_quality = {**second_quality, "promotion_repair": repair}
-        target = "NEEDS_REVIEW" if second_error or second_quality.get("needs_review") else "READY_TO_PUBLISH"
+        target = (
+            "READY_TO_PUBLISH"
+            if second_passed
+            else "NEEDS_REVIEW"
+        )
         repo.save_quality(article_id, final_quality, connection, status=target)
         final_status = target
         if target == "READY_TO_PUBLISH" and int(current.get("upstream_archive_id") or 0) > 0:
@@ -428,6 +569,15 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             message=str(exc)[:300],
         )
         return "ERROR"
+
+
+def recheck_article(article_id: int, config: AppConfig, connection) -> str:
+    """Run one manually selected review item through the current quality rules."""
+
+    claimed = repo.claim_quality_recheck(article_id, connection)
+    if claimed is None:
+        raise ValueError("当前文章不在待人工审核状态，不能重新质检")
+    return _process_article(claimed, config, connection)
 
 
 def run_once(config: AppConfig, *, database_path: str | None = None) -> dict[str, Any]:

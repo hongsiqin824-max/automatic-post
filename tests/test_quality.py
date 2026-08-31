@@ -169,3 +169,144 @@ def test_llm_can_fix_semantically_incomplete_title():
     assert result["title_fix_method"] == "llm"
     assert result["title_after"] == "主队在杯赛中以二比一击败客队并晋级"
     assert llm.calls == 2
+
+
+class _StructuredPromotionLLM:
+    configured = True
+
+    def chat_json(self, prompt):
+        assert "b2 <p>: 点击这里关注 WhatsApp 频道，获取最新消息" in prompt
+        return {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "needs_review": True,
+            "reason": "正文末尾含 WhatsApp 频道引流信息",
+            "repair_plans": [{
+                "block_id": "b2",
+                "action": "remove_block",
+                "evidence": "点击这里关注 WhatsApp 频道，获取最新消息",
+                "confidence": 0.98,
+            }],
+        }
+
+
+def test_llm_semantic_check_exposes_structured_targeted_repair_plan():
+    result = evaluate(
+        title="球队公布本轮联赛完整比赛结果",
+        body=(
+            "<p>球队在本轮联赛中取胜，报道包含进球过程、球员表现和赛后采访。</p>"
+            "<p>点击这里关注 WhatsApp 频道，获取最新消息</p>"
+        ),
+        channels=[1],
+        llm=_StructuredPromotionLLM(),
+    )
+
+    assert result["needs_review"] is True
+    assert result["repair_plan_error"] is None
+    assert result["repair_plans"][0]["block_id"] == "b2"
+
+
+class _LinePromotionLLM:
+    configured = True
+
+    def chat_json(self, prompt):
+        teaser = "【视频】佐藤龙之介送出引发进球的凶狠逼抢，以及他的威胁场面"
+        assert f"b1.s2 独立行: {teaser}" in prompt
+        assert '"action":"remove_text_line"' in prompt
+        return {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "needs_review": True,
+            "reason": "正文含独立视频引流行",
+            "repair_plans": [{
+                "segment_id": "b1.s2",
+                "action": "remove_text_line",
+                "evidence": teaser,
+                "confidence": 0.99,
+            }],
+        }
+
+
+def test_llm_semantic_check_exposes_line_level_repair_target():
+    teaser = "【视频】佐藤龙之介送出引发进球的凶狠逼抢，以及他的威胁场面"
+    result = evaluate(
+        title="佐藤龙之介首发出场，瓦伦西亚客场告负",
+        body=(
+            "<p>佐藤龙之介本轮首发出场约60分钟。\n"
+            f"{teaser}\n"
+            "他在第26分钟参与前场逼抢并帮助球队取得进球。</p>"
+        ),
+        channels=[1],
+        llm=_LinePromotionLLM(),
+    )
+
+    assert result["needs_review"] is True
+    assert result["repair_plan_error"] is None
+    assert result["repair_plans"] == [{
+        "segment_id": "b1.s2",
+        "action": "remove_text_line",
+        "evidence": teaser,
+        "confidence": 0.99,
+    }]
+
+
+class _MalformedSemanticLLM:
+    configured = True
+
+    def chat_json(self, prompt):
+        return {
+            "title_complete": "true",
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "needs_review": True,
+            "reason": "字段格式异常",
+            "repair_plans": ["delete everything"],
+        }
+
+
+def test_malformed_semantic_result_is_explicitly_blocked():
+    result = evaluate(
+        title="球队公布本轮联赛完整比赛结果",
+        body="<p>球队在本轮联赛中取胜，报道包含比赛过程、球员表现和赛后采访。</p>",
+        channels=[1],
+        llm=_MalformedSemanticLLM(),
+    )
+
+    assert result["needs_review"] is True
+    assert result["repair_plans"] == []
+    assert result["repair_plan_error"]
+    assert result["issues"]["semantic_problems"]
+
+
+class _ContradictoryRepairPlanLLM:
+    configured = True
+
+    def chat_json(self, prompt):
+        return {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": False,
+            "needs_review": False,
+            "reason": "内容正常",
+            "repair_plans": [{
+                "block_id": "b1",
+                "action": "remove_block",
+                "evidence": "点击这里关注 WhatsApp 频道，获取最新消息",
+                "confidence": 0.99,
+            }],
+        }
+
+
+def test_repair_plan_cannot_coexist_with_semantic_pass():
+    result = evaluate(
+        title="球队公布本轮联赛完整比赛结果",
+        body="<p>点击这里关注 WhatsApp 频道，获取最新消息</p>",
+        channels=[1],
+        llm=_ContradictoryRepairPlanLLM(),
+    )
+
+    assert result["pass"] is False
+    assert result["needs_review"] is True
+    assert result["repair_plan_error"] == "AI 修复计划与质检结论矛盾"
