@@ -35,6 +35,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _env_json_object(name: str) -> dict[str, str]:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -77,6 +85,10 @@ class AppConfig:
     llm_base_url: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
     llm_model: str = os.getenv("LLM_MODEL", "gpt-5.5")
     llm_timeout: int = max(10, _env_int("LLM_TIMEOUT_SECONDS", 45))
+    llm_max_retries: int = max(0, min(3, _env_int("LLM_MAX_RETRIES", 2)))
+    llm_retry_delay_seconds: float = max(
+        0.1, min(10.0, _env_float("LLM_RETRY_DELAY_SECONDS", 0.5))
+    )
 
     dqd_base_url: str = os.getenv(
         "DQD_BASE_URL", "https://dadmin.dongqiudi.com"

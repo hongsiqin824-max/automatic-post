@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import errno
+import fcntl
+import os
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -13,8 +16,13 @@ from ..db import _connect
 from ..statuses import STATUS_LABELS
 from .material_client import MaterialClient, MaterialClientError, normalize_item
 from .publisher import publish_ready_articles
-from .quality import LLMService, evaluate
-from .link_sanitizer import remove_clickable_links
+from .quality import (
+    LLMService,
+    evaluate,
+    is_photo_credit_advisory_plans,
+    plan_local_repair,
+)
+from .link_sanitizer import preprocess_quality_body
 from .promotion_repair import (
     apply_repair_plan,
     body_safety_stats,
@@ -35,21 +43,29 @@ def _quality_eligible(article: dict[str, Any]) -> bool:
 
 
 def _update_content(article_id: int, *, title: str | None = None,
-                    body: str | None = None, connection) -> None:
+                    body: str | None = None, connection,
+                    quality_claim_token: str | None = None) -> None:
     conn = connection
     current = repo.get_article(article_id, conn)
     if current is None:
         raise ValueError("article not found")
     with conn:
-        conn.execute(
-            "UPDATE articles SET title_final=?, body_html=?, updated_at=? WHERE id=?",
+        clauses = ["id=?"]
+        params: list[Any] = [article_id]
+        if quality_claim_token is not None:
+            clauses.append("quality_claim_token=?")
+            params.append(str(quality_claim_token))
+        cursor = conn.execute(
+            "UPDATE articles SET title_final=?, body_html=?, updated_at=? WHERE " + " AND ".join(clauses),
             (
                 current.get("title_final", "") if title is None else str(title),
                 current.get("body_html", "") if body is None else str(body),
                 _utc_now(),
-                article_id,
+                *params,
             ),
         )
+        if quality_claim_token is not None and cursor.rowcount != 1:
+            raise RuntimeError("文章质检租约已失效，放弃写入旧正文")
 
 
 def _make_llm(config: AppConfig) -> LLMService | None:
@@ -60,6 +76,8 @@ def _make_llm(config: AppConfig) -> LLMService | None:
         config.llm_base_url,
         config.llm_model,
         config.llm_timeout,
+        config.llm_max_retries,
+        config.llm_retry_delay_seconds,
     )
 
 
@@ -73,11 +91,27 @@ def _audit_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "tag": str(item.get("tag") or ""),
         }
         for key in (
-            "block_id", "segment_id", "action", "text", "caption", "source", "before", "after"
+            "block_id",
+            "segment_id",
+            "action",
+            "validation",
+            "issue_type",
+            "reason",
+            "text",
+            "caption",
+            "source",
+            "before",
+            "after",
         ):
             value = str(item.get(key) or "")[:300]
             if value:
                 entry[key] = value
+        try:
+            confidence = float(item.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = None
+        if confidence is not None:
+            entry["confidence"] = confidence
         audited.append(entry)
     return audited
 
@@ -86,13 +120,23 @@ def _audit_repair_plans(plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Persist only bounded, non-HTML repair-plan evidence."""
 
     audited: list[dict[str, Any]] = []
-    for item in plans[:3]:
+    for item in plans[:8]:
+        segment_id = str(item.get("segment_id") or "")[:40]
+        block_id = str(item.get("block_id") or "")[:40]
+        if not block_id and ".s" in segment_id.lower():
+            block_id = segment_id.lower().split(".s", 1)[0]
         entry: dict[str, Any] = {
-            "block_id": str(item.get("block_id") or "")[:40],
-            "segment_id": str(item.get("segment_id") or "")[:40],
+            "block_id": block_id,
+            "segment_id": segment_id,
             "action": str(item.get("action") or item.get("operation") or "")[:40],
             "evidence": str(item.get("evidence") or item.get("before") or "")[:300],
         }
+        for key in ("issue_type", "reason", "keep_block_id", "keep_segment_id"):
+            value = str(item.get(key) or "")[:300]
+            if value:
+                entry[key] = value
+        if "issue_type" not in entry and item.get("issue_code"):
+            entry["issue_type"] = str(item.get("issue_code"))[:80]
         if item.get("after") is not None or item.get("replacement") is not None:
             entry["after"] = str(item.get("after") or item.get("replacement") or "")[:300]
         try:
@@ -127,6 +171,113 @@ def _quality_passes(quality: Any) -> bool:
     return all(isinstance(values, list) and not values for values in issues.values())
 
 
+def _quality_repair_scope_is_dirty_only(quality: dict[str, Any]) -> bool:
+    """Allow body-only cleanup only when no other quality issue is present."""
+
+    issues = quality.get("issues")
+    if not isinstance(issues, dict):
+        return False
+    dirty = issues.get("dirty_content")
+    if not isinstance(dirty, list) or not dirty:
+        return False
+    return all(
+        isinstance(issues.get(key), list) and not issues.get(key)
+        for key in (
+            "title_problems",
+            "completeness_problems",
+            "channel_problems",
+            "semantic_problems",
+        )
+    )
+
+
+def _quality_has_repairable_ai_plan(
+    quality: dict[str, Any], plans: list[dict[str, Any]]
+) -> bool:
+    """Return whether a failed body check has a bounded AI repair plan."""
+
+    if not plans:
+        return False
+    semantic = quality.get("semantic_check")
+    if isinstance(semantic, dict):
+        if semantic.get("repairable") is False:
+            return False
+        if semantic.get("title_complete") is False or semantic.get("body_complete") is False:
+            return False
+    issues = quality.get("issues")
+    if not isinstance(issues, dict):
+        return False
+    if any(
+        not isinstance(issues.get(key), list) or issues.get(key)
+        for key in (
+            "title_problems",
+            "completeness_problems",
+            "channel_problems",
+        )
+    ):
+        return False
+    return bool(
+        issues.get("dirty_content")
+        or issues.get("semantic_problems")
+        or (isinstance(semantic, dict) and semantic.get("needs_review") is True)
+    )
+
+
+def _quality_allows_body_repair_planning(quality: dict[str, Any]) -> bool:
+    """Keep title, completeness and channel failures out of body-only repair."""
+
+    issues = quality.get("issues")
+    if not isinstance(issues, dict):
+        return False
+    return bool(
+        not quality.get("semantic_error")
+        and not any(issues.get(key) for key in (
+            "title_problems",
+            "completeness_problems",
+            "channel_problems",
+        ))
+        and (issues.get("dirty_content") or issues.get("semantic_problems"))
+    )
+
+
+def _clear_non_blocking_photo_advisory(
+    quality: dict[str, Any],
+    *,
+    body: str,
+) -> dict[str, Any]:
+    """Keep explicit photo-credit advice in audit data without blocking pass."""
+
+    if (
+        quality.get("pass") is not True
+        or quality.get("needs_review") is not False
+    ):
+        return quality
+    issues = quality.get("issues")
+    if not isinstance(issues, dict) or any(issues.get(key) for key in (
+        "title_problems",
+        "dirty_content",
+        "completeness_problems",
+        "channel_problems",
+        "semantic_problems",
+    )):
+        return quality
+    semantic = quality.get("semantic_check")
+    if not isinstance(semantic, dict):
+        return quality
+    if semantic.get("has_ad_or_dirty") is not False or semantic.get("needs_review") is not False:
+        return quality
+    plans = quality.get("repair_plans")
+    if not is_photo_credit_advisory_plans(plans, body=body):
+        return quality
+    advisory = [dict(item) for item in (plans if isinstance(plans, list) else [plans])]
+    normalized = dict(quality)
+    normalized["advisory_repair_plans"] = advisory
+    normalized["repair_plans"] = []
+    normalized["repair_plan_error"] = None
+    normalized["advisory_reason"] = "摄影署名建议仅作记录，未自动修改正文"
+    return normalized
+
+
 def _record_quality_result(
     article_id: int,
     quality: dict[str, Any],
@@ -134,6 +285,7 @@ def _record_quality_result(
     connection,
     *,
     status: str,
+    quality_claim_token: str | None = None,
 ) -> None:
     payload = dict(quality)
     payload["quality_round"] = quality_round
@@ -145,20 +297,22 @@ def _record_quality_result(
         payload=payload,
         from_status=status,
         to_status=status,
+        quality_claim_token=quality_claim_token,
     )
 
 
-def _apply_quality_title(article_id: int, current: dict[str, Any], quality: dict[str, Any], connection) -> None:
+def _apply_quality_title(article_id: int, current: dict[str, Any], quality: dict[str, Any], connection, *, quality_claim_token: str | None = None) -> None:
     title_after = quality.get("title_after") or current.get("title_final", "")
     if title_after == current.get("title_final", ""):
         return
-    _update_content(article_id, title=title_after, connection=connection)
+    _update_content(article_id, title=title_after, connection=connection, quality_claim_token=quality_claim_token)
     repo.add_article_event(
         article_id,
         "TITLE_FIXED",
         connection,
         message=f"标题已自动修正（{quality.get('title_fix_method', 'unknown')}）",
         payload={"before": current.get("title_final", ""), "after": title_after},
+        quality_claim_token=quality_claim_token,
     )
     current["title_final"] = title_after
 
@@ -166,7 +320,7 @@ def _apply_quality_title(article_id: int, current: dict[str, Any], quality: dict
 def _second_quality_error(first_quality: dict[str, Any], error: Exception) -> dict[str, Any]:
     issues = dict(first_quality.get("issues") or {})
     semantic = list(issues.get("semantic_problems") or [])
-    semantic.append("正文自动优化后的二次完整质检异常，需要人工确认")
+    semantic.append("候选正文的二次完整质检异常，需要人工确认")
     issues["semantic_problems"] = semantic
     return {
         **first_quality,
@@ -174,7 +328,7 @@ def _second_quality_error(first_quality: dict[str, Any], error: Exception) -> di
         "needs_review": True,
         "score": 50,
         "issues": issues,
-        "reason": "正文已自动优化，但二次完整质检异常，需要人工确认",
+        "reason": "候选正文已生成，但二次完整质检异常，需要人工确认",
         "second_quality_error": str(error)[:300],
     }
 
@@ -183,39 +337,96 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
     article_id = int(article["id"])
     if not _quality_eligible(article):
         return article.get("status", "")
-    if not article.get("tabs") and not article.get("tab_id"):
-        quality = {
-            "pass": False,
-            "needs_review": True,
-            "score": 50,
-            "level": "B",
-            "issues": {"configuration": ["该来源尚未绑定栏目"]},
-            "reason": "来源尚未绑定栏目",
-            "weak_channel_check": True,
-        }
-        repo.save_quality(article_id, quality, connection, status="NEEDS_REVIEW")
-        return "NEEDS_REVIEW"
-
-    repo.transition_status(
+    claimed = repo.claim_quality_article(
         article_id,
-        "QUALITY_CHECKING",
+        article.get("updated_at"),
         connection,
-        event_type="QUALITY_STARTED",
-        message="开始标题、正文和脏内容检查",
     )
+    if claimed is None:
+        current = repo.get_article(article_id, connection)
+        return current.get("status", "") if current else ""
+    article = claimed
+    quality_claim_token = str(claimed.get("quality_claim_token") or "")
+    if not article.get("tabs") and not article.get("tab_id"):
+        try:
+            quality = {
+                "pass": False,
+                "needs_review": True,
+                "score": 50,
+                "level": "B",
+                "issues": {"configuration": ["该来源尚未绑定栏目"]},
+                "reason": "来源尚未绑定栏目",
+                "weak_channel_check": True,
+            }
+            repo.save_quality(
+                article_id,
+                quality,
+                connection,
+                status="NEEDS_REVIEW",
+                quality_claim_token=quality_claim_token,
+            )
+            return "NEEDS_REVIEW"
+        except RuntimeError:
+            current = repo.get_article(article_id, connection)
+            if current and current.get("quality_claim_token") != quality_claim_token:
+                return current.get("status", "")
+            raise
+        finally:
+            repo.release_quality_claim(article_id, quality_claim_token, connection)
+
     current = repo.get_article(article_id, connection)
     try:
-        cleaned_body = remove_clickable_links(current.get("body_html", ""))
-        if cleaned_body != current.get("body_html", ""):
-            _update_content(article_id, body=cleaned_body, connection=connection)
+        body_before_preprocess = str(current.get("body_html") or "")
+        cleaned_body = preprocess_quality_body(body_before_preprocess)
+        if cleaned_body != body_before_preprocess:
+            preprocess_before = body_safety_stats(body_before_preprocess)
+            preprocess_after = body_safety_stats(cleaned_body)
+            preprocess_safe = bool(
+                preprocess_before["parse_ok"]
+                and preprocess_after["parse_ok"]
+                and preprocess_before["image_count"] == preprocess_after["image_count"]
+                and preprocess_before["image_sources"] == preprocess_after["image_sources"]
+                and preprocess_before["image_attributes"] == preprocess_after["image_attributes"]
+            )
+            if not preprocess_safe:
+                # Never persist a quality cleanup that could lose or mutate
+                # article media; the raw body will fail closed in quality.py.
+                cleaned_body = body_before_preprocess
+                preprocess_after = preprocess_before
+            else:
+                _update_content(
+                    article_id,
+                    body=cleaned_body,
+                    connection=connection,
+                    quality_claim_token=quality_claim_token,
+                )
+                current["body_html"] = cleaned_body
             repo.add_article_event(
                 article_id,
                 "LINKS_REMOVED",
                 connection,
-                message="质检前已移除正文中的超链接及链接文字",
-                payload={"source": "quality_preprocess"},
+                message=(
+                    "质检前已清理可跳转内容、播放器和采集残留"
+                    if preprocess_safe
+                    else "检测到可清理的可跳转内容或采集残留，但安全校验未通过，正文未改动"
+                ),
+                payload={
+                    "source": "quality_preprocess",
+                    "rule_version": "quality-preprocess-v1",
+                    "before_sha256": preprocess_before["sha256"],
+                    "after_sha256": preprocess_after["sha256"],
+                    "before_length": len(body_before_preprocess),
+                    "after_length": len(cleaned_body),
+                    "image_count_before": preprocess_before["image_count"],
+                    "image_count_after": preprocess_after["image_count"],
+                    "image_sources_before": preprocess_before["image_sources"],
+                    "image_sources_after": preprocess_after["image_sources"],
+                    "image_attributes_before": preprocess_before["image_attributes"],
+                    "image_attributes_after": preprocess_after["image_attributes"],
+                    "applied": preprocess_safe,
+                },
+                quality_claim_token=quality_claim_token,
             )
-            current["body_html"] = cleaned_body
         previous_repair = current.get("quality", {}).get("promotion_repair", {})
         first_quality = evaluate(
             title=current.get("title_final", ""),
@@ -224,11 +435,15 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             llm=_make_llm(config),
         )
         _record_quality_result(
-            article_id, first_quality, 1, connection, status="QUALITY_CHECKING"
+            article_id,
+            first_quality,
+            1,
+            connection,
+            status="QUALITY_CHECKING",
+            quality_claim_token=quality_claim_token,
         )
 
-        dirty_content = (first_quality.get("issues") or {}).get("dirty_content") or []
-        first_failed = bool(first_quality.get("needs_review") or not first_quality.get("pass"))
+        first_failed = not _quality_passes(first_quality)
         body_before = str(current.get("body_html") or "")
         raw_repair_plans = first_quality.get("repair_plans")
         if isinstance(raw_repair_plans, dict):
@@ -238,18 +453,59 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
         else:
             repair_plans = []
         repair_plan_error = first_quality.get("repair_plan_error")
+        repair_planner: dict[str, Any] | None = None
+        if (
+            first_failed
+            and not repair_plans
+            and not repair_plan_error
+            and not previous_repair.get("attempted")
+            and _quality_allows_body_repair_planning(first_quality)
+        ):
+            planner_llm = _make_llm(config)
+            if planner_llm is not None:
+                try:
+                    planner_result = plan_local_repair(
+                        title=current.get("title_final", ""),
+                        body=body_before,
+                        first_quality=first_quality,
+                        llm=planner_llm,
+                    )
+                    repair_plan_error = planner_result.get("repair_plan_error")
+                    planned = planner_result.get("repair_plans")
+                    if isinstance(planned, list):
+                        repair_plans = [item for item in planned if isinstance(item, dict)]
+                    repair_planner = {
+                        "repairable": planner_result.get("repairable") is True,
+                        "reason": str(planner_result.get("reason") or "")[:500],
+                        "repair_plans": _audit_repair_plans(repair_plans),
+                        "repair_plan_error": (
+                            str(repair_plan_error)[:300] if repair_plan_error else None
+                        ),
+                    }
+                except Exception as exc:  # a planning outage must not modify content
+                    logger.warning("AI 局部修复规划失败 article_id=%s: %s", article_id, exc)
+                    repair_planner = {
+                        "repairable": False,
+                        "reason": "AI 局部修复规划调用失败",
+                        "repair_plans": [],
+                        "repair_plan_error": str(exc)[:300],
+                    }
         ai_plan_error: str | None = None
         ai_plan_matches: list[dict[str, Any]] = []
         ai_body_after = body_before
         promotion_candidates: list[dict[str, Any]] = []
         attribution_candidates: list[dict[str, Any]] = []
+        repair_scope_is_dirty_only = _quality_repair_scope_is_dirty_only(first_quality)
+        repairable_ai_plan = _quality_has_repairable_ai_plan(first_quality, repair_plans)
+        if repair_planner is not None and repair_planner.get("repairable") is True:
+            repairable_ai_plan = bool(
+                repair_plans and _quality_allows_body_repair_planning(first_quality)
+            )
         if first_failed and repair_plan_error and not previous_repair.get("attempted"):
             ai_plan_error = str(repair_plan_error)[:300]
         elif (
             first_failed
-            and repair_plans
-            and isinstance(first_quality.get("semantic_check"), dict)
-            and first_quality["semantic_check"].get("has_ad_or_dirty") is True
+            and repairable_ai_plan
             and not previous_repair.get("attempted")
         ):
             ai_body_after, ai_plan_matches, ai_plan_error = apply_repair_plan(
@@ -258,11 +514,12 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             promotion_candidates = []
             attribution_candidates = []
         elif first_failed and repair_plans and not previous_repair.get("attempted"):
-            ai_plan_error = "仅广告或脏内容质检失败允许执行局部自动修复"
+            ai_plan_error = "当前质检失败还包含无法通过正文局部修改解决的问题"
             promotion_candidates = []
             attribution_candidates = []
         elif (
             first_failed
+            and repair_scope_is_dirty_only
             and isinstance(first_quality.get("semantic_check"), dict)
             and first_quality["semantic_check"].get("has_ad_or_dirty") is True
             and not previous_repair.get("attempted")
@@ -270,7 +527,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             ai_plan_error = "AI 发现广告或脏内容，但未提供可验证的局部修复计划"
             promotion_candidates = []
             attribution_candidates = []
-        elif first_failed and dirty_content and not previous_repair.get("attempted"):
+        elif first_failed and repair_scope_is_dirty_only and not previous_repair.get("attempted"):
             promotion_candidates = find_promotional_blocks(body_before)
             _, attribution_candidates = normalize_photo_credits(body_before)
         else:
@@ -286,8 +543,16 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 "repair_plans": _audit_repair_plans(repair_plans),
                 "first_quality": first_quality,
             }
+            if repair_planner is not None:
+                repair["repair_planner"] = repair_planner
             final_quality = {**first_quality, "promotion_repair": repair}
-            repo.save_quality(article_id, final_quality, connection, status="NEEDS_REVIEW")
+            repo.save_quality(
+                article_id,
+                final_quality,
+                connection,
+                status="NEEDS_REVIEW",
+                quality_claim_token=quality_claim_token,
+            )
             repo.add_article_event(
                 article_id,
                 "AUTO_REPAIR_FINISHED",
@@ -302,12 +567,15 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 },
                 from_status="NEEDS_REVIEW",
                 to_status="NEEDS_REVIEW",
+                quality_claim_token=quality_claim_token,
             )
             return "NEEDS_REVIEW"
         if ai_plan_matches:
             candidates = ai_plan_matches
         if not candidates:
             final_quality = dict(first_quality)
+            if repair_planner is not None:
+                final_quality["repair_planner"] = repair_planner
             if previous_repair.get("attempted"):
                 # A worker can stop after persisting the one-attempt marker
                 # but before the body mutation or second quality pass.  A
@@ -326,13 +594,29 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 })
                 final_quality["promotion_repair"] = previous_repair
                 repo.save_quality(
-                    article_id, final_quality, connection, status="NEEDS_REVIEW"
+                    article_id,
+                    final_quality,
+                    connection,
+                    status="NEEDS_REVIEW",
+                    quality_claim_token=quality_claim_token,
                 )
                 return "NEEDS_REVIEW"
 
-            _apply_quality_title(article_id, current, first_quality, connection)
+            _apply_quality_title(
+                article_id,
+                current,
+                first_quality,
+                connection,
+                quality_claim_token=quality_claim_token,
+            )
             target = "NEEDS_REVIEW" if not _quality_passes(first_quality) else "READY_TO_PUBLISH"
-            repo.save_quality(article_id, final_quality, connection, status=target)
+            repo.save_quality(
+                article_id,
+                final_quality,
+                connection,
+                status=target,
+                quality_claim_token=quality_claim_token,
+            )
             if target == "READY_TO_PUBLISH" and int(current.get("upstream_archive_id") or 0) > 0:
                 repo.transition_status(
                     article_id,
@@ -340,6 +624,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     connection,
                     event_type="ALREADY_PUBLISHED_DETECTED",
                     message="素材接口已返回非零 archive_id，本阶段不重复发布",
+                    quality_claim_token=quality_claim_token,
                 )
                 return "ALREADY_PUBLISHED"
             return target
@@ -349,28 +634,38 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             "attempted": True,
             "applied": False,
             "outcome": "pending",
+            "scope": "bounded_local",
+            "schema_version": 2,
             "removed_count": 0,
             "attribution_normalized_count": 0,
             "matches": audit_matches,
             "first_quality": first_quality,
         }
+        if repair_planner is not None:
+            repair["repair_planner"] = repair_planner
         progress_quality = {**first_quality, "promotion_repair": repair}
         # Persist the one-attempt marker before mutating the body. If a worker
         # stops between steps, a later run cannot delete more content.
-        repo.save_quality(article_id, progress_quality, connection, status="QUALITY_CHECKING")
+        repo.save_quality(
+            article_id,
+            progress_quality,
+            connection,
+            status="QUALITY_CHECKING",
+            quality_claim_token=quality_claim_token,
+        )
         repo.add_article_event(
             article_id,
             "AUTO_REPAIR_TRIGGERED",
             connection,
             message=(
-                "首轮 AI 质检定位到高置信推广内容，准备定向清理一次"
+                "首轮 AI 质检定位到可验证局部问题，准备生成候选正文"
                 if ai_plan_matches
                 else "首轮质检命中可安全处理的固定格式，准备自动优化一次"
             ),
             payload={
                 "quality_round": 1,
                 "trigger_reason": (
-                    "首轮 AI 质检失败，计划目标通过高置信规则交叉验证"
+                    "首轮质检失败后，AI 返回具体位置、完整证据、问题类别和原因，且通过结构与置信度校验"
                     if ai_plan_matches
                     else "首轮完整质检未通过，且命中高置信固定格式"
                 ),
@@ -385,6 +680,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             },
             from_status="QUALITY_CHECKING",
             to_status="QUALITY_CHECKING",
+            quality_claim_token=quality_claim_token,
         )
 
         if ai_plan_matches:
@@ -420,11 +716,19 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             ),
             "before": before_stats,
             "after": after_stats,
+            "candidate_created": safe_to_apply,
+            "candidate_committed": False,
         })
         if not safe_to_apply:
             repair.update({"outcome": "failed", "safety_check_passed": False})
             final_quality = {**first_quality, "promotion_repair": repair}
-            repo.save_quality(article_id, final_quality, connection, status="NEEDS_REVIEW")
+            repo.save_quality(
+                article_id,
+                final_quality,
+                connection,
+                status="NEEDS_REVIEW",
+                quality_claim_token=quality_claim_token,
+            )
             repo.add_article_event(
                 article_id,
                 "AUTO_REPAIR_FINISHED",
@@ -438,48 +742,27 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 },
                 from_status="NEEDS_REVIEW",
                 to_status="NEEDS_REVIEW",
+                quality_claim_token=quality_claim_token,
             )
             return "NEEDS_REVIEW"
 
-        _update_content(article_id, body=body_after, connection=connection)
-        current["body_html"] = body_after
-        repair.update({"applied": True, "safety_check_passed": True})
-        repo.add_article_event(
-            article_id,
-            "AUTO_REPAIR_APPLIED",
-            connection,
-            message=(
-                f"已规范化 {len(normalized_attributions)} 处图片署名，"
-                f"删除 {len(removed)} 处高置信推广文字"
-            ),
-            payload={
-                "removed_blocks": _audit_matches(removed),
-                "removed_count": len(removed),
-                "attribution_normalized_count": len(normalized_attributions),
-                "attribution_changes": _audit_matches(normalized_attributions),
-                "attribution_only": bool(normalized_attributions and not removed),
-                "match_count": len(removed) + len(normalized_attributions),
-                "body_length_before": before_stats["body_length"],
-                "body_length_after": after_stats["body_length"],
-                "image_count_before": before_stats["image_count"],
-                "image_count_after": after_stats["image_count"],
-                "image_sources_unchanged": images_unchanged,
-                "image_attributes_unchanged": image_attributes_unchanged,
-                "title_unchanged": True,
-            },
-            from_status="QUALITY_CHECKING",
-            to_status="QUALITY_CHECKING",
-        )
+        repair.update({"applied": False, "safety_check_passed": True})
 
         second_error: Exception | None = None
         try:
             second_quality = evaluate(
                 title=current.get("title_final", ""),
-                body=current.get("body_html", ""),
+                body=body_after,
                 channels=current.get("channels", []),
                 llm=_make_llm(config),
             )
-        except Exception as exc:  # uncertainty after mutation must fail closed
+            if not isinstance(second_quality, dict):
+                raise TypeError("二次质检返回结果格式错误")
+            second_quality = _clear_non_blocking_photo_advisory(
+                second_quality,
+                body=body_after,
+            )
+        except Exception as exc:  # uncertainty leaves the canonical body untouched
             logger.exception("二次质检失败 article_id=%s", article_id)
             second_error = exc
             second_quality = _second_quality_error(first_quality, exc)
@@ -491,22 +774,53 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             second_quality = dict(second_quality)
             issues = dict(second_quality.get("issues") or {})
             title_problems = list(issues.get("title_problems") or [])
-            title_problems.append("正文自动优化不修改标题，标题修复需人工确认")
+            title_problems.append("局部正文修复不修改标题，标题修复需人工确认")
             issues["title_problems"] = title_problems
             second_quality.update({
                 "pass": False,
                 "needs_review": True,
                 "score": min(int(second_quality.get("score") or 50), 50),
                 "issues": issues,
-                "reason": "正文已自动优化，但标题修复需人工确认",
+                "reason": "候选正文已生成，但标题修复需人工确认",
                 "title_after": current.get("title_final", ""),
                 "title_fix_method": "blocked_during_promotion_repair",
             })
 
         _record_quality_result(
-            article_id, second_quality, 2, connection, status="QUALITY_CHECKING"
+            article_id,
+            second_quality,
+            2,
+            connection,
+            status="QUALITY_CHECKING",
+            quality_claim_token=quality_claim_token,
         )
         second_passed = second_error is None and _quality_passes(second_quality)
+        applied_event_message: str | None = None
+        applied_event_payload: dict[str, Any] | None = None
+        if second_passed:
+            repair.update({"applied": True, "candidate_committed": True})
+            applied_event_message = (
+                f"候选正文二次质检通过，已提交 {len(normalized_attributions)} 处署名规范化"
+                if normalized_attributions and not removed
+                else f"候选正文二次质检通过，已提交 {len(removed)} 处局部修复"
+            )
+            applied_event_payload = {
+                "removed_blocks": _audit_matches(removed),
+                "removed_count": len(removed),
+                "attribution_normalized_count": len(normalized_attributions),
+                "attribution_changes": _audit_matches(normalized_attributions),
+                "attribution_only": bool(normalized_attributions and not removed),
+                "match_count": len(removed) + len(normalized_attributions),
+                "body_length_before": before_stats["body_length"],
+                "body_length_after": after_stats["body_length"],
+                "body_sha256_before": before_stats["sha256"],
+                "body_sha256_after": after_stats["sha256"],
+                "image_count_before": before_stats["image_count"],
+                "image_count_after": after_stats["image_count"],
+                "image_sources_unchanged": images_unchanged,
+                "image_attributes_unchanged": image_attributes_unchanged,
+                "title_unchanged": True,
+            }
         repair.update({
             "outcome": "error" if second_error else ("passed" if second_passed else "failed"),
             "second_quality": second_quality,
@@ -519,7 +833,26 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             if second_passed
             else "NEEDS_REVIEW"
         )
-        repo.save_quality(article_id, final_quality, connection, status=target)
+        repo.save_quality(
+            article_id,
+            final_quality,
+            connection,
+            status=target,
+            quality_claim_token=quality_claim_token,
+            body_html=body_after if second_passed else None,
+        )
+        if second_passed:
+            current["body_html"] = body_after
+            repo.add_article_event(
+                article_id,
+                "AUTO_REPAIR_APPLIED",
+                connection,
+                message=applied_event_message,
+                payload=applied_event_payload,
+                from_status=target,
+                to_status=target,
+                quality_claim_token=quality_claim_token,
+            )
         final_status = target
         if target == "READY_TO_PUBLISH" and int(current.get("upstream_archive_id") or 0) > 0:
             repo.transition_status(
@@ -528,10 +861,12 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 connection,
                 event_type="ALREADY_PUBLISHED_DETECTED",
                 message="素材接口已返回非零 archive_id，本阶段不重复发布",
+                quality_claim_token=quality_claim_token,
             )
             final_status = "ALREADY_PUBLISHED"
         finish_payload: dict[str, Any] = {
             "outcome": repair["outcome"],
+            "candidate_committed": repair["candidate_committed"],
             "final_status": final_status,
             "destination": "发布队列" if final_status == "READY_TO_PUBLISH" else (
                 "不重复发布" if final_status == "ALREADY_PUBLISHED" else "人工审核"
@@ -546,29 +881,39 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             "AUTO_REPAIR_FINISHED",
             connection,
             message=(
-                "二次完整质检异常，已转人工审核"
+                "候选正文二次完整质检异常，原正文未改动并转人工审核"
                 if second_error is not None
                 else (
-                    "自动清理后二次质检通过"
+                    "局部修复后二次质检通过，候选正文已提交"
                     if final_status in {"READY_TO_PUBLISH", "ALREADY_PUBLISHED"}
-                    else "自动清理后二次质检未通过，已转人工审核"
+                    else "候选正文二次质检未通过，原正文未改动并转人工审核"
                 )
             ),
             payload=finish_payload,
             from_status=final_status,
             to_status=final_status,
+            quality_claim_token=quality_claim_token,
         )
         return final_status
     except Exception as exc:  # noqa: BLE001 - one bad item must not stop a batch
-        logger.exception("质检失败 article_id=%s", article_id)
-        repo.transition_status(
+        transitioned = repo.transition_status(
             article_id,
             "ERROR",
             connection,
             event_type="QUALITY_ERROR",
             message=str(exc)[:300],
+            quality_claim_token=quality_claim_token,
         )
+        if transitioned is None and quality_claim_token:
+            # A newer worker owns the lease.  Its result is authoritative; do
+            # not report the stale worker as an article-level quality error.
+            current = repo.get_article(article_id, connection)
+            logger.warning("质检租约已被其他 worker 接管 article_id=%s", article_id)
+            return current.get("status", "") if current else ""
+        logger.exception("质检失败 article_id=%s", article_id)
         return "ERROR"
+    finally:
+        repo.release_quality_claim(article_id, quality_claim_token, connection)
 
 
 def recheck_article(article_id: int, config: AppConfig, connection) -> str:
@@ -580,7 +925,48 @@ def recheck_article(article_id: int, config: AppConfig, connection) -> str:
     return _process_article(claimed, config, connection)
 
 
+def _try_acquire_run_lock(database_path: str):
+    """Acquire a crash-safe, non-blocking lock shared by all processes."""
+
+    lock_path = f"{database_path}.run.lock"
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        if exc.errno in {errno.EACCES, errno.EAGAIN}:
+            return None
+        raise
+    return handle
+
+
 def run_once(config: AppConfig, *, database_path: str | None = None) -> dict[str, Any]:
+    """Run one ingestion pass, with a process-wide single-flight lock."""
+
+    resolved_database_path = database_path or config.database_path
+    lock_handle = _try_acquire_run_lock(resolved_database_path)
+    if lock_handle is None:
+        return {
+            "run_id": None,
+            "fetched": 0,
+            "inserted": 0,
+            "updated": 0,
+            "errors": 0,
+            "skipped": True,
+            "already_running": True,
+            "message": "已有其他进程正在运行，本轮跳过",
+        }
+    try:
+        return _run_once_locked(config, database_path=resolved_database_path)
+    finally:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_handle.close()
+
+
+def _run_once_locked(config: AppConfig, *, database_path: str | None = None) -> dict[str, Any]:
     """Fetch enabled sources, upsert materials and process eligible articles."""
     database_path = database_path or config.database_path
     conn = _connect(database_path)

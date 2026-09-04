@@ -180,6 +180,50 @@ def test_create_article_form_removes_linked_text_but_preserves_linked_images(app
     assert '<img src="/body.jpg">' in fields["body"]
 
 
+def test_create_article_form_applies_final_quality_cleanup(app):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+    body = (
+        '<p data-href="https://example.com">正文内容，包含比赛信息和赛后采访。</p>'
+        '<iframe src="https://video.example/player"></iframe>'
+        '<p>[相关阅读][source]</p>\n'
+        '[source]: https://example.com/news\n'
+        '<p><img src="/body.jpg" alt="比赛图"></p>'
+    )
+
+    fields = dict(build_create_article_form(
+        {"title_final": "最终提交前清理", "body_html": body},
+        {"backend_tab_id": 284},
+        config,
+    ))
+
+    assert "data-href=" not in fields["body"].lower()
+    assert "<iframe" not in fields["body"].lower()
+    assert "[相关阅读]" not in fields["body"]
+    assert "[source]:" not in fields["body"]
+    assert '<img src="/body.jpg" alt="比赛图">' in fields["body"]
+
+
+def test_create_article_form_rejects_body_erased_by_final_cleanup(app):
+    config = replace(
+        app.extensions["app_config"],
+        dqd_open_appid="appid-test",
+        dqd_open_appsecret="secret-test",
+        dqd_open_enname="hongsiqin",
+    )
+
+    with pytest.raises(DqdOpenClientError, match="正文为空"):
+        build_create_article_form(
+            {"title_final": "清理后正文为空", "body_html": "<p>前文</p><p>正文</p>"},
+            {"backend_tab_id": 284},
+            config,
+        )
+
+
 def test_create_article_form_uses_shared_default_when_publish_image_is_missing(app):
     config = replace(
         app.extensions["app_config"],

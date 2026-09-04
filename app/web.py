@@ -64,6 +64,7 @@ STATUS_ALIASES = {
 EVENT_LABELS = {
     "MATERIAL_RECEIVED": "素材进入系统",
     "QUALITY_STARTED": "开始自动质检",
+    "QUALITY_CLAIMED": "领取质检任务",
     "QUALITY_SAVED": "保存质检结果",
     "QUALITY_RESULT": "自动质检完成",
     "QUALITY_ERROR": "自动质检失败",
@@ -353,6 +354,18 @@ def _event_summary_rows(event_type: str, payload: dict[str, Any]) -> list[dict[s
         if result:
             add(label, result[0], tone=result[1])
 
+    def add_llm_error(prefix: str, value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        add(f"{prefix}异常类型", value.get("category"), tone="bad")
+        add(f"{prefix}HTTP 状态", value.get("status_code"), tone="bad")
+        add(f"{prefix}模型", value.get("model"))
+        elapsed_ms = value.get("elapsed_ms")
+        add(f"{prefix}请求耗时", f"{elapsed_ms} ms" if elapsed_ms is not None else None)
+        add(f"{prefix}调用次数", value.get("attempts"))
+        add(f"{prefix}request_id", value.get("request_id"))
+        add(f"{prefix}错误信息", value.get("message"), tone="bad")
+
     def text_list(value: Any, *, key: str | None = None) -> str:
         if not isinstance(value, (list, tuple)):
             return ""
@@ -411,6 +424,8 @@ def _event_summary_rows(event_type: str, payload: dict[str, Any]) -> list[dict[s
         add("质检等级", payload.get("level"))
         add("质检得分", payload.get("score"))
         add("结果说明", payload.get("reason"))
+        add_llm_error("AI ", payload.get("semantic_error"))
+        add_llm_error("标题 AI ", payload.get("title_error"))
 
     elif event_type == "TITLE_FIXED":
         add("修正前", payload.get("before"))

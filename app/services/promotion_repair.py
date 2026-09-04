@@ -1,4 +1,4 @@
-"""Conservative deterministic repair of common feed artifacts.
+"""Deterministic and AI-planned local repair of common feed artifacts.
 
 The material feed occasionally appends a call-to-action as a normal ``<p>``
 element instead of a link.  This module only removes a complete, plain-text
@@ -13,6 +13,7 @@ import hashlib
 import html
 import math
 import re
+import unicodedata
 from html.parser import HTMLParser
 from typing import Any
 
@@ -68,12 +69,20 @@ PROMOTION_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "standalone_channel_call_to_action",
         re.compile(
-            r"^(?:请|立即|点击这里)?(?:关注|订阅|加入|进入).{0,80}"
+            r"^(?:请|立即|欢迎|点击这里|订阅|加入|进入)\s*(?:关注|订阅|加入|进入).{0,80}"
             r"(?:whatsapp|telegram|电报|频道|群组|社群).{0,100}"
             r"(?:获取|接收|查看|观看|最新|全部|内容|资讯|消息|动态|直播|节目|更新)?"
             r"[。！!：:，,、\s]*$",
             re.IGNORECASE,
         ),
+    ),
+    (
+        "standalone_feed_marker",
+        re.compile(r"^(?:前文|正文|转会中心\s*[:：])$", re.IGNORECASE),
+    ),
+    (
+        "standalone_more_news_cta",
+        re.compile(r"^更多.{0,80}(?:球队)?(?:消息|新闻|资讯|动态|内容)$", re.IGNORECASE),
     ),
     (
         "standalone_branded_podcast_prompt",
@@ -86,7 +95,7 @@ PROMOTION_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "standalone_branded_watch_prompt",
         re.compile(
-            r"^[+✅\s]*(?:观看(?:更多)?|收看|在)[:：]?\s*.{0,100}"
+            r"^[+✅\s]*(?:请\s*)?(?:观看(?:更多)?|收看|在)[:：]?\s*.{0,100}"
             r"(?:ge|globo|sportv).{0,100}"
             r"(?:观看|收看|了解|全部|一切|内容|消息|动态)"
             r"[：:。！!\s]*$",
@@ -97,7 +106,9 @@ PROMOTION_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 _TAIL_ONLY_RULES = {
     "standalone_cooperation_contact",
+    "standalone_feed_marker",
     "standalone_media_call_to_action",
+    "standalone_more_news_cta",
     "standalone_branded_podcast_prompt",
     "standalone_branded_watch_prompt",
     "standalone_channel_call_to_action",
@@ -117,15 +128,371 @@ _LINE_BLOCK_RE = re.compile(
 )
 _LINE_SEPARATOR_RE = re.compile(r"(?:\r\n|\r|\n|<br\b[^>]*>)", re.IGNORECASE)
 _VIDEO_TEASER_RE = re.compile(
-    r"^(?:【视频】|\[视频\])\s*[^<>\r\n]{2,170}$",
+    r"^(?:【视频】|【集锦视频】|【实战视频】|【视频集锦】|"
+    r"\[视频\]|\[集锦视频\]|\[实战视频\]|\[视频集锦\])\s*[^<>\r\n]{2,170}$",
+    re.IGNORECASE,
+)
+_SCOREBOARD_MARKER_RE = re.compile(
+    r"^(?:【积分榜】|\[积分榜\])\s*[^<>\r\n]{2,170}$",
+    re.IGNORECASE,
+)
+_PROGRAM_PROMOTION_RE = re.compile(
+    r"^[●•+]\s*.{0,100}(?:节目|播客|podcast).{0,120}"
+    r"(?:开播|播出|上线|观看|收听).{0,100}$",
     re.IGNORECASE,
 )
 
 _AI_PLAN_ACTIONS = {"remove_block", "remove_text_line", "replace_text"}
+_AI_PLAN_ACTION_ALIASES = {
+    "delete_block": "remove_block",
+    "delete_segment": "remove_text_line",
+    "replace_exact_text": "replace_text",
+}
+
+# The model is allowed to describe a new promotion wording without waiting
+# for a new regular expression.  These are content categories, rather than
+# concrete phrases; the exact evidence and structural checks below remain the
+# authority for what can actually be removed.
+_AI_PROMOTION_ISSUE_TYPES = frozenset({
+    "promotion",
+    "advertisement",
+    "traffic_generation",
+    "call_to_action",
+    "media_promotion",
+    "program_promotion",
+    "channel_promotion",
+    "external_promotion",
+    "schedule_promotion",
+    "social_promotion",
+    "sponsorship_promotion",
+    "video_promotion",
+    "引流",
+    "推广",
+    "广告",
+    "广告引流",
+    "视频引流",
+    "节目推广",
+    "频道推广",
+    "standalone_program_promotion",
+    "standalone_media_promotion",
+    "standalone_ad_promotion",
+    "standalone_external_promotion",
+})
+_AI_GENERAL_REMOVAL_ISSUE_TYPES = frozenset({
+    "extraneous_content",
+    "duplicate_content",
+    "template_artifact",
+    "format_noise",
+    "无关内容",
+    "重复内容",
+    "模板残留",
+    "格式噪声",
+})
+_AI_REPLACEMENT_ISSUE_TYPES = frozenset({
+    "minor_text_defect",
+    "format_noise",
+    "轻微文本缺陷",
+    "格式噪声",
+})
+_AI_STRUCTURAL_ARTIFACT_RE = re.compile(
+    r"^(?:"
+    r"【\s*(?:图片|写真|视频|集锦|实战|直播|积分榜|赛程|节目|播客|广告|推荐|相关阅读|更多)"
+    r"[^】\r\n]{0,20}】"
+    r"|\[\s*(?:图片|写真|photo|video|视频|集锦|直播|积分榜|赛程|节目|podcast)"
+    r"[^\]\r\n]{0,20}\]"
+    r"|(?:https?://|www\.)\S+\s*$"
+    r")|(?:\[[^\]]*(?:照片|写真|photo)[^\]]*\]\s*[=＝])",
+    re.IGNORECASE,
+)
+_AI_MEDIA_ARTIFACT_RE = re.compile(
+    r"^(?:"
+    r"【\s*(?:图片|写真|视频|集锦|集锦视频|实战视频|视频集锦)\s*】"
+    r"|\[\s*(?:图片|写真|photo|video|视频|集锦|集锦视频|实战视频|视频集锦)\s*\]"
+    r")\s*[^<>\r\n]{2,170}$",
+    re.IGNORECASE,
+)
+_AI_BRACKETED_ARTIFACT_RE = re.compile(
+    r"^(?:【[^】\r\n]{1,24}】|\[[^\]\r\n]{1,24}\])\s*(?P<tail>.*)$",
+    re.IGNORECASE,
+)
+_AI_ARTIFACT_EVIDENCE_CTA_RE = re.compile(
+    r"^(?:(?:请|立即|现在|欢迎)\s*)?"
+    r"(?:点击|查看|查看更多|查看全部|观看|收看|进入|前往|打开|访问|扫码|"
+    r"关注|订阅|下载|收听)|^(?:更多|完整).{0,30}(?:内容|资讯|新闻|赛程|视频|节目|回放)",
+    re.IGNORECASE,
+)
+_NUMERIC_EXPRESSION_RE = re.compile(
+    r"[$¥€£₩<>=≤≥≈≠(]*[-+]?\d+(?:[.,]\d+)?(?:[-:/]\d+)?[%‰$¥€£₩)]*"
+)
+_NUMERIC_DASH_TRANSLATION = str.maketrans({
+    "−": "-",
+    "﹣": "-",
+    "－": "-",
+    "‒": "-",
+    "–": "-",
+    "—": "-",
+})
+_AI_ARTIFACT_REASON_RE = re.compile(
+    r"(?:入口|引流|导流|推广|广告|跳转|外链|占位|"
+    r"(?:采集|抓取|解析|模板|格式).{0,12}(?:残留|噪声|错误|异常))",
+    re.IGNORECASE,
+)
+_AI_PROMOTION_REASON_MARKERS = re.compile(
+    r"(?:推广|广告|引流|导流|宣传|引导|号召|节目|视频|频道|关注|点击|直播|外部|链接|促销|商业|"
+    r"赞助|营销|接收|获取|"
+    r"promotion|advert|traffic|media|program|channel|external|sponsor)",
+    re.IGNORECASE,
+)
+_AI_FIXED_MARKER_REASON_MARKERS = re.compile(
+    r"(?:入口|引导|引流|导流|榜单|推广|广告|视频|节目|频道|"
+    r"与.{0,30}(?:新闻|正文|事实).{0,10}无关)",
+    re.IGNORECASE,
+)
+_AI_STANDALONE_REASON_RE = re.compile(r"(?:独立|单独|额外|入口)", re.IGNORECASE)
+_AI_UNRELATED_REASON_RE = re.compile(
+    r"(?:无关|不属于|不是(?:新闻|正文|事实)|非(?:新闻|正文|事实))",
+    re.IGNORECASE,
+)
+_AI_REASON_SUBJECT_RE = re.compile(
+    r"(?:独立|单独|额外|入口|该段|这段|此段|该块|这块|该内容|这条内容|"
+    r"该句|这句|该行|这行|该文字|这部分)",
+    re.IGNORECASE,
+)
+
+# AI can identify a new wording before a deterministic rule is added.  These
+# matchers validate a recognizable call-to-action shape without treating a
+# generic sentence containing words such as "观看" or "关注" as an advert.
+_AI_EXPLICIT_ACTION_PREFIX_RE = re.compile(
+    r"^[+✅📲➡️🗞️\s]*(?:(?:请|立即|现在|欢迎)\s*"
+    r"(?:点击|扫码|扫描二维码|关注|订阅|下载|购买|收听|听听|观看|收看|"
+    r"进入|前往|打开|访问|查看|查看更多|查看全部)|"
+    r"点击这里|扫码|扫描二维码|查看更多|查看全部)",
+    re.IGNORECASE,
+)
+_AI_PROMOTION_ACTION_RE = re.compile(
+    r"(?:点击|扫码|扫描二维码|关注|订阅|下载|购买|收听|听听|观看|收看|"
+    r"获取|查看|进入|前往|打开|访问|最新|更多|查看更多|查看全部|全部内容|更多内容|尽在|"
+    r"优惠|活动)",
+    re.IGNORECASE,
+)
+_AI_PROMOTION_BENEFIT_RE = re.compile(
+    r"(?:获取|接收|领取|最新|全部|更多|查看更多|查看全部|尽在|一切|"
+    r"完整(?:内容|信息|资讯|新闻|赛程|视频|节目|回放)|"
+    r"观看全部|收看全部)",
+    re.IGNORECASE,
+)
+_AI_PROMOTION_DESTINATION_RE = re.compile(
+    r"(?:官网|官方网站|网站|链接|频道|群组|社群|平台|whatsapp|telegram|电报|"
+    r"播客|podcast|直播间|二维码|应用|app|客户端|小程序|商店)",
+    re.IGNORECASE,
+)
+_AI_EXPLICIT_IN_PREFIX_RE = re.compile(
+    r"^[+✅📲➡️🗞️\s]*(?:请|立即|现在|欢迎)\s*在",
+    re.IGNORECASE,
+)
+_AI_EXPLICIT_IN_DESTINATION_RE = re.compile(
+    r"(?:官方平台|官方媒体|官方网站|官网|网站|频道|平台|媒体|"
+    r"whatsapp|telegram|电报|群组|社群)",
+    re.IGNORECASE,
+)
+_AI_MORE_CONTENT_PROMOTION_RE = re.compile(
+    r"^(?:更多|查看更多|查看全部).{0,80}(?:新闻|资讯|消息|动态|内容)\s*[:：]?$",
+    re.IGNORECASE,
+)
+_AI_MEDIA_PLATFORM_RE = re.compile(
+    r"(?:^|[\s、，,：:;；|/（）()])(?:ge|globo|sportv)(?![a-z])",
+    re.IGNORECASE,
+)
+_AI_EXPLICIT_WATCH_HEADING_RE = re.compile(
+    r"^[+✅📲➡️🗞️\s]*(?:观看(?:更多)?|收看)\s*[:：]",
+    re.IGNORECASE,
+)
+
+
+def _find_ai_safe_media_blocks(body_html: str | None) -> list[dict[str, Any]]:
+    """Return explicit media teaser blocks reserved for an AI-confirmed plan."""
+
+    body = str(body_html or "")
+    excluded_spans = _excluded_context_spans(body)
+    result: list[dict[str, Any]] = []
+    for match in _BLOCK_RE.finditer(body):
+        if _inside_excluded_context(match.start(), excluded_spans):
+            continue
+        text = _plain_text(match.group("content"))
+        if _VIDEO_TEASER_RE.fullmatch(text) or _SCOREBOARD_MARKER_RE.fullmatch(text):
+            result.append({
+                "rule": "standalone_media_marker",
+                "tag": match.group("tag").lower(),
+                "text": text,
+                "start": match.start(),
+                "end": match.end(),
+            })
+    return result
+
+
+def _is_ai_promotional_evidence(evidence: str) -> bool:
+    """Return whether evidence has a standalone promotion-shaped signal.
+
+    The deterministic rules cover known feed templates.  The fallback shape
+    check is intentionally compositional: a CTA at the beginning plus a
+    destination/benefit marker (or a known media platform) is required.
+    """
+
+    text = _normalise_promotion_text(evidence)
+    if not text or len(text) > 240:
+        return False
+    if (
+        _rule_for(text)
+        or _VIDEO_TEASER_RE.fullmatch(text)
+        or _SCOREBOARD_MARKER_RE.fullmatch(text)
+        or _PROGRAM_PROMOTION_RE.fullmatch(text)
+    ):
+        return True
+    has_explicit_action_prefix = bool(_AI_EXPLICIT_ACTION_PREFIX_RE.match(text))
+    has_explicit_in_prefix = bool(_AI_EXPLICIT_IN_PREFIX_RE.match(text))
+    has_watch_heading = bool(_AI_EXPLICIT_WATCH_HEADING_RE.match(text))
+    has_more_content_heading = bool(_AI_MORE_CONTENT_PROMOTION_RE.fullmatch(text))
+    has_media_platform = bool(_AI_MEDIA_PLATFORM_RE.search(text))
+    if not any((
+        has_explicit_action_prefix,
+        has_explicit_in_prefix,
+        has_watch_heading,
+        has_more_content_heading,
+    )):
+        return False
+    if not _AI_PROMOTION_ACTION_RE.search(text):
+        return False
+    if has_explicit_in_prefix:
+        return bool(
+            (has_media_platform or _AI_EXPLICIT_IN_DESTINATION_RE.search(text))
+            and _AI_PROMOTION_BENEFIT_RE.search(text)
+        )
+    if has_more_content_heading:
+        return True
+    if has_media_platform:
+        return bool(_AI_PROMOTION_BENEFIT_RE.search(text))
+    return bool(
+        _AI_PROMOTION_DESTINATION_RE.search(text)
+        and _AI_PROMOTION_BENEFIT_RE.search(text)
+    )
+
+
+def _is_ai_promotional_plan(
+    item: dict[str, Any],
+    evidence: str,
+    *,
+    fixed_marker: bool = False,
+) -> bool:
+    """Validate the model's category signal for a previously unknown promo.
+
+    Deterministic rules remain a backwards-compatible fallback for existing
+    plans.  A new wording must carry an explicit category and a short reason;
+    this lets the model expand coverage without granting it permission to
+    delete an arbitrary news paragraph.
+    """
+
+    raw_issue_type = item.get("issue_type")
+    raw_reason = item.get("reason")
+    if raw_issue_type is None and raw_reason is None:
+        return bool(_rule_for(evidence) or _VIDEO_TEASER_RE.fullmatch(evidence))
+    if not isinstance(raw_issue_type, str) or not isinstance(raw_reason, str):
+        return False
+    issue_type = re.sub(r"[\s-]+", "_", raw_issue_type.strip().lower())
+    reason = re.sub(r"\s+", " ", raw_reason).strip()
+    if (
+        not issue_type
+        or len(issue_type) > 80
+        or len(reason) < 4
+        or len(reason) > 500
+        or "<" in reason
+        or ">" in reason
+    ):
+        return False
+    if issue_type not in _AI_PROMOTION_ISSUE_TYPES:
+        return False
+    if fixed_marker:
+        # Fixed feed markers (for example the standalone scoreboard entry in
+        # article 11501) can use equivalent wording such as "引导访问".  The
+        # reason still needs to tie the marker to a promotion unrelated to the
+        # article.  The subject can be described as "该段" instead of using a
+        # single required adjective such as "独立".
+        return bool(
+            _AI_UNRELATED_REASON_RE.search(reason)
+            and (
+                _AI_STANDALONE_REASON_RE.search(reason)
+                or _AI_REASON_SUBJECT_RE.search(reason)
+            )
+        )
+    if not _AI_PROMOTION_REASON_MARKERS.search(reason):
+        return False
+    # A new AI category cannot authorize deletion of an arbitrary news
+    # paragraph. It must also carry an explicit standalone promotion shape.
+    return bool(
+        _is_ai_promotional_evidence(evidence)
+        and _AI_UNRELATED_REASON_RE.search(reason)
+        and (
+            _AI_STANDALONE_REASON_RE.search(reason)
+            or _AI_REASON_SUBJECT_RE.search(reason)
+        )
+    )
+
+
+def _normalized_issue_type(item: dict[str, Any]) -> str:
+    raw = item.get("issue_type") or item.get("issue_code") or ""
+    normalized = re.sub(r"[\s-]+", "_", str(raw).strip().lower())
+    return {
+        "无关内容": "extraneous_content",
+        "重复内容": "duplicate_content",
+        "模板残留": "template_artifact",
+        "格式噪声": "format_noise",
+        "轻微文本缺陷": "minor_text_defect",
+    }.get(normalized, normalized)
+
+
+def _has_valid_ai_reason(item: dict[str, Any]) -> bool:
+    reason = re.sub(r"\s+", " ", str(item.get("reason") or "")).strip()
+    return bool(4 <= len(reason) <= 500 and "<" not in reason and ">" not in reason)
+
+
+def _is_ai_general_removal_plan(item: dict[str, Any]) -> bool:
+    """Accept broad issue families while keeping the actual edit structurally bounded."""
+
+    issue_type = _normalized_issue_type(item)
+    if issue_type not in _AI_GENERAL_REMOVAL_ISSUE_TYPES or not _has_valid_ai_reason(item):
+        return False
+    if issue_type == "duplicate_content":
+        return True
+    evidence = _plain_text(str(item.get("evidence") or item.get("before") or ""))
+    if not _AI_STRUCTURAL_ARTIFACT_RE.search(evidence):
+        return False
+    if evidence.startswith(("【", "[")):
+        reason = re.sub(r"\s+", " ", str(item.get("reason") or "")).strip()
+        if not _AI_ARTIFACT_REASON_RE.search(reason):
+            return False
+        if _AI_MEDIA_ARTIFACT_RE.fullmatch(evidence):
+            return True
+        bracketed = _AI_BRACKETED_ARTIFACT_RE.match(evidence)
+        return bool(
+            bracketed
+            and _AI_ARTIFACT_EVIDENCE_CTA_RE.search(bracketed.group("tail").strip())
+        )
+    return True
+
+
+def _substantive_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", _plain_text(value)).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def _numeric_expressions(value: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", _plain_text(value)).translate(
+        _NUMERIC_DASH_TRANSLATION
+    )
+    return _NUMERIC_EXPRESSION_RE.findall(normalized)
 
 _EXCLUDED_CONTEXT_RE = re.compile(
     r"<!--.*?(?:-->|$)|"
-    r"<(?P<raw_tag>script|style|template|textarea)\b[^>]*>"
+    r"<(?P<raw_tag>script|style|template|textarea|noscript|iframe|embed|object|video|audio|svg)\b[^>]*>"
     r".*?(?:</(?P=raw_tag)\s*>|$)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -136,7 +503,7 @@ _TAIL_AFTER_BLOCK_RE = re.compile(
 )
 
 _PHOTO_CREDIT_RE = re.compile(
-    r"\[\s*照片\s*\]\s*[=＝]\s*(?P<source>[^<>\[\]\r\n]{1,120}?)\s*$",
+    r"\[\s*(?:照片|写真)\s*\]\s*[=＝]\s*(?P<source>[^<>\[\]\r\n]{1,120}?)\s*$",
     re.IGNORECASE,
 )
 
@@ -156,7 +523,19 @@ _PHOTO_SOURCE_ALLOWED_RE = re.compile(
 
 
 def _plain_text(value: str) -> str:
-    return re.sub(r"\s+", " ", html.unescape(value or "")).strip()
+    without_tags = re.sub(r"<[^>]+>", " ", html.unescape(value or ""))
+    return re.sub(r"\s+", " ", without_tags).strip()
+
+
+def _normalise_promotion_text(value: str | None) -> str:
+    """Normalize only the copy used by promotion matchers.
+
+    The original evidence is retained for exact body matching and auditing;
+    NFKC here only makes full-width punctuation and compatibility characters
+    comparable to the fixed rules.
+    """
+
+    return unicodedata.normalize("NFKC", _plain_text(str(value or "")))
 
 
 def _excluded_context_spans(body: str) -> list[tuple[int, int]]:
@@ -168,10 +547,11 @@ def _inside_excluded_context(start: int, spans: list[tuple[int, int]]) -> bool:
 
 
 def _rule_for(text: str) -> str | None:
-    if not text or len(text) > 180:
+    normalized = _normalise_promotion_text(text)
+    if not normalized or len(normalized) > 180:
         return None
     for name, pattern in PROMOTION_RULES:
-        if pattern.fullmatch(text):
+        if pattern.fullmatch(normalized):
             return name
     return None
 
@@ -305,8 +685,8 @@ def apply_repair_plan(
         return body, [], plan_error
     if not plans:
         return body, [], None
-    if len(plans) > 3:
-        return body, [], "AI 修复计划超过单次最多3个局部操作"
+    if len(plans) > 8:
+        return body, [], "AI 修复计划超过单次最多8个局部操作"
     blocks = content_blocks(body)
     by_id = {item["block_id"]: item for item in blocks}
     segments_by_id = {
@@ -316,7 +696,7 @@ def apply_repair_plan(
     }
     allowed_promotions = {
         (int(item["start"]), int(item["end"]), str(item["text"]))
-        for item in find_promotional_blocks(body)
+        for item in [*find_promotional_blocks(body), *_find_ai_safe_media_blocks(body)]
     }
     allowed_promotion_lines = {
         (int(item["start"]), int(item["end"]), str(item["text"]))
@@ -329,7 +709,12 @@ def apply_repair_plan(
     }
     operations: list[dict[str, Any]] = []
     for item in plans:
-        action = str(item.get("action") or item.get("operation") or "").strip().lower()
+        raw_action = str(item.get("action") or item.get("operation") or "").strip().lower()
+        duplicate_action = raw_action == "delete_duplicate"
+        if duplicate_action:
+            action = "remove_text_line" if item.get("segment_id") else "remove_block"
+        else:
+            action = _AI_PLAN_ACTION_ALIASES.get(raw_action, raw_action)
         if action not in _AI_PLAN_ACTIONS:
             return body, [], "AI 修复动作不在允许范围内"
         target_id = str(item.get("segment_id") or item.get("block_id") or "").strip().lower()
@@ -354,24 +739,47 @@ def apply_repair_plan(
         if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
             return body, [], "AI 修复置信度缺失或格式错误"
         confidence = float(raw_confidence)
-        if not math.isfinite(confidence) or confidence < 0.85 or confidence > 1:
+        if not math.isfinite(confidence) or confidence < 0.80 or confidence > 1:
             return body, [], "AI 修复置信度不足"
+        issue_type = _normalized_issue_type(item)
+        keep_target_id: str | None = None
+        if duplicate_action and issue_type != "duplicate_content":
+            return body, [], "重复删除动作必须使用 duplicate_content 类型"
+        if (
+            (
+                _SCOREBOARD_MARKER_RE.fullmatch(evidence)
+                or _VIDEO_TEASER_RE.fullmatch(evidence)
+            )
+            and (item.get("issue_type") is None or item.get("reason") is None)
+        ):
+            return body, [], "媒体或榜单标记必须提供明确的 AI 推广类别和原因"
         if action == "remove_text_line":
             if segment is None:
                 return body, [], "行级修复必须提供 segment_id"
             if len(block.get("segments") or []) < 2:
                 return body, [], "行级修复目标缺少明确边界"
             line_identity = (int(segment["start"]), int(segment["end"]), evidence)
-            if line_identity not in allowed_promotion_lines:
-                return body, [], "AI 修复目标未命中高置信独立推广行"
-            same_text_count = sum(
-                1
-                for candidate_block in blocks
-                for candidate in (candidate_block.get("segments") or [])
-                if str(candidate.get("text") or "") == evidence
+            known_promotion_line = line_identity in allowed_promotion_lines
+            ai_promotion = _is_ai_promotional_plan(
+                item, evidence, fixed_marker=known_promotion_line
             )
-            if same_text_count != 1:
-                return body, [], "AI 修复证据在正文中不是唯一独立行"
+            ai_general_removal = _is_ai_general_removal_plan(item)
+            if not known_promotion_line and not ai_promotion and not ai_general_removal:
+                return body, [], "AI 修复目标未命中可处理的局部问题类型"
+            if known_promotion_line and (
+                item.get("issue_type") is not None or item.get("reason") is not None
+            ) and not ai_promotion and not ai_general_removal:
+                return body, [], "AI 修复推广类别或原因无效"
+            if issue_type == "duplicate_content":
+                keep_id = str(item.get("keep_segment_id") or "").strip().lower()
+                keep_pair = segments_by_id.get(keep_id)
+                if (
+                    keep_pair is None
+                    or keep_id == target_id
+                    or str(keep_pair[1].get("text") or "") != evidence
+                ):
+                    return body, [], "重复内容修复缺少有效的保留正文行"
+                keep_target_id = keep_id
             remove_start = int(segment["start"])
             remove_end = int(segment["end"])
             following = segment.get("separator_after")
@@ -389,30 +797,73 @@ def apply_repair_plan(
                 "item": item,
                 "block_id": block_id,
                 "segment_id": target_id,
+                "keep_target_id": keep_target_id,
                 "tag": str(block.get("tag") or "p"),
+                "validation": (
+                    "fixed_promotion_rule"
+                    if known_promotion_line else (
+                        "ai_general_issue" if ai_general_removal else "ai_promotion_category"
+                    )
+                ),
             })
             continue
 
         block_identity = (int(block["start"]), int(block["end"]), evidence)
-        if block_identity not in allowed_promotions and block_identity not in allowed_photo_credits:
-            return body, [], "AI 修复目标未命中高置信推广或图片署名规则"
+        known_promotion_block = block_identity in allowed_promotions
+        ai_promotion = _is_ai_promotional_plan(
+            item, evidence, fixed_marker=known_promotion_block
+        )
+        ai_general_removal = _is_ai_general_removal_plan(item)
+        if (
+            block_identity not in allowed_photo_credits
+            and not known_promotion_block
+            and not ai_promotion
+            and not ai_general_removal
+            and action != "replace_text"
+        ):
+            return body, [], "AI 修复目标未命中可处理的局部问题类型"
+        if known_promotion_block and (
+            item.get("issue_type") is not None or item.get("reason") is not None
+        ) and not ai_promotion and not ai_general_removal:
+            return body, [], "AI 修复推广类别或原因无效"
         if action == "remove_block":
-            if block_identity not in allowed_promotions:
+            if not known_promotion_block and not ai_promotion and not ai_general_removal:
                 return body, [], "图片署名只能规范化，不能删除所在正文块"
+            if not known_promotion_block and len(block.get("segments") or []) != 1:
+                return body, [], "AI 局部修复块包含多行内容，请改用行级修复"
+            if issue_type == "duplicate_content":
+                keep_id = str(item.get("keep_block_id") or "").strip().lower()
+                keep_block = by_id.get(keep_id)
+                if (
+                    keep_block is None
+                    or keep_id == block_id
+                    or str(keep_block.get("text") or "") != evidence
+                ):
+                    return body, [], "重复内容修复缺少有效的保留正文块"
+                keep_target_id = keep_id
             replacement = ""
         else:
             photo_match = allowed_photo_credits.get(block_identity)
-            if photo_match is None:
-                return body, [], "推广内容只能删除，不能由 AI 改写"
             replacement = str(item.get("after") or item.get("replacement") or "")
             if (
                 not replacement
                 or len(replacement) > 500
                 or "<" in replacement
                 or ">" in replacement
-                or _plain_text(replacement) != _plain_text(photo_match["after"])
             ):
                 return body, [], "AI 文本替换内容为空或包含 HTML"
+            if photo_match is not None:
+                if _plain_text(replacement) != _plain_text(photo_match["after"]):
+                    return body, [], "图片署名替换内容与规范化结果不一致"
+            elif (
+                issue_type not in _AI_REPLACEMENT_ISSUE_TYPES
+                or not _has_valid_ai_reason(item)
+                or replacement == evidence
+                or len(block.get("segments") or []) != 1
+                or _substantive_text(replacement) != _substantive_text(evidence)
+                or _numeric_expressions(replacement) != _numeric_expressions(evidence)
+            ):
+                return body, [], "AI 文本替换不是可验证的轻微局部修复"
         operations.append({
             "action": action,
             "start": int(block["start"]),
@@ -422,12 +873,36 @@ def apply_repair_plan(
             "item": item,
             "block_id": block_id,
             "segment_id": None,
+            "keep_target_id": keep_target_id,
             "tag": str(block.get("tag") or "p"),
+            "validation": (
+                "photo_credit_rule"
+                if block_identity in allowed_photo_credits
+                else (
+                    "fixed_promotion_rule"
+                    if known_promotion_block else (
+                        "ai_general_issue"
+                        if ai_general_removal or issue_type in _AI_REPLACEMENT_ISSUE_TYPES
+                        else "ai_promotion_category"
+                    )
+                )
+            ),
         })
 
     spans = {(int(operation["start"]), int(operation["end"])) for operation in operations}
     if len(spans) != len(operations):
         return body, [], "AI 修复计划重复操作同一正文块"
+    removed_target_ids = {
+        str(operation.get("segment_id") or operation.get("block_id") or "")
+        for operation in operations
+        if operation.get("action") in {"remove_block", "remove_text_line"}
+    }
+    if any(
+        operation.get("keep_target_id") in removed_target_ids
+        for operation in operations
+        if operation.get("keep_target_id")
+    ):
+        return body, [], "重复内容修复不能同时删除指定的保留目标"
     cleaned_parts: list[str] = []
     cursor = 0
     applied: list[dict[str, Any]] = []
@@ -438,6 +913,7 @@ def apply_repair_plan(
         replacement = str(operation["replacement"])
         evidence = str(operation["evidence"])
         item = operation["item"]
+        issue_type = _normalized_issue_type(item)
         if start < previous_end:
             return body, [], "AI 修复计划操作范围重叠"
         cleaned_parts.append(body[cursor:start])
@@ -456,9 +932,18 @@ def apply_repair_plan(
             "block_id": str(operation["block_id"]),
             "tag": str(operation["tag"]),
             "text": evidence,
+            "validation": str(operation["validation"]),
+            "confidence": float(item["confidence"]),
         }
         if operation.get("segment_id"):
             audit_item["segment_id"] = str(operation["segment_id"])
+        if issue_type:
+            audit_item["issue_type"] = issue_type
+        for keep_key in ("keep_block_id", "keep_segment_id"):
+            if item.get(keep_key) is not None:
+                audit_item[keep_key] = str(item[keep_key])
+        if item.get("reason") is not None:
+            audit_item["reason"] = str(item["reason"])
         if replacement:
             audit_item["after"] = replacement
         applied.append(audit_item)
@@ -467,17 +952,6 @@ def apply_repair_plan(
     cleaned = "".join(cleaned_parts)
     if cleaned == body:
         return body, [], "AI 修复计划未改变正文"
-    removed_line_characters = sum(
-        len(str(operation["evidence"]))
-        for operation in operations
-        if str(operation["action"]) == "remove_text_line"
-    )
-    original_visible_length = max(1, body_safety_stats(body)["visible_text_length"])
-    if (
-        removed_line_characters > 300
-        or removed_line_characters / original_visible_length > 0.15
-    ):
-        return body, [], "AI 行级修复删除比例超过安全上限"
     return cleaned, applied, None
 
 

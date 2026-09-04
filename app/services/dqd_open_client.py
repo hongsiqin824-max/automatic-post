@@ -16,7 +16,8 @@ from .article_images import (
     fallback_litpic_for_tabs,
 )
 from .dqd_publish_html import DqdPublishHtmlError, sanitize_dqd_publish_html
-from .link_sanitizer import remove_clickable_links
+from .link_sanitizer import preprocess_quality_body, remove_clickable_links
+from .quality import html_to_text
 from .open_platform import (
     OpenPlatformAuthError,
     OpenPlatformClient,
@@ -107,9 +108,15 @@ def build_create_article_form(
     body = remove_clickable_links(
         str(article.get("body_html") or article.get("body") or "")
     )
+    # Apply the same deterministic cleanup at the final submission boundary.
+    # This covers manually approved or edited articles that did not pass
+    # through the ingestion quality-preprocess step.
+    body = preprocess_quality_body(body)
     if not title:
         raise DqdOpenClientError("标题为空，不能创建草稿")
-    if not body.strip():
+    if not body.strip() or (
+        not html_to_text(body) and "<img" not in body.lower()
+    ):
         raise DqdOpenClientError("正文为空，不能创建草稿")
     # Materialize iterables once because the same tab rows are needed for the
     # backend IDs and for selecting the primary fallback cover.

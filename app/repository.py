@@ -1314,13 +1314,13 @@ def upsert_material(material: Mapping[str, Any], connection=None) -> dict:
         conn.execute(
             """
             UPDATE articles SET upstream_archive_id=?, title_original=?,
-                title_final=CASE WHEN status IN ('RECEIVED','QUALITY_CHECKING','ERROR')
+                title_final=CASE WHEN status IN ('RECEIVED','ERROR')
                     THEN ? ELSE title_final END,
-                body_html=CASE WHEN status IN ('RECEIVED','QUALITY_CHECKING','ERROR')
+                body_html=CASE WHEN status IN ('RECEIVED','ERROR')
                     THEN ? ELSE body_html END,
-                litpic=CASE WHEN status IN ('RECEIVED','QUALITY_CHECKING','ERROR')
+                litpic=CASE WHEN status IN ('RECEIVED','ERROR')
                     THEN ? ELSE litpic END,
-                channels_json=CASE WHEN status IN ('RECEIVED','QUALITY_CHECKING','ERROR')
+                channels_json=CASE WHEN status IN ('RECEIVED','ERROR')
                     THEN ? ELSE channels_json END,
                 raw_json=?, updated_at=?, last_seen_at=?
             WHERE id=?
@@ -1768,7 +1768,7 @@ def list_articles(connection=None, *, status: Optional[str] = None,
         escaped = str(query).strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped}%"
         clauses.append(
-            "(a.title_final LIKE ? ESCAPE '\\\\' OR a.title_original LIKE ? ESCAPE '\\\\' OR a.source_url LIKE ? ESCAPE '\\\\')"
+            "(a.title_final LIKE ? ESCAPE '\\' OR a.title_original LIKE ? ESCAPE '\\' OR a.source_url LIKE ? ESCAPE '\\')"
         )
         params.extend([pattern, pattern, pattern])
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
@@ -1813,7 +1813,8 @@ def article_counts(connection=None) -> dict[str, int]:
 
 def transition_status(article_id: int, to_status: str, connection=None, *, message: str = "",
                       event_type: str = "STATUS_CHANGED", payload: Any = None,
-                      from_status: Optional[str] = None) -> dict:
+                      from_status: Optional[str] = None,
+                      quality_claim_token: Optional[str] = None) -> dict | None:
     to_status = str(to_status or "").upper().strip()
     if to_status not in VALID_STATUSES:
         raise ValueError("invalid article status")
@@ -1824,18 +1825,25 @@ def transition_status(article_id: int, to_status: str, connection=None, *, messa
     old_status = from_status or current["status"]
     now = _now()
     preserve_error = to_status in {"ERROR", "PUBLISH_FAILED"}
+    clauses = ["id=?"]
+    params: list[Any] = [article_id]
+    if quality_claim_token is not None:
+        clauses.append("quality_claim_token=?")
+        params.append(str(quality_claim_token))
     with conn:
-        conn.execute(
-            "UPDATE articles SET status=?, error=?, published_at=CASE WHEN ?='PUBLISHED' THEN COALESCE(published_at, ?) ELSE published_at END, updated_at=? WHERE id=?",
+        cursor = conn.execute(
+            "UPDATE articles SET status=?, error=?, published_at=CASE WHEN ?='PUBLISHED' THEN COALESCE(published_at, ?) ELSE published_at END, updated_at=? WHERE " + " AND ".join(clauses),
             (
                 to_status,
                 (message or current.get("error")) if preserve_error else None,
                 to_status,
                 now,
                 now,
-                article_id,
+                *params,
             ),
         )
+        if quality_claim_token is not None and cursor.rowcount != 1:
+            return None
         conn.execute(
             """
             INSERT INTO article_events
@@ -2289,7 +2297,9 @@ def record_draft_confirmation_result(
 
 
 def save_quality(article_id: int, quality: Mapping[str, Any], connection=None, *,
-                 status: Optional[str] = None, error: Optional[str] = None) -> dict:
+                 status: Optional[str] = None, error: Optional[str] = None,
+                 quality_claim_token: Optional[str] = None,
+                 body_html: Optional[str] = None) -> dict:
     conn = _conn(connection)
     if status is not None and str(status).upper() not in VALID_STATUSES:
         raise ValueError("invalid article status")
@@ -2298,11 +2308,23 @@ def save_quality(article_id: int, quality: Mapping[str, Any], connection=None, *
     if current is None:
         raise ValueError("article not found")
     target = str(status).upper() if status else current["status"]
+    clauses = ["id=?"]
+    params: list[Any] = [article_id]
+    if quality_claim_token is not None:
+        clauses.append("quality_claim_token=?")
+        params.append(str(quality_claim_token))
+    assignments = ["quality_json=?", "status=?", "error=?", "updated_at=?"]
+    values: list[Any] = [_json(dict(quality), {}), target, error, now]
+    if body_html is not None:
+        assignments.insert(0, "body_html=?")
+        values.insert(0, str(body_html))
     with conn:
-        conn.execute(
-            "UPDATE articles SET quality_json=?, status=?, error=?, updated_at=? WHERE id=?",
-            (_json(dict(quality), {}), target, error, now, article_id),
+        cursor = conn.execute(
+            "UPDATE articles SET " + ", ".join(assignments) + " WHERE " + " AND ".join(clauses),
+            (*values, *params),
         )
+        if quality_claim_token is not None and cursor.rowcount != 1:
+            raise RuntimeError("文章质检租约已失效，放弃写入旧结果")
         conn.execute(
             """
             INSERT INTO article_events
@@ -2312,6 +2334,101 @@ def save_quality(article_id: int, quality: Mapping[str, Any], connection=None, *
             (article_id, current["status"], target, "QUALITY_SAVED", error, _json(dict(quality), {}), now),
         )
     return get_article(article_id, conn)
+
+
+def claim_quality_article(
+    article_id: int,
+    expected_updated_at: Optional[str] = None,
+    connection=None,
+    *,
+    now: Optional[str] = None,
+    claim_stale_after_seconds: int = 900,
+) -> dict | None:
+    """Atomically lease an article for quality work across processes.
+
+    A token-less ``QUALITY_CHECKING`` row is a legacy/incomplete run and may
+    be recovered. Active leases are protected until they expire, so a second
+    worker cannot run the same article concurrently.
+    """
+
+    numeric_article_id = _positive_int(article_id, "article id")
+    conn = _conn(connection)
+    existing = get_article(numeric_article_id, conn)
+    old_status = existing.get("status") if existing else "QUALITY_CHECKING"
+    now_value = str(now or _now())
+    parsed = now_value[:-1] + "+00:00" if now_value.endswith("Z") else now_value
+    try:
+        current_time = datetime.fromisoformat(parsed)
+    except ValueError:
+        current_time = datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    stale_before = (
+        current_time - timedelta(seconds=max(1, int(claim_stale_after_seconds)))
+    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    claim_token = uuid.uuid4().hex
+    clauses = [
+        "id=?",
+        "status IN ('RECEIVED','QUALITY_CHECKING','ERROR')",
+        "(quality_claim_token IS NULL OR quality_claimed_at IS NULL OR quality_claimed_at<=?)",
+    ]
+    params: list[Any] = [numeric_article_id, stale_before]
+    if expected_updated_at not in (None, ""):
+        clauses.append("updated_at=?")
+        params.append(str(expected_updated_at))
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE articles
+            SET status='QUALITY_CHECKING', quality_claimed_at=?,
+                quality_claim_token=?, updated_at=?
+            WHERE """ + " AND ".join(clauses),
+            (now_value, claim_token, now_value, *params),
+        )
+        if cursor.rowcount != 1:
+            return None
+        conn.execute(
+            """
+            INSERT INTO article_events
+            (article_id, from_status, to_status, event_type, message, payload_json, created_at)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                numeric_article_id,
+                old_status,
+                "QUALITY_CHECKING",
+                "QUALITY_CLAIMED",
+                "领取文章质检任务",
+                _json({"lease_seconds": max(1, int(claim_stale_after_seconds))}, {}),
+                now_value,
+            ),
+        )
+    article = get_article(numeric_article_id, conn)
+    if article is not None:
+        article["quality_claim_token"] = claim_token
+    return article
+
+
+def release_quality_claim(
+    article_id: int,
+    claim_token: Optional[str],
+    connection=None,
+) -> bool:
+    """Release a quality lease without disturbing the article result."""
+
+    if not claim_token:
+        return False
+    conn = _conn(connection)
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE articles
+            SET quality_claimed_at=NULL, quality_claim_token=NULL
+            WHERE id=? AND quality_claim_token=?
+            """,
+            (_positive_int(article_id, "article id"), str(claim_token)),
+        )
+    return cursor.rowcount == 1
 
 
 def claim_quality_recheck(article_id: int, connection=None) -> dict | None:
@@ -2331,7 +2448,8 @@ def claim_quality_recheck(article_id: int, connection=None) -> dict | None:
         cursor = conn.execute(
             """
             UPDATE articles
-            SET status='RECEIVED', quality_json=?, error=NULL, updated_at=?
+            SET status='RECEIVED', quality_json=?, error=NULL,
+                quality_claimed_at=NULL, quality_claim_token=NULL, updated_at=?
             WHERE id=? AND status='NEEDS_REVIEW'
             """,
             (_json(quality, {}), now, article_id),
@@ -2443,19 +2561,46 @@ def list_article_events(article_id: int, connection=None) -> list[dict]:
 
 def add_article_event(article_id: int, event_type: str, connection=None, *,
                       message: str = "", payload: Any = None,
-                      from_status: Optional[str] = None, to_status: Optional[str] = None) -> dict:
+                      from_status: Optional[str] = None, to_status: Optional[str] = None,
+                      quality_claim_token: Optional[str] = None) -> dict:
     conn = _conn(connection)
     if get_article(article_id, conn) is None:
         raise ValueError("article not found")
     with conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO article_events
-            (article_id, from_status, to_status, event_type, message, payload_json, created_at)
-            VALUES (?,?,?,?,?,?,?)
-            """,
-            (article_id, from_status, to_status, str(event_type), message or None, _json(payload, {}), _now()),
+        now = _now()
+        event_values = (
+            article_id,
+            from_status,
+            to_status,
+            str(event_type),
+            message or None,
+            _json(payload, {}),
+            now,
         )
+        if quality_claim_token is None:
+            cursor = conn.execute(
+                """
+                INSERT INTO article_events
+                (article_id, from_status, to_status, event_type, message, payload_json, created_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                event_values,
+            )
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO article_events
+                (article_id, from_status, to_status, event_type, message, payload_json, created_at)
+                SELECT ?,?,?,?,?,?,?
+                WHERE EXISTS (
+                    SELECT 1 FROM articles
+                    WHERE id=? AND quality_claim_token=?
+                )
+                """,
+                (*event_values, article_id, str(quality_claim_token)),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("文章质检租约已失效，放弃写入旧事件")
     return _row(conn.execute("SELECT * FROM article_events WHERE id=?", (cursor.lastrowid,)).fetchone())
 
 

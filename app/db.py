@@ -106,6 +106,8 @@ CREATE TABLE IF NOT EXISTS articles (
     draft_last_attempt_at TEXT,
     draft_confirm_claimed_at TEXT,
     draft_confirm_claim_token TEXT,
+    quality_claimed_at    TEXT,
+    quality_claim_token   TEXT,
     publish_account_id   INTEGER REFERENCES publish_accounts(id) ON DELETE SET NULL,
     publish_user_id      INTEGER,
     publish_user_name    TEXT,
@@ -276,6 +278,7 @@ def init_db(database: Optional[PathLike] = None) -> None:
         _migrate_article_origin_identity(connection)
         _migrate_article_publish_assignment(connection)
         _migrate_article_draft_confirmation(connection)
+        _migrate_article_quality_claim(connection)
         _migrate_source_publish_mode(connection)
         _migrate_tab_and_article_publish_mode(connection)
         _migrate_tab_fallback_litpic(connection)
@@ -516,6 +519,26 @@ def _migrate_article_draft_confirmation(connection: sqlite3.Connection) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_articles_draft_confirmation_due
             ON articles(status, draft_next_confirm_at, draft_confirm_claimed_at)
+            """
+        )
+
+
+def _migrate_article_quality_claim(connection: sqlite3.Connection) -> None:
+    """Add a lease so quality work is single-flight across processes."""
+
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(articles)").fetchall()
+    }
+    with connection:
+        if "quality_claimed_at" not in columns:
+            connection.execute("ALTER TABLE articles ADD COLUMN quality_claimed_at TEXT")
+        if "quality_claim_token" not in columns:
+            connection.execute("ALTER TABLE articles ADD COLUMN quality_claim_token TEXT")
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_articles_quality_claim
+            ON articles(status, quality_claimed_at, quality_claim_token)
             """
         )
 

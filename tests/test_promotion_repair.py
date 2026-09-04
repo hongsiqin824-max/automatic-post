@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.services.promotion_repair import (
     apply_repair_plan,
     body_safety_stats,
@@ -12,6 +14,12 @@ from app.services.promotion_repair import (
 
 
 VIDEO_TEASER = "【视频】佐藤龙之介送出引发进球的凶狠逼抢，以及他的威胁场面"
+VIDEO_REASON = "该独立视频引流行与新闻事实无关"
+PROGRAM_PROMOTION = "●矢部浩之先生的新节目《J.LEAGUE WEEKEND 周日的矢部萨卡》开播！ ｜ J联赛"
+SCOREBOARD_MARKER = "【积分榜】明治安田J1联赛2026/27"
+BRANDED_WATCH_PROMOTION = (
+    "请在 ge、Globo 和 SporTV 上观看关于瓦斯科达伽马的全部内容："
+)
 
 
 def test_ai_repair_plan_removes_10878_video_line_only() -> None:
@@ -30,6 +38,8 @@ def test_ai_repair_plan_removes_10878_video_line_only() -> None:
         "segment_id": segment["segment_id"],
         "action": "remove_text_line",
         "evidence": VIDEO_TEASER,
+        "issue_type": "video_promotion",
+        "reason": VIDEO_REASON,
         "confidence": 0.99,
     })
 
@@ -41,8 +51,76 @@ def test_ai_repair_plan_removes_10878_video_line_only() -> None:
         "block_id": "b1",
         "tag": "p",
         "text": VIDEO_TEASER,
+        "validation": "fixed_promotion_rule",
+        "confidence": 0.99,
         "segment_id": "b1.s2",
+        "issue_type": "video_promotion",
+        "reason": VIDEO_REASON,
     }]
+
+
+def test_ai_repair_plan_removes_unknown_program_promotion_line() -> None:
+    before = "京都不死鸟已经确认球员离队，俱乐部正在办理后续手续。"
+    after = "报道同时回顾了球员本赛季的出场数据和此前的职业经历。"
+    context = (
+        "<p>文章其余部分详细介绍了转会背景、球队计划以及俱乐部发布的官方信息，"
+        "并引用了相关人员对于下一阶段安排的说明。</p>"
+    ) * 4
+    image = '<p><img src="/fastdfs8/program.jpg" alt="球员资料图" /></p>'
+    body = f"<p>{before}\n{PROGRAM_PROMOTION}\n{after}</p>{image}{context}"
+    segment = content_blocks(body)[0]["segments"][1]
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "segment_id": segment["segment_id"],
+        "action": "remove_text_line",
+        "evidence": PROGRAM_PROMOTION,
+        "issue_type": "standalone_program_promotion",
+        "reason": "独立节目推广内容，与新闻事实无关",
+        "confidence": 0.99,
+    })
+
+    assert error is None
+    assert cleaned == f"<p>{before}\n{after}</p>{image}{context}"
+    assert PROGRAM_PROMOTION not in cleaned
+    assert image in cleaned
+    assert matches[0] == {
+        "rule": "ai_targeted_repair",
+        "action": "remove_text_line",
+        "block_id": "b1",
+        "tag": "p",
+        "text": PROGRAM_PROMOTION,
+        "validation": "ai_promotion_category",
+        "confidence": 0.99,
+        "segment_id": "b1.s2",
+        "issue_type": "standalone_program_promotion",
+        "reason": "独立节目推广内容，与新闻事实无关",
+    }
+
+
+def test_unknown_promotion_requires_valid_issue_type_and_reason() -> None:
+    body = (
+        f"<p>球队已经确认本轮首发名单。\n{PROGRAM_PROMOTION}\n"
+        "赛后报道还将继续更新球员数据。</p>"
+        "<p>文章其余部分包含完整比赛过程、球员表现、赛后采访和俱乐部官方说明。</p>"
+        "<p>报道还补充了球队本赛季的整体计划以及后续比赛安排。</p>"
+    )
+    base = {
+        "segment_id": "b1.s2",
+        "action": "remove_text_line",
+        "evidence": PROGRAM_PROMOTION,
+        "confidence": 0.99,
+    }
+
+    for extra in (
+        {},
+        {"issue_type": "standalone_program_promotion"},
+        {"issue_type": "program_schedule", "reason": "节目相关内容"},
+        {"issue_type": "program_promotion", "reason": "这是一段内容"},
+    ):
+        cleaned, matches, error = apply_repair_plan(body, {**base, **extra})
+        assert cleaned == body
+        assert matches == []
+        assert error
 
 
 def test_ai_repair_plan_accepts_explicit_br_line_boundary() -> None:
@@ -60,6 +138,8 @@ def test_ai_repair_plan_accepts_explicit_br_line_boundary() -> None:
         "segment_id": segment["segment_id"],
         "action": "remove_text_line",
         "evidence": VIDEO_TEASER,
+        "issue_type": "video_promotion",
+        "reason": VIDEO_REASON,
         "confidence": 0.98,
     })
 
@@ -79,6 +159,8 @@ def test_ai_line_repair_rejects_inline_sentence_without_boundary() -> None:
         "segment_id": "b1.s1",
         "action": "remove_text_line",
         "evidence": VIDEO_TEASER,
+        "issue_type": "video_promotion",
+        "reason": VIDEO_REASON,
         "confidence": 0.99,
     })
     assert cleaned == body
@@ -86,7 +168,7 @@ def test_ai_line_repair_rejects_inline_sentence_without_boundary() -> None:
     assert error
 
 
-def test_ai_line_repair_rejects_duplicate_evidence() -> None:
+def test_ai_line_repair_uses_segment_id_when_evidence_is_repeated() -> None:
     body = (
         f"<p>正常新闻前文。\n{VIDEO_TEASER}\n正常新闻后文。</p>"
         f"<p>另一段正常新闻。\n{VIDEO_TEASER}\n报道结束。</p>"
@@ -96,42 +178,51 @@ def test_ai_line_repair_rejects_duplicate_evidence() -> None:
         "segment_id": "b1.s2",
         "action": "remove_text_line",
         "evidence": VIDEO_TEASER,
+        "issue_type": "video_promotion",
+        "reason": VIDEO_REASON,
         "confidence": 0.99,
     })
 
-    assert cleaned == body
-    assert matches == []
-    assert "不是唯一" in str(error)
+    assert error is None
+    assert cleaned == (
+        "<p>正常新闻前文。\n正常新闻后文。</p>"
+        f"<p>另一段正常新闻。\n{VIDEO_TEASER}\n报道结束。</p>"
+    )
+    assert matches[0]["segment_id"] == "b1.s2"
 
 
-def test_ai_line_repair_rejects_excessive_deletion_ratio() -> None:
+def test_ai_line_repair_allows_high_confidence_line_when_it_is_a_large_share() -> None:
     body = f"<p>正常新闻前文只有很少内容。\n{VIDEO_TEASER}\n简短结尾。</p>"
 
     cleaned, matches, error = apply_repair_plan(body, {
         "segment_id": "b1.s2",
         "action": "remove_text_line",
         "evidence": VIDEO_TEASER,
+        "issue_type": "video_promotion",
+        "reason": VIDEO_REASON,
         "confidence": 0.99,
     })
 
-    assert cleaned == body
-    assert matches == []
-    assert "删除比例" in str(error)
+    assert error is None
+    assert VIDEO_TEASER not in cleaned
+    assert len(matches) == 1
 
 
-def test_ai_line_repair_operation_alias_cannot_bypass_deletion_ratio() -> None:
+def test_ai_line_repair_operation_alias_allows_high_confidence_line_when_it_is_a_large_share() -> None:
     body = f"<p>很短前文。\n{VIDEO_TEASER}\n很短后文。</p>"
 
     cleaned, matches, error = apply_repair_plan(body, {
         "segment_id": "b1.s2",
         "operation": "remove_text_line",
         "evidence": VIDEO_TEASER,
+        "issue_type": "video_promotion",
+        "reason": VIDEO_REASON,
         "confidence": 0.99,
     })
 
-    assert cleaned == body
-    assert matches == []
-    assert "删除比例" in str(error)
+    assert error is None
+    assert VIDEO_TEASER not in cleaned
+    assert len(matches) == 1
 
 
 def test_video_teaser_whole_block_waits_for_ai_line_plan() -> None:
@@ -139,6 +230,261 @@ def test_video_teaser_whole_block_waits_for_ai_line_plan() -> None:
 
     assert find_promotional_blocks(body) == []
     assert remove_promotional_blocks(body) == (body, [])
+
+
+def test_ai_plan_can_remove_explicit_media_marker_block():
+    body = (
+        '<p>这是一段完整的比赛报道，包含比赛过程、球员表现和赛后采访信息。</p>'
+        '<p>【集锦视频】本场比赛精彩回放</p>'
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": "【集锦视频】本场比赛精彩回放",
+        "issue_type": "video_promotion",
+        "reason": "该独立集锦视频引流块与新闻事实无关",
+        "confidence": 0.98,
+    })
+
+    assert error is None
+    assert cleaned == '<p>这是一段完整的比赛报道，包含比赛过程、球员表现和赛后采访信息。</p>'
+    assert matches[0]["text"] == "【集锦视频】本场比赛精彩回放"
+
+
+def test_ai_plan_can_remove_unknown_standalone_promotion_block():
+    context = (
+        "文章其余部分详细介绍了比赛过程、球员表现、赛后采访和俱乐部官方信息，"
+        "并补充了球队本赛季的整体计划以及后续比赛安排。"
+    )
+    body = (
+        '<p>这是一段完整的比赛报道，包含比赛过程、球员表现和赛后采访信息。</p>'
+        f"<p>{PROGRAM_PROMOTION}</p>"
+        f"<p>{context}</p><p>{context}</p><p>{context}</p>"
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": PROGRAM_PROMOTION,
+        "issue_type": "program_promotion",
+        "reason": "独立节目推广内容，与新闻事实无关",
+        "confidence": 0.98,
+    })
+
+    assert error is None
+    assert cleaned == (
+        '<p>这是一段完整的比赛报道，包含比赛过程、球员表现和赛后采访信息。</p>'
+        f"<p>{context}</p><p>{context}</p><p>{context}</p>"
+    )
+    assert matches[0]["validation"] == "ai_promotion_category"
+
+
+def test_real_branded_watch_plan_accepts_ai_reason_referring_to_target_as_this_block():
+    context = (
+        "报道完整介绍了比赛进程、球队表现、教练赛后评价和接下来的赛事安排，"
+        "并引用了俱乐部相关人员对于球队现状的说明。"
+    )
+    image = '<img src="/fastdfs8/vasco.jpg" alt="比赛图片" width="1200">'
+    body = (
+        f"<p>{context}</p>{image}<p>{context}</p>"
+        f"<p>{BRANDED_WATCH_PROMOTION}</p>"
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b3",
+        "action": "remove_block",
+        "evidence": BRANDED_WATCH_PROMOTION,
+        "issue_type": "media_promotion",
+        "reason": (
+            "该段以‘观看全部内容’为号召，推广在指定媒体平台观看内容，"
+            "与新闻事实无关。"
+        ),
+        "confidence": 0.99,
+    })
+
+    assert error is None
+    assert cleaned == f"<p>{context}</p>{image}<p>{context}</p>"
+    assert image in cleaned
+    assert matches[0]["validation"] == "fixed_promotion_rule"
+
+
+def test_ai_plan_can_remove_new_standalone_watch_promotion_shape():
+    promotion = "观看：关于球队的一切尽在 FanZone 频道"
+    context = (
+        "文章其余内容详细介绍了双方比赛过程、球员表现和教练赛后发言，"
+        "并补充了球队下一阶段的训练和比赛计划。"
+    )
+    body = f"<p>{context}</p><p>{context}</p><p>{promotion}</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b3",
+        "action": "remove_block",
+        "evidence": promotion,
+        "issue_type": "channel_promotion",
+        "reason": "该段引导读者前往指定频道查看内容，与新闻事实无关",
+        "confidence": 0.98,
+    })
+
+    assert error is None
+    assert cleaned == f"<p>{context}</p><p>{context}</p>"
+    assert matches[0]["validation"] == "ai_promotion_category"
+
+
+def test_ai_plan_accepts_explicit_in_platform_watch_promotion():
+    promotion = "请在官方平台观看本轮比赛的完整回放"
+    context = (
+        "报道详细介绍了双方的比赛过程、球员表现和教练赛后发言，"
+        "并补充了球队下一阶段的训练安排。"
+    )
+    body = f"<p>{context}</p><p>{promotion}</p><p>{context}</p><p>{context}</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": promotion,
+        "issue_type": "media_promotion",
+        "reason": "该段引导读者前往官方平台观看回放，与新闻事实无关",
+        "confidence": 0.97,
+    })
+
+    assert error is None
+    assert cleaned == f"<p>{context}</p><p>{context}</p><p>{context}</p>"
+    assert matches[0]["validation"] == "ai_promotion_category"
+
+
+def test_ai_plan_removes_scoreboard_marker_when_reason_uses_guidance_wording():
+    context = (
+        "这篇报道完整介绍了球员转会背景、合同安排、球队计划和后续训练，"
+        "并引用了俱乐部及相关人员对下一阶段工作的说明。"
+    )
+    body = (
+        f"<p>{context}</p><p>{SCOREBOARD_MARKER}</p>"
+        f"<p>{context}</p><p>{context}</p>"
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": SCOREBOARD_MARKER,
+        "issue_type": "traffic_generation",
+        "reason": "该独立积分榜入口用于引导访问赛事榜单，与球员转会新闻事实无关",
+        "confidence": 0.99,
+    })
+
+    assert error is None
+    assert SCOREBOARD_MARKER not in cleaned
+    assert matches[0]["validation"] == "fixed_promotion_rule"
+
+
+def test_scoreboard_marker_without_ai_category_is_not_removed():
+    body = (
+        f"<p>报道完整介绍了球员转会背景、合同安排和球队计划。</p>"
+        f"<p>{SCOREBOARD_MARKER}</p>"
+        f"<p>报道还补充了俱乐部官方说明和后续训练安排。</p>"
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": SCOREBOARD_MARKER,
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "必须提供明确" in str(error)
+
+
+def test_high_confidence_plan_is_not_rejected_only_for_deletion_ratio():
+    body = (
+        '<p>这是一段完整的比赛报道，包含比赛过程和赛后采访信息。</p>'
+        f"<p>{PROGRAM_PROMOTION}</p>"
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": PROGRAM_PROMOTION,
+        "issue_type": "program_promotion",
+        "reason": "独立节目推广内容，与新闻事实无关",
+        "confidence": 0.98,
+    })
+
+    assert error is None
+    assert cleaned == '<p>这是一段完整的比赛报道，包含比赛过程和赛后采访信息。</p>'
+    assert matches[0]["text"] == PROGRAM_PROMOTION
+
+
+def test_ai_plan_rejects_normal_news_even_with_promotional_reason():
+    evidence = "球队本轮取得胜利，教练引导球员保持阵型并继续施压，最终赢得比赛。"
+    body = f"<p>{evidence}</p><p>报道还补充了赛后采访和球队后续训练安排。</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b1",
+        "action": "remove_block",
+        "evidence": evidence,
+        "issue_type": "traffic_generation",
+        "reason": "该段含有推广引流信息，与新闻事实无关",
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "未命中可处理" in str(error)
+
+
+def test_ai_plan_rejects_normal_watch_sentence_even_with_allowed_category():
+    evidence = "在 ge 体育场，球迷观看了比赛，随后为球队的获胜欢呼。"
+    context = "报道还完整回顾了比赛过程、关键进球以及主教练在赛后的采访。"
+    body = f"<p>{evidence}</p><p>{context}</p><p>{context}</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b1",
+        "action": "remove_block",
+        "evidence": evidence,
+        "issue_type": "media_promotion",
+        "reason": "该段是媒体推广内容，与新闻事实无关",
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "未命中可处理" in str(error)
+
+
+def test_ai_plan_rejects_news_sentences_starting_with_watch_or_sponsorship_terms():
+    context = "报道还完整回顾了比赛过程、关键进球以及主教练在赛后的采访。"
+    for evidence in (
+        "观看 Globo 播出的比赛后，主教练分析了球队本轮的防守表现。",
+        "广告赞助了本场公益比赛，相关收入将用于当地青训建设。",
+        "查看VAR回放后，裁判取消了这粒进球。",
+        "查看比赛视频后，教练认为球队防守仍需改进。",
+        "关注本场比赛的媒体记者已经抵达球场。",
+        "进入视频裁判复核环节后，主裁判改判点球。",
+        "请查看视频回放，裁判随后确认进球有效。",
+        "立即观看回放的裁判最终取消进球。",
+        "关注官方平台伤病通报的球迷发现，主力前锋仍未恢复训练。",
+        "打开俱乐部官方平台的报名名单后，记者发现两名新援已经入选。",
+        "关注俱乐部频道报道的记者透露，球队本周将进行封闭训练。",
+        "打开官方网站公示名单后，主教练确认这名球员没有报名。",
+        "进入官方平台工作的前球员表示，俱乐部管理已经有所改善。",
+        "访问俱乐部网站时，记者发现球队已经更新了球员资料。",
+        "查看官方平台发布的伤病公告后，球迷得知门将将缺阵三周。",
+    ):
+        body = f"<p>{evidence}</p><p>{context}</p><p>{context}</p>"
+        cleaned, matches, error = apply_repair_plan(body, {
+            "block_id": "b1",
+            "action": "remove_block",
+            "evidence": evidence,
+            "issue_type": "media_promotion",
+            "reason": "该段是媒体推广内容，与新闻事实无关",
+            "confidence": 0.99,
+        })
+
+        assert cleaned == body
+        assert matches == []
+        assert "未命中可处理" in str(error)
 
 
 def test_ai_repair_plan_requires_allowlisted_tail_promotion_and_exact_evidence() -> None:
@@ -201,7 +547,7 @@ def test_ai_repair_plan_rejects_non_promotion_or_untrusted_plan() -> None:
         assert error
 
 
-def test_ai_repair_plan_does_not_confuse_duplicate_middle_and_tail_text() -> None:
+def test_ai_repair_plan_uses_block_id_when_text_occurs_more_than_once() -> None:
     promotion = "点击这里关注 WhatsApp 频道，获取最新消息"
     body = (
         f"<p>{promotion}</p>"
@@ -217,9 +563,246 @@ def test_ai_repair_plan_does_not_confuse_duplicate_middle_and_tail_text() -> Non
         "confidence": 0.99,
     })
 
+    assert error is None
+    assert cleaned == (
+        "<p>这是一段完整的比赛报道，包含比赛过程、球员表现和赛后采访信息。</p>"
+        f"<p>{promotion}</p>"
+    )
+    assert matches[0]["block_id"] == blocks[0]["block_id"]
+
+
+def test_duplicate_content_plan_keeps_first_block_and_removes_selected_copy() -> None:
+    repeated = "费内巴切已确认，格林伍德和贡多齐正接受欧足联的纪律调查。"
+    body = (
+        f"<p>{repeated}</p>"
+        "<p>俱乐部还说明了案件背景以及下一阶段的处理安排。</p>"
+        f"<p>{repeated}</p>"
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b3",
+        "keep_block_id": "b1",
+        "action": "remove_block",
+        "evidence": repeated,
+        "issue_type": "duplicate_content",
+        "reason": "b3 与 b1 完全重复，保留首次出现的段落",
+        "confidence": 0.97,
+    })
+
+    assert error is None
+    assert cleaned.count(repeated) == 1
+    assert cleaned.startswith(f"<p>{repeated}</p>")
+    assert matches[0]["keep_block_id"] == "b1"
+    assert matches[0]["validation"] == "ai_general_issue"
+
+
+def test_duplicate_content_plan_requires_matching_keep_block() -> None:
+    repeated = "这段比赛报道被错误重复了一次。"
+    body = f"<p>{repeated}</p><p>{repeated}</p><p>后续报道内容完整。</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "keep_block_id": "b3",
+        "action": "remove_block",
+        "evidence": repeated,
+        "issue_type": "duplicate_content",
+        "reason": "删除后一次重复内容",
+        "confidence": 0.98,
+    })
+
     assert cleaned == body
     assert matches == []
-    assert "未命中高置信" in str(error)
+    assert "保留正文块" in str(error)
+
+
+def test_duplicate_content_plan_cannot_delete_each_others_keep_blocks() -> None:
+    repeated = "这段比赛报道被错误重复了一次。"
+    body = f"<p>{repeated}</p><p>{repeated}</p><p>后续报道内容完整。</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, [
+        {
+            "block_id": "b1",
+            "keep_block_id": "b2",
+            "action": "remove_block",
+            "evidence": repeated,
+            "issue_type": "duplicate_content",
+            "reason": "删除其中一个重复段落",
+            "confidence": 0.98,
+        },
+        {
+            "block_id": "b2",
+            "keep_block_id": "b1",
+            "action": "remove_block",
+            "evidence": repeated,
+            "issue_type": "duplicate_content",
+            "reason": "删除另一个重复段落",
+            "confidence": 0.98,
+        },
+    ])
+
+    assert cleaned == body
+    assert matches == []
+    assert "保留目标" in str(error)
+
+
+def test_general_extraneous_content_plan_removes_exact_plain_text_block() -> None:
+    extra = "【图片】三井寺眞崇拜的两位世界级球员"
+    body = (
+        "<p>报道介绍了球员本轮比赛的完整表现和赛后采访。</p>"
+        f"<p>{extra}</p>"
+        "<p>球队将在下周继续备战下一轮联赛。</p>"
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": extra,
+        "issue_type": "extraneous_content",
+        "reason": "该图片入口是采集残留，与正文新闻事实无关",
+        "confidence": 0.91,
+    })
+
+    assert error is None
+    assert extra not in cleaned
+    assert matches[0]["validation"] == "ai_general_issue"
+
+
+@pytest.mark.parametrize("prefix", ["【官方】", "【伤停】", "【赛果】", "[Official]"])
+def test_general_issue_type_cannot_delete_normal_labeled_news_fact_paragraph(
+    prefix: str,
+) -> None:
+    evidence = f"{prefix}俱乐部宣布张伟将在9月10日续约至2028年。"
+    body = f"<p>{evidence}</p><p>球队随后公布了下一阶段的训练安排。</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b1",
+        "action": "remove_block",
+        "evidence": evidence,
+        "issue_type": "extraneous_content",
+        "reason": "模型声称这是采集残留入口，与正文无关",
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "未命中可处理" in str(error)
+
+
+def test_structural_label_with_cta_and_artifact_reason_can_be_removed() -> None:
+    evidence = "【赛程】查看2026/27赛季完整赛程"
+    body = f"<p>新赛季揭幕战将在十月进行。</p><p>{evidence}</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": evidence,
+        "issue_type": "extraneous_content",
+        "reason": "该赛程入口是采集残留，与正文新闻事实无关",
+        "confidence": 0.91,
+    })
+
+    assert error is None
+    assert evidence not in cleaned
+    assert matches[0]["validation"] == "ai_general_issue"
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "【赛程】新赛季揭幕战将在10月5日举行。",
+        "【直播】主教练赛后表示球队发挥出色。",
+    ],
+)
+def test_structural_label_without_cta_cannot_delete_news_fact(
+    evidence: str,
+) -> None:
+    body = f"<p>{evidence}</p><p>报道还介绍了球队的备战情况。</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b1",
+        "action": "remove_block",
+        "evidence": evidence,
+        "issue_type": "extraneous_content",
+        "reason": "模型声称这是采集残留入口，与正文无关",
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "未命中可处理" in str(error)
+
+
+def test_minor_text_defect_replaces_only_the_exact_plain_text_block() -> None:
+    before = "球队将在下周出战。。"
+    after = "球队将在下周出战。"
+    body = f"<p>主教练确认了下一阶段的训练安排。</p><p>{before}</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "replace_text",
+        "evidence": before,
+        "after": after,
+        "issue_type": "minor_text_defect",
+        "reason": "目标块末尾存在重复标点，只修正该标点",
+        "confidence": 0.9,
+    })
+
+    assert error is None
+    assert cleaned == f"<p>主教练确认了下一阶段的训练安排。</p><p>{after}</p>"
+    assert matches[0]["after"] == after
+
+
+def test_minor_text_defect_cannot_change_names_dates_or_contract_terms() -> None:
+    evidence = "张伟将在9月10日与俱乐部续约至2028年。"
+    body = f"<p>{evidence}</p><p>球队随后公布了训练安排。</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": evidence,
+        "after": "李明将在10月20日与俱乐部续约至2030年。",
+        "issue_type": "minor_text_defect",
+        "reason": "模型声称只做轻微修正",
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "轻微局部修复" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("evidence", "replacement"),
+    [
+        ("俱乐部支付了1.5亿欧元转会费。", "俱乐部支付了15亿欧元转会费。"),
+        ("球队最终以2-1赢得比赛。", "球队最终以21赢得比赛。"),
+        ("该项数据修正值为-1。", "该项数据修正值为1。"),
+        ("该项数据修正值为−1。", "该项数据修正值为1。"),
+        ("球队控球率达到50%。", "球队控球率达到50。"),
+        ("俱乐部支付了$100。", "俱乐部支付了¥100。"),
+        ("报名人数不得超过≤20人。", "报名人数不得超过20人。"),
+        ("本期账面调整为(100)万元。", "本期账面调整为100万元。"),
+    ],
+)
+def test_minor_text_defect_cannot_change_numeric_expressions(
+    evidence: str,
+    replacement: str,
+) -> None:
+    body = f"<p>{evidence}</p><p>报道还介绍了比赛背景。</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": evidence,
+        "after": replacement,
+        "issue_type": "minor_text_defect",
+        "reason": "模型声称只做轻微修正",
+        "confidence": 0.99,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "轻微局部修复" in str(error)
 
 
 def test_removes_only_high_confidence_standalone_plain_text_block() -> None:
@@ -444,6 +1027,25 @@ def test_tail_only_promotions_match_only_at_article_end() -> None:
         "standalone_cooperation_contact"
     ]
     assert remove_promotional_blocks(middle) == (middle, [])
+
+
+def test_feed_markers_and_more_news_prompts_are_only_removed_at_tail() -> None:
+    middle = (
+        "<article><p>正文介绍了球队备战。</p><p>更多球队新闻</p>"
+        "<p>记者随后补充了比赛信息。</p></article>"
+    )
+    tail = (
+        "<article><p>正文介绍了球队备战和新赛季安排。</p>"
+        "<p>前文</p><p>更多球队新闻</p></article>"
+    )
+
+    assert remove_promotional_blocks(middle) == (middle, [])
+    cleaned, matches = remove_promotional_blocks(tail)
+    assert cleaned == "<article><p>正文介绍了球队备战和新赛季安排。</p></article>"
+    assert [item["rule"] for item in matches] == [
+        "standalone_feed_marker",
+        "standalone_more_news_cta",
+    ]
 
 
 def test_tail_media_call_to_action_allows_only_comments_and_container_closers_after_it() -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 
 from app.config import AppConfig
-from app.services.pipeline import RunController
+from app.services.pipeline import RunController, _try_acquire_run_lock
 from app.services.scheduler import Scheduler
 
 
@@ -51,6 +51,22 @@ def test_run_controller_recovers_after_unexpected_error(monkeypatch):
     assert controller.start() is True
     assert controller.wait(2) is True
     assert calls == 2
+
+
+def test_run_lock_is_shared_by_separate_file_handles(tmp_path):
+    database = str(tmp_path / "automatic.sqlite3")
+    first = _try_acquire_run_lock(database)
+    assert first is not None
+    try:
+        assert _try_acquire_run_lock(database) is None
+    finally:
+        import fcntl
+
+        fcntl.flock(first.fileno(), fcntl.LOCK_UN)
+        first.close()
+    released = _try_acquire_run_lock(database)
+    assert released is not None
+    released.close()
 
 
 class _FakeController:

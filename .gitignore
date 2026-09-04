@@ -6,4 +6,5 @@ __pycache__/
 instance/*.sqlite3
 instance/*.sqlite3-*
 *.log
+*.run.lock
 .DS_Store

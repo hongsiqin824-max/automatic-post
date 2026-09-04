@@ -163,6 +163,24 @@ def test_list_articles_filters_by_created_time_newest_first(app):
         assert [row["id"] for row in rows] == [newer["id"], older["id"]]
 
 
+def test_list_articles_searches_title_and_source_url(app):
+    with app.app_context():
+        title_article = repo.upsert_material(_material(
+            source_url="https://example.com/search/title",
+            translate_title="按标题搜索的测试文章",
+        ))["article"]
+        url_article = repo.upsert_material(_material(
+            source_url="https://example.com/search/source-url",
+            translate_title="另一篇搜索测试文章",
+        ))["article"]
+
+        title_rows = repo.list_articles(query="按标题搜索")
+        url_rows = repo.list_articles(query="search/source-url")
+
+        assert [row["id"] for row in title_rows] == [title_article["id"]]
+        assert [row["id"] for row in url_rows] == [url_article["id"]]
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_kbs_ncd_deduplicates_pc_and_standard_urls(app, reverse):
     urls = [
@@ -676,6 +694,92 @@ def test_quality_recheck_claim_is_atomic_and_clears_previous_attempt_marker(app)
         assert repo.claim_quality_recheck(article["id"]) is None
         events = repo.list_article_events(article["id"])
         assert events[-1]["event_type"] == "QUALITY_RECHECK_REQUESTED"
+
+
+def test_quality_article_claim_is_atomic_and_reclaims_expired_lease(app):
+    with app.app_context():
+        article = repo.upsert_material(_material())[
+            "article"
+        ]
+        first = repo.claim_quality_article(article["id"], article["updated_at"])
+        assert first is not None
+        assert first["status"] == "QUALITY_CHECKING"
+        assert first["quality_claim_token"]
+        second = repo.claim_quality_article(article["id"], article["updated_at"])
+        assert second is None
+
+        expired = repo.claim_quality_article(
+            article["id"], None, now="2099-09-01T00:20:00.000Z",
+            claim_stale_after_seconds=1,
+        )
+        assert expired is not None
+        assert expired["quality_claim_token"] != first["quality_claim_token"]
+
+
+def test_expired_quality_worker_cannot_overwrite_new_lease(app):
+    with app.app_context():
+        article = repo.upsert_material(_material())[
+            "article"
+        ]
+        first = repo.claim_quality_article(article["id"], article["updated_at"])
+        assert first is not None
+        second = repo.claim_quality_article(
+            article["id"],
+            None,
+            now="2099-09-01T00:20:00.000Z",
+            claim_stale_after_seconds=1,
+        )
+        assert second is not None
+        original_body = second["body_html"]
+
+        stale_token = first["quality_claim_token"]
+        with pytest.raises(RuntimeError, match="租约已失效"):
+            repo.save_quality(
+                article["id"],
+                {"pass": True, "needs_review": False},
+                status="READY_TO_PUBLISH",
+                quality_claim_token=stale_token,
+                body_html="<p>过期 worker 的候选正文</p>",
+            )
+        assert repo.transition_status(
+            article["id"], "ERROR", quality_claim_token=stale_token
+        ) is None
+        with pytest.raises(RuntimeError, match="租约已失效"):
+            repo.add_article_event(
+                article["id"],
+                "STALE_WORKER_EVENT",
+                quality_claim_token=stale_token,
+            )
+
+        current = repo.get_article(article["id"])
+        assert current["status"] == "QUALITY_CHECKING"
+        assert current["quality"] == {}
+        assert current["body_html"] == original_body
+        assert not any(
+            event["event_type"] == "STALE_WORKER_EVENT"
+            for event in repo.list_article_events(article["id"])
+        )
+        repo.release_quality_claim(article["id"], second["quality_claim_token"])
+
+
+def test_save_quality_can_commit_candidate_body_and_result_together(app):
+    with app.app_context():
+        article = repo.upsert_material(_material())["article"]
+        claimed = repo.claim_quality_article(article["id"], article["updated_at"])
+        candidate = "<p>二次质检通过后的候选正文。</p>"
+        quality = {"pass": True, "needs_review": False, "reason": "内容正常"}
+
+        saved = repo.save_quality(
+            article["id"],
+            quality,
+            status="READY_TO_PUBLISH",
+            quality_claim_token=claimed["quality_claim_token"],
+            body_html=candidate,
+        )
+
+        assert saved["body_html"] == candidate
+        assert saved["quality"] == quality
+        assert saved["status"] == "READY_TO_PUBLISH"
 
 
 def test_catalog_seed_survives_operator_tab_edits_and_restart(app):

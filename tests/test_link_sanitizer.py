@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.services.link_sanitizer import remove_clickable_links
+from app.services.link_sanitizer import preprocess_quality_body, remove_clickable_links
 
 
 def test_removes_linked_text_nested_markup_and_keeps_surrounding_body():
@@ -46,3 +46,80 @@ def test_incomplete_anchor_start_tag_is_removed():
 
     assert "href=" not in cleaned.lower()
     assert "<a" not in cleaned.lower()
+
+
+def test_quality_preprocess_drops_embeds_and_scripts_but_keeps_images():
+    body = (
+        '<ARTICLE><p>正文内容足够完整。</p>'
+        '<iframe src="https://video.example/player"></iframe>'
+        '<script>alert(1)</script>'
+        '<p><img src="/story.jpg" alt="比赛图" width="1200"></p>'
+        '</ARTICLE>'
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert '<iframe' not in cleaned.lower()
+    assert '<script' not in cleaned.lower()
+    assert '<img src="/story.jpg" alt="比赛图" width="1200">' in cleaned
+    assert '<ARTICLE>' in cleaned and '</ARTICLE>' in cleaned
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_removes_clickable_attributes_and_feed_markers():
+    body = (
+        '<p onclick="location.href=\'https://bad.example\'" data-href="/x">正文内容足够完整。</p>'
+        '<!-- google_ad_section_start -->广告<!-- google_ad_section_end -->'
+        '[推荐](https://bad.example/news)'
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert 'onclick=' not in cleaned.lower()
+    assert 'data-href=' not in cleaned.lower()
+    assert 'google_ad_section' not in cleaned.lower()
+    assert '[推荐]' not in cleaned
+
+
+def test_quality_preprocess_removes_empty_transfer_marker_after_link_cleanup():
+    body = (
+        '<p>正文内容足够完整。</p>'
+        '<p><strong>转会中心：</strong> <a href="https://example.com/transfers">查看详情</a></p>'
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == '<p>正文内容足够完整。</p>'
+
+
+def test_quality_preprocess_removes_standalone_feed_marker_blocks():
+    body = "<p>正文内容足够完整。</p><p>前文</p><p>正文</p><p>相关SSI（正文中）</p>"
+
+    assert preprocess_quality_body(body) == '<p>正文内容足够完整。</p>'
+
+
+def test_quality_preprocess_removes_markdown_reference_links_and_definitions():
+    body = (
+        "<p>正文内容足够完整。</p>"
+        "<p>[相关阅读][source] 以及 [官网](https://example.com "
+        "\"打开官网\")</p>\n"
+        "[source]: https://example.com/news \"新闻来源\""
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert "[相关阅读]" not in cleaned
+    assert "[官网]" not in cleaned
+    assert "[source]:" not in cleaned
+
+
+def test_quality_preprocess_keeps_non_link_markdown_like_text():
+    body = "<p>正文内容足够完整，正常[在比赛中](第10分钟)继续进攻。</p>"
+
+    assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_keeps_undefined_markdown_reference_text():
+    body = "<p>正文内容足够完整，参见[注释][x]中的比赛时间。</p>"
+
+    assert preprocess_quality_body(body) == body

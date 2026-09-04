@@ -7,12 +7,18 @@ from app.config import AppConfig
 from app.db import _connect
 from app.services.material_client import MaterialFetchResult
 from app.services.pipeline import run_once
+from app.services.promotion_repair import body_safety_stats
 
 
 TITLE = "澳超新赛季赛程公布及揭幕战安排确认"
 ARTICLE_TEXT = "澳超官方公布了新赛季安排，揭幕战将在十月进行，各支球队正在按计划完成季前备战。"
 PROMOTION = "点击查看2026/27赛季五十铃UTE澳超完整赛程"
 VIDEO_TEASER = "【视频】佐藤龙之介送出引发进球的凶狠逼抢，以及他的威胁场面"
+PROGRAM_PROMOTION = "●矢部浩之先生的新节目《J.LEAGUE WEEKEND 周日的矢部萨卡》开播！ ｜ J联赛"
+SCOREBOARD_MARKER = "【积分榜】明治安田J1联赛2026/27"
+BRANDED_WATCH_PROMOTION = (
+    "请在 ge、Globo 和 SporTV 上观看关于瓦斯科达伽马的全部内容："
+)
 IMAGE = '<img src="/fastdfs8/promotion-test.jpg" alt="澳超赛场">'
 
 
@@ -151,6 +157,144 @@ def test_pipeline_repairs_once_then_second_quality_passes(app, monkeypatch) -> N
         conn.close()
 
 
+def test_first_quality_pass_bypasses_repair_and_preserves_body(app, monkeypatch) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{PROMOTION}</p>"
+    _fetch(monkeypatch, [_item("first-pass-unchanged", body=body)])
+    calls: list[dict] = []
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return deepcopy(SECOND_PASS)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(calls) == 1
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        events = _event_map(article["id"], conn)
+        assert article["body_html"] == calls[0]["body"] == body
+        assert article["title_final"] == TITLE
+        assert "AUTO_REPAIR_TRIGGERED" not in events
+        assert "AUTO_REPAIR_APPLIED" not in events
+        assert "AUTO_REPAIR_FINISHED" not in events
+        assert [event["payload"]["quality_round"] for event in events["QUALITY_RESULT"]] == [1]
+    finally:
+        conn.close()
+
+
+def test_pipeline_repairs_duplicate_block_then_second_quality_passes(
+    app, monkeypatch
+) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    repeated = "费内巴切已确认，格林伍德和贡多齐正接受欧足联的纪律调查。"
+    body = (
+        f"<p>{repeated}</p><p>{ARTICLE_TEXT}</p>{IMAGE}<p>{repeated}</p>"
+    )
+    _fetch(monkeypatch, [_item("duplicate-block", body=body)])
+    first = _quality(needs_review=True, reason="正文存在完全重复段落")
+    first["issues"]["semantic_problems"] = ["正文存在完全重复段落"]
+    first.update({
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": False,
+            "repairable": True,
+            "needs_review": True,
+        },
+        "repair_plans": [{
+            "block_id": "b3",
+            "keep_block_id": "b1",
+            "action": "remove_block",
+            "evidence": repeated,
+            "issue_type": "duplicate_content",
+            "reason": "b3 与 b1 完全重复，保留首次出现内容",
+            "confidence": 0.97,
+        }],
+        "repair_plan_error": None,
+    })
+    calls: list[dict] = []
+    answers = iter([first, deepcopy(SECOND_PASS)])
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return next(answers)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(calls) == 2
+    assert calls[0]["body"].count(repeated) == 2
+    assert calls[1]["body"].count(repeated) == 1
+    assert IMAGE in calls[1]["body"]
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["body_html"].count(repeated) == 1
+        assert article["quality"]["promotion_repair"]["candidate_committed"] is True
+    finally:
+        conn.close()
+
+
+def test_pipeline_uses_separate_planner_when_first_failure_has_no_plan(
+    app, monkeypatch
+) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    extra = "【图片】三井寺眞崇拜的两位世界级球员"
+    body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{extra}</p>"
+    _fetch(monkeypatch, [_item("separate-planner", body=body)])
+    first = _quality(needs_review=True, reason="正文含与新闻无关的图片入口")
+    first["issues"]["semantic_problems"] = ["正文含与新闻无关的图片入口"]
+    first["semantic_check"] = {
+        "title_complete": True,
+        "body_complete": True,
+        "has_ad_or_dirty": False,
+        "repairable": False,
+        "needs_review": True,
+    }
+    answers = iter([first, deepcopy(SECOND_PASS)])
+    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: next(answers))
+    monkeypatch.setattr("app.services.pipeline._make_llm", lambda config: object())
+    monkeypatch.setattr(
+        "app.services.pipeline.plan_local_repair",
+        lambda **kwargs: {
+            "repairable": True,
+            "reason": "可删除精确定位的图片入口",
+            "repair_plans": [{
+                "block_id": "b2",
+                "action": "remove_block",
+                "evidence": extra,
+                "issue_type": "extraneous_content",
+                "reason": "该图片入口与新闻事实无关",
+                "confidence": 0.92,
+            }],
+            "repair_plan_error": None,
+        },
+    )
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert extra not in article["body_html"]
+        repair = article["quality"]["promotion_repair"]
+        assert repair["repair_planner"]["repairable"] is True
+        assert repair["candidate_committed"] is True
+    finally:
+        conn.close()
+
+
 def test_pipeline_second_quality_failure_goes_to_manual_review(app, monkeypatch) -> None:
     database = app.config["DATABASE"]
     _enable_source(database)
@@ -164,8 +308,11 @@ def test_pipeline_second_quality_failure_goes_to_manual_review(app, monkeypatch)
     try:
         article = repo.list_articles(conn)[0]
         assert article["status"] == "NEEDS_REVIEW"
-        assert PROMOTION not in article["body_html"]
-        assert article["quality"]["promotion_repair"]["outcome"] == "failed"
+        assert PROMOTION in article["body_html"]
+        repair = article["quality"]["promotion_repair"]
+        assert repair["outcome"] == "failed"
+        assert repair["candidate_created"] is True
+        assert repair["candidate_committed"] is False
         finished = _event_map(article["id"], conn)["AUTO_REPAIR_FINISHED"][0]["payload"]
         assert finished["outcome"] == "failed"
         assert finished["final_status"] == "NEEDS_REVIEW"
@@ -268,18 +415,16 @@ def test_pipeline_photo_credit_repair_second_quality_failure_is_audited(
     try:
         article = repo.list_articles(conn)[0]
         assert article["status"] == "NEEDS_REVIEW"
-        assert "[照片]" not in article["body_html"]
-        assert f"{caption}（图片来源：Getty Images）" in article["body_html"]
+        assert "[照片]" in article["body_html"]
+        assert f"{caption}（图片来源：Getty Images）" not in article["body_html"]
         repair = article["quality"]["promotion_repair"]
         assert repair["attribution_normalized_count"] == 1
         assert repair["removed_count"] == 0
         assert repair["outcome"] == "failed"
+        assert repair["candidate_committed"] is False
 
         events = _event_map(article["id"], conn)
-        applied = events["AUTO_REPAIR_APPLIED"][0]["payload"]
-        assert applied["attribution_only"] is True
-        assert applied["image_count_before"] == applied["image_count_after"] == 1
-        assert applied["image_sources_unchanged"] is True
+        assert "AUTO_REPAIR_APPLIED" not in events
         finished = events["AUTO_REPAIR_FINISHED"][0]["payload"]
         assert finished["outcome"] == "failed"
         assert finished["final_status"] == "NEEDS_REVIEW"
@@ -341,7 +486,7 @@ def test_pipeline_second_quality_exception_fails_closed(app, monkeypatch) -> Non
     try:
         article = repo.list_articles(conn)[0]
         assert article["status"] == "NEEDS_REVIEW"
-        assert PROMOTION not in article["body_html"]
+        assert PROMOTION in article["body_html"]
         repair = article["quality"]["promotion_repair"]
         assert repair["attempted"] is True
         assert repair["outcome"] == "error"
@@ -355,6 +500,26 @@ def test_pipeline_second_quality_exception_fails_closed(app, monkeypatch) -> Non
         assert finished["outcome"] == "error"
         assert finished["final_status"] == "NEEDS_REVIEW"
         assert finished["error"] == "second quality unavailable"
+    finally:
+        conn.close()
+
+
+def test_pipeline_second_quality_non_dict_fails_closed(app, monkeypatch) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    _fetch(monkeypatch, [_item("second-invalid-shape")])
+    answers = iter([deepcopy(FIRST_DIRTY), []])
+    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: next(answers))
+
+    result = run_once(_config(database))
+
+    assert result["errors"] == 0
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "NEEDS_REVIEW"
+        assert article["quality"]["promotion_repair"]["outcome"] == "error"
+        assert article["quality"]["promotion_repair"]["error"] == "二次质检返回结果格式错误"
     finally:
         conn.close()
 
@@ -419,7 +584,7 @@ def test_pipeline_never_attempts_same_article_twice(app, monkeypatch) -> None:
         article = repo.list_articles(conn)[0]
         events = _event_map(article["id"], conn)
         assert len(events["AUTO_REPAIR_TRIGGERED"]) == 1
-        assert len(events["AUTO_REPAIR_APPLIED"]) == 1
+        assert "AUTO_REPAIR_APPLIED" not in events
         assert len(events["AUTO_REPAIR_FINISHED"]) == 1
         assert article["quality"]["promotion_repair"]["attempted"] is True
         assert article["status"] == "NEEDS_REVIEW"
@@ -461,7 +626,7 @@ def test_interrupted_or_previous_repair_cannot_become_ready_on_later_ai_pass(
         assert "已阻止重复处理" in article["quality"]["reason"]
         events = _event_map(article["id"], conn)
         assert len(events["AUTO_REPAIR_TRIGGERED"]) == 1
-        assert len(events["AUTO_REPAIR_APPLIED"]) == 1
+        assert "AUTO_REPAIR_APPLIED" not in events
         assert len(events["AUTO_REPAIR_FINISHED"]) == 1
     finally:
         conn.close()
@@ -492,7 +657,8 @@ def test_pipeline_promotion_repair_never_applies_suggested_title(app, monkeypatc
         assert article["quality"]["promotion_repair"]["outcome"] == "failed"
         events = _event_map(article["id"], conn)
         assert "TITLE_FIXED" not in events
-        assert events["AUTO_REPAIR_APPLIED"][0]["payload"]["title_unchanged"] is True
+        assert "AUTO_REPAIR_APPLIED" not in events
+        assert article["quality"]["promotion_repair"]["candidate_committed"] is False
     finally:
         conn.close()
 
@@ -536,7 +702,11 @@ def test_pipeline_applies_validated_ai_plan_for_two_tail_promotions(
     _fetch(monkeypatch, [_item("ai-plan", body=body)])
     first = deepcopy(FIRST_DIRTY)
     first.update({
-        "semantic_check": {"has_ad_or_dirty": True},
+        "semantic_check": {
+            "has_ad_or_dirty": True,
+            "repairable": True,
+            "needs_review": False,
+        },
         "repair_plans": [
             {
                 "block_id": "b2",
@@ -580,6 +750,220 @@ def test_pipeline_applies_validated_ai_plan_for_two_tail_promotions(
         conn.close()
 
 
+def test_pipeline_repairs_real_branded_watch_plan_then_runs_full_second_quality(
+    app, monkeypatch
+) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    context = (
+        "报道完整介绍了比赛进程、球队表现、教练赛后评价和接下来的赛事安排，"
+        "并引用了俱乐部相关人员对于球队现状的说明。"
+    )
+    body = (
+        f"<p>{context}</p>{IMAGE}<p>{context}</p>"
+        f"<p>{BRANDED_WATCH_PROMOTION}</p>"
+    )
+    _fetch(monkeypatch, [_item("real-branded-watch", body=body)])
+    first = deepcopy(SECOND_PASS)
+    first.update({
+        "pass": False,
+        "needs_review": True,
+        "score": 50,
+        "issues": {
+            **deepcopy(SECOND_PASS["issues"]),
+            "dirty_content": ["AI 判断可能含广告或脏内容：正文末尾包含媒体引流"],
+        },
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "repairable": True,
+            "needs_review": False,
+        },
+        "repair_plans": [{
+            "block_id": "b3",
+            "action": "remove_block",
+            "evidence": BRANDED_WATCH_PROMOTION,
+            "issue_type": "media_promotion",
+            "reason": (
+                "该段以‘观看全部内容’为号召，推广在指定媒体平台观看内容，"
+                "与新闻事实无关。"
+            ),
+            "confidence": 0.99,
+        }],
+        "repair_plan_error": None,
+    })
+    calls: list[dict] = []
+    answers = iter([first, deepcopy(SECOND_PASS)])
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return next(answers)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(calls) == 2
+    assert BRANDED_WATCH_PROMOTION in calls[0]["body"]
+    assert BRANDED_WATCH_PROMOTION not in calls[1]["body"]
+    assert calls[1]["title"] == TITLE
+    assert IMAGE in calls[1]["body"]
+    assert context in calls[1]["body"]
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert BRANDED_WATCH_PROMOTION not in article["body_html"]
+        assert IMAGE in article["body_html"]
+        repair = article["quality"]["promotion_repair"]
+        assert repair["outcome"] == "passed"
+        assert repair["removed_count"] == 1
+        events = _event_map(article["id"], conn)
+        assert [
+            event["payload"]["quality_round"]
+            for event in events["QUALITY_RESULT"]
+        ] == [1, 2]
+        assert events["AUTO_REPAIR_APPLIED"][0]["payload"][
+            "image_attributes_unchanged"
+        ] is True
+        assert events["AUTO_REPAIR_FINISHED"][0]["payload"]["destination"] == "发布队列"
+    finally:
+        conn.close()
+
+
+def test_pipeline_does_not_apply_plan_from_inconsistent_first_pass(
+    app, monkeypatch
+) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{PROMOTION}</p>"
+    _fetch(monkeypatch, [_item("ai-plan-needs-review-false", body=body)])
+    first = deepcopy(SECOND_PASS)
+    first.update({
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "repairable": True,
+            "needs_review": False,
+        },
+        "repair_plans": [{
+            "block_id": "b2",
+            "action": "remove_block",
+            "evidence": PROMOTION,
+            "confidence": 0.99,
+        }],
+        "repair_plan_error": None,
+    })
+    calls: list[dict] = []
+    answers = iter([first, deepcopy(SECOND_PASS)])
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return next(answers)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"NEEDS_REVIEW": 1}
+    assert len(calls) == 1
+    assert PROMOTION in calls[0]["body"]
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "NEEDS_REVIEW"
+        assert PROMOTION in article["body_html"]
+        assert article["quality"]["promotion_repair"]["outcome"] == "failed"
+    finally:
+        conn.close()
+
+
+def test_pipeline_treats_photo_credit_advisory_as_non_blocking_second_pass(
+    app, monkeypatch
+) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = (
+        "<p>前锋德田誉独中两元（Hiroyuki SATO），球队随后赢得比赛。</p>"
+        f"{IMAGE}<p>{PROMOTION}</p>"
+    )
+    _fetch(monkeypatch, [_item("photo-advisory-second-pass", body=body)])
+    photo_plan = {
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": "前锋德田誉独中两元（Hiroyuki SATO）",
+        "after": "前锋德田誉独中两元（摄影：Hiroyuki SATO）",
+        "confidence": 0.9,
+    }
+    second = deepcopy(SECOND_PASS)
+    second.update({
+        "semantic_check": {
+            "has_ad_or_dirty": False,
+            "needs_review": False,
+        },
+        "repair_plans": [photo_plan],
+        "repair_plan_error": None,
+    })
+    answers = iter([deepcopy(FIRST_DIRTY), second])
+    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: next(answers))
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        quality = article["quality"]
+        assert quality["repair_plans"] == []
+        assert quality["repair_plan_error"] is None
+        assert quality["advisory_repair_plans"] == [photo_plan]
+        assert quality["promotion_repair"]["outcome"] == "passed"
+    finally:
+        conn.close()
+
+
+def test_pipeline_keeps_contradictory_remove_plan_blocked_on_second_pass(
+    app, monkeypatch
+) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    _fetch(monkeypatch, [_item("remove-plan-contradiction-second-pass")])
+    second = deepcopy(SECOND_PASS)
+    second.update({
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": False,
+            "needs_review": False,
+        },
+        "repair_plans": [{
+            "block_id": "b1",
+            "action": "remove_block",
+            "evidence": ARTICLE_TEXT,
+            "confidence": 0.99,
+        }],
+        "repair_plan_error": "AI 修复计划与质检结论矛盾",
+    })
+    answers = iter([deepcopy(FIRST_DIRTY), second])
+    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: next(answers))
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"NEEDS_REVIEW": 1}
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "NEEDS_REVIEW"
+        assert article["quality"]["promotion_repair"]["outcome"] == "failed"
+        assert article["quality"]["repair_plans"]
+    finally:
+        conn.close()
+
+
 def test_pipeline_applies_ai_line_plan_and_runs_second_quality(
     app, monkeypatch
 ) -> None:
@@ -598,6 +982,8 @@ def test_pipeline_applies_ai_line_plan_and_runs_second_quality(
             "segment_id": "b1.s2",
             "action": "remove_text_line",
             "evidence": VIDEO_TEASER,
+            "issue_type": "video_promotion",
+            "reason": "该独立视频引流行与新闻事实无关",
             "confidence": 0.99,
         }],
         "repair_plan_error": None,
@@ -636,6 +1022,146 @@ def test_pipeline_applies_ai_line_plan_and_runs_second_quality(
         conn.close()
 
 
+def test_pipeline_applies_unknown_ai_program_promotion_and_audits_reason(
+    app, monkeypatch
+) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = (
+        f"<p>{ARTICLE_TEXT}\n{PROGRAM_PROMOTION}\n赛后主教练接受了采访并肯定了球队的表现。</p>"
+        f"{IMAGE}<p>{ARTICLE_TEXT}</p><p>{ARTICLE_TEXT}</p>"
+        f"<p>{ARTICLE_TEXT}球队还将根据教练组的安排继续完成训练，并准备下一场比赛。</p>"
+    )
+    _fetch(monkeypatch, [_item("ai-unknown-program", body=body)])
+    first = deepcopy(FIRST_DIRTY)
+    first.update({
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "repairable": True,
+            "needs_review": False,
+        },
+        "repair_plans": [{
+            "segment_id": "b1.s2",
+            "action": "remove_text_line",
+            "evidence": PROGRAM_PROMOTION,
+            "issue_type": "standalone_program_promotion",
+            "reason": "独立节目推广内容，与新闻事实无关",
+            "confidence": 0.99,
+        }],
+        "repair_plan_error": None,
+    })
+    calls: list[dict] = []
+    answers = iter([first, deepcopy(SECOND_PASS)])
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return next(answers)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(calls) == 2
+    assert PROGRAM_PROMOTION in calls[0]["body"]
+    assert PROGRAM_PROMOTION not in calls[1]["body"]
+    assert IMAGE in calls[1]["body"]
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        applied = _event_map(article["id"], conn)["AUTO_REPAIR_APPLIED"][0]["payload"]
+        assert applied["removed_blocks"][0]["issue_type"] == "standalone_program_promotion"
+        assert applied["removed_blocks"][0]["reason"] == "独立节目推广内容，与新闻事实无关"
+        assert applied["removed_blocks"][0]["confidence"] == 0.99
+        assert applied["removed_blocks"][0]["block_id"] == "b1"
+        assert applied["removed_blocks"][0]["segment_id"] == "b1.s2"
+    finally:
+        conn.close()
+
+
+def test_pipeline_applies_scoreboard_ai_plan_with_guidance_reason_and_preserves_images(
+    app, monkeypatch
+) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    image_one = (
+        '<IMG SRC="/fastdfs8/scoreboard-main.jpg" ALT="主图" width="640" '
+        'loading="lazy" class="hero" data-slot="main">'
+    )
+    image_two = (
+        '<img class="detail" src="https://img.example/scoreboard-detail.jpg" '
+        'alt="细节图" width="320" height="180" data-slot="detail">'
+    )
+    context = (
+        "报道完整介绍了球员转会背景、合同安排、球队计划和后续训练，"
+        "并引用了俱乐部及相关人员对下一阶段工作的说明。"
+    )
+    body = (
+        f"<p>{context}</p>{image_one}<p>{SCOREBOARD_MARKER}</p>"
+        f"{image_two}<p>{context}</p><p>{context}</p>"
+    )
+    _fetch(monkeypatch, [_item("ai-scoreboard", body=body)])
+    first = deepcopy(FIRST_DIRTY)
+    first.update({
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "repairable": True,
+            "needs_review": False,
+        },
+        "repair_plans": [{
+            "block_id": "b2",
+            "action": "remove_block",
+            "evidence": SCOREBOARD_MARKER,
+            "issue_type": "traffic_generation",
+            "reason": "该独立积分榜入口用于引导访问赛事榜单，与球员转会新闻事实无关",
+            "confidence": 0.99,
+        }],
+        "repair_plan_error": None,
+    })
+    calls: list[dict] = []
+    answers = iter([first, deepcopy(SECOND_PASS)])
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return next(answers)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+    before_stats = body_safety_stats(body)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(calls) == 2
+    assert SCOREBOARD_MARKER in calls[0]["body"]
+    assert SCOREBOARD_MARKER not in calls[1]["body"]
+    assert body_safety_stats(calls[1]["body"])["image_count"] == before_stats["image_count"]
+    assert body_safety_stats(calls[1]["body"])["image_sources"] == before_stats["image_sources"]
+    assert body_safety_stats(calls[1]["body"])["image_attributes"] == before_stats["image_attributes"]
+
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert SCOREBOARD_MARKER not in article["body_html"]
+        assert body_safety_stats(article["body_html"])["image_attributes"] == before_stats["image_attributes"]
+        events = _event_map(article["id"], conn)
+        assert [event["payload"]["quality_round"] for event in events["QUALITY_RESULT"]] == [1, 2]
+        applied = events["AUTO_REPAIR_APPLIED"][0]["payload"]
+        assert applied["image_sources_unchanged"] is True
+        assert applied["image_attributes_unchanged"] is True
+        assert applied["removed_blocks"][0]["issue_type"] == "traffic_generation"
+        assert applied["removed_blocks"][0]["reason"] == "该独立积分榜入口用于引导访问赛事榜单，与球员转会新闻事实无关"
+        finished = events["AUTO_REPAIR_FINISHED"][0]["payload"]
+        assert finished["destination"] == "发布队列"
+    finally:
+        conn.close()
+
+
 def test_pipeline_rejects_ai_plan_for_normal_news_paragraph(app, monkeypatch) -> None:
     database = app.config["DATABASE"]
     _enable_source(database)
@@ -663,7 +1189,7 @@ def test_pipeline_rejects_ai_plan_for_normal_news_paragraph(app, monkeypatch) ->
         assert article["body_html"] == body
         repair = article["quality"]["promotion_repair"]
         assert repair["applied"] is False
-        assert "未命中高置信" in repair["plan_error"]
+        assert "未命中可处理" in repair["plan_error"]
     finally:
         conn.close()
 
