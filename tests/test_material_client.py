@@ -38,3 +38,20 @@ def test_fetch_all_uses_contract_pagination_and_retries_429(monkeypatch):
     assert [call["offset"] for call in session.calls] == [0, 0, 1]
     assert session.calls[1]["source"] == "marca"
     assert session.calls[1]["hours"] == 6
+
+
+def test_normalize_item_filters_blacklisted_channels_without_changing_raw_payload():
+    from app.services.material_client import normalize_item
+
+    raw = {
+        "translate_title": "标签过滤测试",
+        "translate_body": "<p>正文</p>",
+        "source": "marca",
+        "source_url": "https://example.com/channel-filter",
+        "channels": [89, 845616, 93, 189],
+    }
+
+    normalized = normalize_item(raw)
+
+    assert normalized["channels"] == [845616, 189]
+    assert normalized["raw_payload"]["channels"] == [89, 845616, 93, 189]

@@ -24,6 +24,7 @@ from .quality import (
 )
 from .link_sanitizer import preprocess_quality_body
 from .promotion_repair import (
+    MAX_AI_REPAIR_PLANS,
     apply_repair_plan,
     body_safety_stats,
     find_promotional_blocks,
@@ -120,7 +121,7 @@ def _audit_repair_plans(plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Persist only bounded, non-HTML repair-plan evidence."""
 
     audited: list[dict[str, Any]] = []
-    for item in plans[:8]:
+    for item in plans[:MAX_AI_REPAIR_PLANS]:
         segment_id = str(item.get("segment_id") or "")[:40]
         block_id = str(item.get("block_id") or "")[:40]
         if not block_id and ".s" in segment_id.lower():
@@ -199,11 +200,10 @@ def _quality_has_repairable_ai_plan(
     if not plans:
         return False
     semantic = quality.get("semantic_check")
-    if isinstance(semantic, dict):
-        if semantic.get("repairable") is False:
-            return False
-        if semantic.get("title_complete") is False or semantic.get("body_complete") is False:
-            return False
+    if not isinstance(semantic, dict) or semantic.get("repairable") is not True:
+        return False
+    if semantic.get("title_complete") is False or semantic.get("body_complete") is False:
+        return False
     issues = quality.get("issues")
     if not isinstance(issues, dict):
         return False
@@ -377,7 +377,10 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
     current = repo.get_article(article_id, connection)
     try:
         body_before_preprocess = str(current.get("body_html") or "")
-        cleaned_body = preprocess_quality_body(body_before_preprocess)
+        cleaned_body = preprocess_quality_body(
+            body_before_preprocess,
+            source=current.get("source"),
+        )
         if cleaned_body != body_before_preprocess:
             preprocess_before = body_safety_stats(body_before_preprocess)
             preprocess_after = body_safety_stats(cleaned_body)

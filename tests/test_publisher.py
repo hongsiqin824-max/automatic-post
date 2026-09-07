@@ -28,7 +28,7 @@ def _ready_article():
         "translate_body": "<p>球队确认了新赛季的重要安排，训练计划、热身赛和球迷活动都已经公布。</p>",
         "archive_id": 0,
         "dqd_litpic": "/fastdfs8/publisher.jpg",
-        "channels": [11, 22],
+        "channels": [11, 12],
     }
 
 
@@ -51,14 +51,45 @@ def test_create_article_form_uses_backend_tab_and_draft_status(app):
         "title_final": "完整标题",
         "body_html": "<p>完整正文，信息充分。</p>",
         "litpic": "/fastdfs8/cover.jpg",
-        "channels": [11, 22],
+        "channels": [11, 12],
     }
     form = build_create_article_form(article, {"backend_tab_id": 284}, config)
     assert ("dqd_enname", "hongsiqin") in form
     assert ("archive_level", "B") in form
     assert ("status", "0") in form
+    assert ("no_roll_recommend", "1") in form
     assert ("tabs[]", "284") in form
-    assert ("channels", "11,22") in form
+    assert ("channels", "11,12") in form
+
+
+def test_create_article_form_filters_blacklisted_channels_at_submission_boundary(app):
+    config = _open_config(":memory:")
+    article = {
+        "title_final": "发布边界标签过滤",
+        "body_html": "<p>完整正文，信息充分。</p>",
+        "channels": [89, 845616, 93, 189],
+        "channelsnew": [90, 122],
+    }
+
+    form = build_create_article_form(article, {"backend_tab_id": 284}, config)
+
+    assert ("channels", "845616,189") in form
+    assert ("channelsnew", "122") in form
+
+
+def test_create_article_form_omits_channels_when_all_are_blacklisted(app):
+    config = _open_config(":memory:")
+    form = build_create_article_form(
+        {
+            "title_final": "全部标签过滤",
+            "body_html": "<p>完整正文，信息充分。</p>",
+            "channels": [89, 90, 93],
+        },
+        {"backend_tab_id": 284},
+        config,
+    )
+
+    assert not any(key == "channels" for key, _ in form)
 
 
 def test_create_article_form_includes_publish_account(app):

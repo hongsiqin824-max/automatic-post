@@ -275,7 +275,7 @@ def test_pipeline_uses_separate_planner_when_first_failure_has_no_plan(
                 "evidence": extra,
                 "issue_type": "extraneous_content",
                 "reason": "该图片入口与新闻事实无关",
-                "confidence": 0.92,
+                "confidence": 0.95,
             }],
             "repair_plan_error": None,
         },
@@ -977,7 +977,11 @@ def test_pipeline_applies_ai_line_plan_and_runs_second_quality(
     _fetch(monkeypatch, [_item("ai-line-plan", body=body)])
     first = deepcopy(FIRST_DIRTY)
     first.update({
-        "semantic_check": {"has_ad_or_dirty": True, "needs_review": True},
+        "semantic_check": {
+            "has_ad_or_dirty": True,
+            "repairable": True,
+            "needs_review": True,
+        },
         "repair_plans": [{
             "segment_id": "b1.s2",
             "action": "remove_text_line",
@@ -1169,7 +1173,10 @@ def test_pipeline_rejects_ai_plan_for_normal_news_paragraph(app, monkeypatch) ->
     _fetch(monkeypatch, [_item("ai-plan-rejected", body=body)])
     first = deepcopy(FIRST_DIRTY)
     first.update({
-        "semantic_check": {"has_ad_or_dirty": True},
+        "semantic_check": {
+            "has_ad_or_dirty": True,
+            "repairable": True,
+        },
         "repair_plans": [{
             "block_id": "b1",
             "action": "remove_block",
@@ -1190,6 +1197,50 @@ def test_pipeline_rejects_ai_plan_for_normal_news_paragraph(app, monkeypatch) ->
         repair = article["quality"]["promotion_repair"]
         assert repair["applied"] is False
         assert "未命中可处理" in repair["plan_error"]
+    finally:
+        conn.close()
+
+
+def test_pipeline_rejects_plan_without_explicit_repairable_true(app, monkeypatch) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{PROMOTION}</p>"
+    _fetch(monkeypatch, [_item("ai-plan-missing-repairable", body=body)])
+    first = deepcopy(FIRST_DIRTY)
+    first.update({
+        "semantic_check": {
+            "has_ad_or_dirty": True,
+            "needs_review": True,
+        },
+        "repair_plans": [{
+            "block_id": "b2",
+            "action": "remove_block",
+            "evidence": PROMOTION,
+            "issue_type": "advertisement",
+            "reason": "独立推广内容，与新闻事实无关",
+            "confidence": 0.99,
+        }],
+        "repair_plan_error": None,
+    })
+    calls: list[dict] = []
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return first
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"NEEDS_REVIEW": 1}
+    assert len(calls) == 1
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "NEEDS_REVIEW"
+        assert article["body_html"] == body
+        assert article["quality"]["promotion_repair"]["applied"] is False
+        assert article["quality"]["promotion_repair"]["plan_error"]
     finally:
         conn.close()
 

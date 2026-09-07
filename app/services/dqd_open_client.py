@@ -15,6 +15,7 @@ from .article_images import (
     effective_litpic,
     fallback_litpic_for_tabs,
 )
+from .channel_filter import filter_blocked_channels
 from .dqd_publish_html import DqdPublishHtmlError, sanitize_dqd_publish_html
 from .link_sanitizer import preprocess_quality_body, remove_clickable_links
 from .quality import html_to_text
@@ -111,7 +112,7 @@ def build_create_article_form(
     # Apply the same deterministic cleanup at the final submission boundary.
     # This covers manually approved or edited articles that did not pass
     # through the ingestion quality-preprocess step.
-    body = preprocess_quality_body(body)
+    body = preprocess_quality_body(body, source=article.get("source"))
     if not title:
         raise DqdOpenClientError("标题为空，不能创建草稿")
     if not body.strip() or (
@@ -157,6 +158,9 @@ def build_create_article_form(
         ("body", body),
         ("archive_level", config.dqd_open_archive_level),
         ("status", str(publish_status)),
+        # Keep the created article out of the rolling recommendation feed.
+        # This is sent as a form field on every draft/publish submission.
+        ("no_roll_recommend", "1"),
     ]
     request_id = str(client_request_id or "").strip()
     if request_id and getattr(config, "dqd_open_idempotency_enabled", False):
@@ -169,11 +173,11 @@ def build_create_article_form(
         fields.append((field_name, request_id))
     fields.extend(_publish_account_fields(publish_account))
     fields.extend(("tabs[]", str(tab_id)) for tab_id in backend_tab_ids)
-    channels = article.get("channels") or []
+    channels = filter_blocked_channels(article.get("channels") or [])
     if channels:
         channel_values = ",".join(str(int(value)) for value in channels)
         fields.append(("channels", channel_values))
-    channelsnew = article.get("channelsnew") or []
+    channelsnew = filter_blocked_channels(article.get("channelsnew") or [])
     if channelsnew:
         channel_values = ",".join(str(int(value)) for value in channelsnew)
         fields.append(("channelsnew", channel_values))

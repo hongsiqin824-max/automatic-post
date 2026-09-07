@@ -128,7 +128,18 @@ def test_material_unique_key_and_external_ids_are_separate(app):
         assert second["article"]["upstream_archive_id"] == 77
         assert second["article"]["dqd_archive_id"] is None
         assert repo.count_articles() == 1
-        assert second["article"]["channels"] == [11, 22]
+        assert second["article"]["channels"] == [11]
+
+
+def test_upsert_material_filters_channels_but_keeps_raw_payload(app):
+    with app.app_context():
+        article = repo.upsert_material(_material(
+            channels=[89, 845616, 93, 189],
+            raw_payload={"channels": [89, 845616, 93, 189]},
+        ))["article"]
+
+        assert article["channels"] == [845616, 189]
+        assert article["raw"] == {"channels": [89, 845616, 93, 189]}
 
 
 def test_list_articles_filters_by_created_time_newest_first(app):
@@ -638,6 +649,23 @@ def test_manual_review_updates_content_and_status(app):
         assert updated["quality"]["pass"] is True
         assert updated["quality"]["needs_review"] is False
         assert len(repo.list_article_events(article["id"])) >= 3
+
+
+def test_manual_review_update_filters_blacklisted_channels(app):
+    with app.app_context():
+        article = repo.upsert_material(_material(
+            source_url="https://example.com/manual-channel-filter",
+            channels=[11, 12],
+        ))["article"]
+        repo.transition_status(article["id"], "NEEDS_REVIEW")
+
+        updated = repo.manual_review_update(
+            article["id"],
+            "manual_fix_then_pass",
+            channels=[89, 12, 93],
+        )
+
+        assert updated["channels"] == [12]
 
 
 def test_transition_status_if_current_prevents_double_claim(app):

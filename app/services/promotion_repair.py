@@ -114,16 +114,26 @@ _TAIL_ONLY_RULES = {
     "standalone_channel_call_to_action",
 }
 
+# ``_BLOCK_RE`` is intentionally kept text-only for deterministic cleanup.
+# Rich formatting wrappers are handled by the AI-plan locator below, where an
+# exact evidence check and a second quality pass are required before commit.
 _BLOCK_RE = re.compile(
     r"<(?P<tag>p|div|li)(?P<attrs>\s[^>]*)?>(?P<content>[^<>]*)</(?P=tag)\s*>",
     re.IGNORECASE,
 )
 
 # A second, deliberately narrow matcher is used for AI line-level plans.  It
-# accepts plain text and ``<br>`` separators, but still rejects rich nested
-# markup so that offsets cannot accidentally target a caption or link node.
+# accepts plain text, ``<br>`` separators, and a small set of *attribute-less*
+# presentational wrappers. Links, images, and arbitrary nested markup remain
+# excluded so an AI plan cannot accidentally target a caption or link node.
+_PRESENTATIONAL_TAG = r"(?:b|i|strong|em|span)"
+_PRESENTATIONAL_TOKEN = rf"<(?:{_PRESENTATIONAL_TAG}\s*|/{_PRESENTATIONAL_TAG}\s*)>"
+_PRESENTATIONAL_TAG_TOKEN_RE = re.compile(
+    rf"<(?P<closing>/)?(?P<tag>{_PRESENTATIONAL_TAG})\s*>",
+    re.IGNORECASE,
+)
 _LINE_BLOCK_RE = re.compile(
-    r"<(?P<tag>p|div|li)(?P<attrs>\s[^>]*)?>(?P<content>(?:[^<>]|<br\b[^>]*>)*?)</(?P=tag)\s*>",
+    rf"<(?P<tag>p|div|li)(?P<attrs>\s[^>]*)?>(?P<content>(?:[^<>]|<br\b[^>]*>|{_PRESENTATIONAL_TOKEN})*?)</(?P=tag)\s*>",
     re.IGNORECASE,
 )
 _LINE_SEPARATOR_RE = re.compile(r"(?:\r\n|\r|\n|<br\b[^>]*>)", re.IGNORECASE)
@@ -148,6 +158,14 @@ _AI_PLAN_ACTION_ALIASES = {
     "delete_segment": "remove_text_line",
     "replace_exact_text": "replace_text",
 }
+
+# A targeted repair is deliberately more conservative than a deterministic
+# feed cleanup.  The complete candidate must still pass the second quality
+# check before it can be committed.
+MAX_AI_REPAIR_PLANS = 3
+MIN_AI_REPAIR_CONFIDENCE = 0.95
+MAX_AI_REPAIR_REMOVED_CHARS = 600
+MAX_AI_REPAIR_REMOVED_RATIO = 0.25
 
 # The model is allowed to describe a new promotion wording without waiting
 # for a new regular expression.  These are content categories, rather than
@@ -303,6 +321,15 @@ _AI_MEDIA_PLATFORM_RE = re.compile(
     r"(?:^|[\s、，,：:;；|/（）()])(?:ge|globo|sportv)(?![a-z])",
     re.IGNORECASE,
 )
+_AI_COMMERCIAL_MEDIA_PLATFORM_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:kayo|bein\s+sports|fox\s+sports\s+sportmail|sportmail)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_AI_COMMERCIAL_BENEFIT_RE = re.compile(
+    r"(?:无广告|新用户|订阅|开通|收件箱|第一时间|获取最新|"
+    r"观看直播|比赛直播|精彩集锦|集锦和分析)",
+    re.IGNORECASE,
+)
 _AI_EXPLICIT_WATCH_HEADING_RE = re.compile(
     r"^[+✅📲➡️🗞️\s]*(?:观看(?:更多)?|收看)\s*[:：]",
     re.IGNORECASE,
@@ -353,6 +380,17 @@ def _is_ai_promotional_evidence(evidence: str) -> bool:
     has_watch_heading = bool(_AI_EXPLICIT_WATCH_HEADING_RE.match(text))
     has_more_content_heading = bool(_AI_MORE_CONTENT_PROMOTION_RE.fullmatch(text))
     has_media_platform = bool(_AI_MEDIA_PLATFORM_RE.search(text))
+    has_commercial_media_platform = bool(_AI_COMMERCIAL_MEDIA_PLATFORM_RE.search(text))
+    if has_commercial_media_platform:
+        # Some publisher templates begin directly with a product/platform
+        # name (for example ``在Kayo上观看每一场...``) instead of a conventional
+        # ``请点击`` CTA. Require both an action and an explicit commercial
+        # benefit so a factual sentence merely mentioning the platform is not
+        # treated as removable promotion.
+        return bool(
+            _AI_PROMOTION_ACTION_RE.search(text)
+            and _AI_COMMERCIAL_BENEFIT_RE.search(text)
+        )
     if not any((
         has_explicit_action_prefix,
         has_explicit_in_prefix,
@@ -546,6 +584,20 @@ def _inside_excluded_context(start: int, spans: list[tuple[int, int]]) -> bool:
     return any(span_start <= start < span_end for span_start, span_end in spans)
 
 
+def _presentational_markup_is_balanced(value: str) -> bool:
+    """Reject mismatched attribute-less formatting wrappers before indexing."""
+
+    stack: list[str] = []
+    for match in _PRESENTATIONAL_TAG_TOKEN_RE.finditer(value):
+        tag = match.group("tag").lower()
+        if match.group("closing"):
+            if not stack or stack.pop() != tag:
+                return False
+        else:
+            stack.append(tag)
+    return not stack
+
+
 def _rule_for(text: str) -> str | None:
     normalized = _normalise_promotion_text(text)
     if not normalized or len(normalized) > 180:
@@ -569,6 +621,8 @@ def content_blocks(body_html: str | None) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     for index, match in enumerate(_LINE_BLOCK_RE.finditer(body), start=1):
         if _inside_excluded_context(match.start(), excluded_spans):
+            continue
+        if not _presentational_markup_is_balanced(match.group("content")):
             continue
         block: dict[str, Any] = {
             "block_id": f"b{index}",
@@ -685,8 +739,8 @@ def apply_repair_plan(
         return body, [], plan_error
     if not plans:
         return body, [], None
-    if len(plans) > 8:
-        return body, [], "AI 修复计划超过单次最多8个局部操作"
+    if len(plans) > MAX_AI_REPAIR_PLANS:
+        return body, [], f"AI 修复计划超过单次最多{MAX_AI_REPAIR_PLANS}个局部操作"
     blocks = content_blocks(body)
     by_id = {item["block_id"]: item for item in blocks}
     segments_by_id = {
@@ -739,7 +793,11 @@ def apply_repair_plan(
         if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
             return body, [], "AI 修复置信度缺失或格式错误"
         confidence = float(raw_confidence)
-        if not math.isfinite(confidence) or confidence < 0.80 or confidence > 1:
+        if (
+            not math.isfinite(confidence)
+            or confidence < MIN_AI_REPAIR_CONFIDENCE
+            or confidence > 1
+        ):
             return body, [], "AI 修复置信度不足"
         issue_type = _normalized_issue_type(item)
         keep_target_id: str | None = None
@@ -903,6 +961,30 @@ def apply_repair_plan(
         if operation.get("keep_target_id")
     ):
         return body, [], "重复内容修复不能同时删除指定的保留目标"
+
+    removed_visible_chars = sum(
+        len(_plain_text(str(operation.get("evidence") or "")))
+        for operation in operations
+        if operation.get("action") in {"remove_block", "remove_text_line"}
+    )
+    if removed_visible_chars:
+        # Use only indexed article blocks for the denominator. This is a
+        # conservative lower bound when a body contains headings or other
+        # unsupported markup, and therefore fails closed rather than allowing
+        # a large fraction of visible article text to be deleted.
+        visible_body_chars = sum(
+            len(_plain_text(str(block.get("text") or ""))) for block in blocks
+        )
+        if removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS:
+            return body, [], "AI 修复计划删除可见文字超过单次上限"
+        # A short article can legitimately contain one standalone promotion
+        # that is large relative to the rest of the text. The absolute cap
+        # still applies; use the ratio guard only for sufficiently long bodies.
+        if (
+            visible_body_chars >= 240
+            and removed_visible_chars / visible_body_chars > MAX_AI_REPAIR_REMOVED_RATIO
+        ):
+            return body, [], "AI 修复计划删除可见文字比例超过25%"
     cleaned_parts: list[str] = []
     cursor = 0
     applied: list[dict[str, Any]] = []

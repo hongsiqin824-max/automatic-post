@@ -440,6 +440,38 @@ def test_create_article_extracts_nested_archive_id(app, monkeypatch):
     assert draft.archive_id == 6141666
 
 
+def test_create_article_sends_no_roll_recommend_field(app, monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+    submitted: dict[str, object] = {}
+
+    with app.app_context():
+        cfg = replace(
+            app.extensions["app_config"],
+            dqd_open_appid="appid-test",
+            dqd_open_appsecret="secret-test",
+            dqd_open_enname="hongsiqin",
+        )
+        client = DqdOpenClient(cfg)
+
+        def post_signed(**kwargs):
+            submitted.update(kwargs)
+            return (
+                FakeResponse(),
+                {"code": 0, "data": {"archive_id": 6141667}},
+                "https://platform.dongqiudi.com/open/v1/do",
+            )
+
+        monkeypatch.setattr(client.open_platform, "post_signed", post_signed)
+        client.create_article(
+            {"title_final": "关闭滚动推荐测试", "body_html": "<p>测试正文。</p>"},
+            {"backend_tab_id": 1},
+        )
+
+    assert ("no_roll_recommend", "1") in submitted["data"]
+
+
 def test_create_article_extracts_nested_article_id_alias(app, monkeypatch):
     class FakeResponse:
         status_code = 200

@@ -54,6 +54,22 @@ _QUALITY_MARKER_TEXT_BLOCK = re.compile(
     r"</(?P=tag)\s*>",
     re.IGNORECASE,
 )
+# ``sponichi`` publishes a CMS template as ordinary text in the translated
+# body.  These markers can occur in the same paragraph as real reporting, so
+# they must be removed as exact tokens rather than by deleting the paragraph.
+# The source check is applied by ``preprocess_quality_body``; other sources are
+# left byte-for-byte unchanged.
+_SPONICHI_TEMPLATE_MARKER = re.compile(
+    r"(?:^|(?<=\s)|(?<=>))(?:"
+    r"google_ad_section_(?:start|end)(?:\([^\r\n)]*\))?"
+    r"|前文链接|相关(?:文章)?SSI\s*[（(](?:正文|本文)中[）)]"
+    r")(?=\s|<|$)",
+    re.IGNORECASE,
+)
+_SPONICHI_TEMPLATE_LABEL = re.compile(
+    r"(?:^|(?<=\r)|(?<=\n)|(?<=>))[ \t]*(?:导语|前言|正文|本文)[ \t]*(?=\r?\n|$|<)",
+    re.IGNORECASE | re.MULTILINE,
+)
 _MARKDOWN_DESTINATION = (
     r"(?:https?://|//|/|#|\.\.?/|mailto:|tel:|javascript:|data:)"
     r"[^)\s>]+"
@@ -212,7 +228,7 @@ def remove_clickable_links(body_html: str | None) -> str:
     return _RESIDUAL_ANCHOR.sub("", cleaned)
 
 
-def preprocess_quality_body(body_html: str | None) -> str:
+def preprocess_quality_body(body_html: str | None, *, source: str | None = None) -> str:
     """Remove non-article embeds and feed markers before quality checks.
 
     This cleanup is deliberately separate from :func:`remove_clickable_links`,
@@ -224,6 +240,10 @@ def preprocess_quality_body(body_html: str | None) -> str:
     body = str(body_html or "")
     if not body:
         return body
+    source_code = str(source or "").strip().casefold()
+    has_source_template_marker = (
+        source_code == "sponichi" and _SPONICHI_TEMPLATE_MARKER.search(body) is not None
+    )
     if not (
         _ANCHOR_START.search(body)
         or _MARKDOWN_LINK.search(body)
@@ -234,6 +254,7 @@ def preprocess_quality_body(body_html: str | None) -> str:
         or _QUALITY_MARKER_TEXT_BLOCK.search(body)
         or _QUALITY_EMPTY_MARKER_BLOCK.search(body)
         or _CLICKABLE_ATTRIBUTE.search(body)
+        or has_source_template_marker
         or re.search(r"(?:brightcove|video-js|jwplayer|vjs-player|player-container)", body, re.IGNORECASE)
         or re.search(r"<\s*(?:area|embed|iframe|math|noscript|object|script|style|svg|template|video|audio)\b", body, re.IGNORECASE)
     ):
@@ -244,6 +265,9 @@ def preprocess_quality_body(body_html: str | None) -> str:
     body = _QUALITY_PLAIN_MARKER_LINE.sub("", body)
     body = _QUALITY_MARKER_TEXT_BLOCK.sub("", body)
     body = _QUALITY_EMPTY_MARKER_BLOCK.sub("", body)
+    if source_code == "sponichi":
+        body = _SPONICHI_TEMPLATE_MARKER.sub("", body)
+        body = _SPONICHI_TEMPLATE_LABEL.sub("", body)
     # Remove complete embed containers.  Unclosed tags are intentionally left
     # in place; the quality layer will flag them instead of swallowing article
     # text after a malformed upstream fragment.

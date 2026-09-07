@@ -339,6 +339,7 @@ class _StructuredPromotionLLM:
             "title_complete": True,
             "body_complete": True,
             "has_ad_or_dirty": True,
+            "repairable": True,
             "needs_review": True,
             "reason": "正文末尾含 WhatsApp 频道引流信息",
             "repair_plans": [{
@@ -501,6 +502,7 @@ class _LinePromotionLLM:
             "title_complete": True,
             "body_complete": True,
             "has_ad_or_dirty": True,
+            "repairable": True,
             "needs_review": True,
             "reason": "正文含独立视频引流行",
             "repair_plans": [{
@@ -633,6 +635,44 @@ def test_repairable_promotion_plan_allows_needs_review_false_from_ai():
     assert result["repair_plan_error"] is None
     assert result["needs_review"] is True
     assert result["issues"]["dirty_content"]
+
+
+class _MissingRepairablePromotionLLM:
+    configured = True
+
+    def chat_json(self, prompt):
+        return {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "needs_review": True,
+            "reason": "正文末尾存在可定位的推广段落",
+            "repair_plans": [{
+                "block_id": "b2",
+                "action": "remove_block",
+                "evidence": "点击这里关注 WhatsApp 频道，获取最新消息",
+                "issue_type": "advertisement",
+                "reason": "独立推广内容，与新闻事实无关",
+                "confidence": 0.99,
+            }],
+        }
+
+
+def test_repair_plan_requires_explicit_repairable_true():
+    result = evaluate(
+        title="球队公布本轮联赛完整比赛结果",
+        body=(
+            "<p>球队在本轮联赛中取胜，报道包含进球过程、球员表现和赛后采访。</p>"
+            "<p>点击这里关注 WhatsApp 频道，获取最新消息</p>"
+        ),
+        channels=[1],
+        llm=_MissingRepairablePromotionLLM(),
+    )
+
+    assert result["pass"] is False
+    assert result["repair_plans"]
+    assert result["repair_plan_error"] == "AI 修复计划与 repairable 结论矛盾"
+    assert result["issues"]["semantic_problems"]
 
 
 class _IncompleteBodyWithPlanLLM:

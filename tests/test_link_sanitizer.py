@@ -123,3 +123,30 @@ def test_quality_preprocess_keeps_undefined_markdown_reference_text():
     body = "<p>正文内容足够完整，参见[注释][x]中的比赛时间。</p>"
 
     assert preprocess_quality_body(body) == body
+
+
+def test_sponichi_template_markers_are_removed_without_dropping_news_text():
+    body = (
+        "<p>google_ad_section_start(name=s1)\n导语\n"
+        "主帅在赛前介绍了球队状态。 前文链接\n相关SSI(正文中)</p>"
+        "<p><img src=\"/story.jpg\"></p>"
+        "<p>正文\n球队将在周末出战。 google_ad_section_end(name=s1)</p>"
+    )
+
+    cleaned = preprocess_quality_body(body, source="sponichi")
+
+    assert "google_ad_section" not in cleaned
+    assert "前文链接" not in cleaned
+    assert "相关SSI" not in cleaned
+    assert "导语" not in cleaned
+    assert "<p>正文" not in cleaned
+    assert "主帅在赛前介绍了球队状态。" in cleaned
+    assert "球队将在周末出战。" in cleaned
+    assert '<img src="/story.jpg">' in cleaned
+    assert preprocess_quality_body(cleaned, source="sponichi") == cleaned
+
+
+def test_sponichi_template_cleanup_does_not_apply_to_other_sources():
+    body = "<p>正文\n主帅介绍了球队状态。 google_ad_section_end(name=s1)</p>"
+
+    assert preprocess_quality_body(body, source="foxsprt") == body

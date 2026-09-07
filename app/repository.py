@@ -12,6 +12,7 @@ from typing import Any, Iterable, Mapping, Optional
 from .db import get_db, _prepare_connection
 from .origin_identity import source_origin_key
 from .services.article_images import _usable_image_src
+from .services.channel_filter import filter_blocked_channels
 from .services.link_sanitizer import remove_clickable_links
 
 
@@ -1194,7 +1195,7 @@ def _normalise_channels(channels: Any) -> list[int]:
             number = int(text)
             if number not in result:
                 result.append(number)
-    return result
+    return filter_blocked_channels(result)
 
 
 def upsert_material(material: Mapping[str, Any], connection=None) -> dict:
@@ -2506,7 +2507,9 @@ def manual_review_update(article_id: int, action: str, connection=None, *,
         else remove_clickable_links(str(body_html))
     )
     final_litpic = current["litpic"] if litpic is None else str(litpic)
-    final_channels = current["channels"] if channels is None else _normalise_channels(channels)
+    final_channels = _normalise_channels(
+        current["channels"] if channels is None else channels
+    )
     if action_status == "READY_TO_PUBLISH" and int(current.get("upstream_archive_id") or 0) > 0:
         action_status = "ALREADY_PUBLISHED"
     quality = dict(current.get("quality") or {})

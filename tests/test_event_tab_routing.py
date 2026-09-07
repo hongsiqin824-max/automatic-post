@@ -13,7 +13,7 @@ def _material(source_url: str, user_name: str, **overrides):
         "source_url": source_url,
         "translate_title": "测试赛事栏目路由",
         "translate_body": "<p>这是一篇用于验证赛事栏目路由的完整测试正文。</p>",
-        "channels": [11, 22],
+        "channels": [11, 12],
         "user_name": user_name,
     }
     item.update(overrides)
@@ -120,7 +120,7 @@ def test_team_rule_wins_and_unconfigured_team_falls_back_to_league(app):
         assert team_match["route_rule_id"] == team_rule["id"]
         assert team_match["route_league"] == "jleague"
         assert team_match["route_team"] == "marinos"
-        assert team_match["channels"] == [11, 22]
+        assert team_match["channels"] == [11, 12]
 
         assert league_match["backend_tab_ids"] == [58, 349]
         assert league_match["route_match_type"] == "league"

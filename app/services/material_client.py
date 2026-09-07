@@ -10,6 +10,8 @@ from urllib.parse import urljoin
 
 import requests
 
+from .channel_filter import filter_blocked_channels
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,7 +51,7 @@ def _as_channels(value: Any) -> list[int]:
         if channel_id not in seen:
             seen.add(channel_id)
             result.append(channel_id)
-    return result
+    return filter_blocked_channels(result)
 
 
 def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
