@@ -48,10 +48,10 @@ def test_normalize_item_filters_blacklisted_channels_without_changing_raw_payloa
         "translate_body": "<p>正文</p>",
         "source": "marca",
         "source_url": "https://example.com/channel-filter",
-        "channels": [89, 845616, 93, 189],
+        "channels": [89, 700000001, 93, 189],
     }
 
     normalized = normalize_item(raw)
 
-    assert normalized["channels"] == [845616, 189]
-    assert normalized["raw_payload"]["channels"] == [89, 845616, 93, 189]
+    assert normalized["channels"] == [700000001, 189]
+    assert normalized["raw_payload"]["channels"] == [89, 700000001, 93, 189]

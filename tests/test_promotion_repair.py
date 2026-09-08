@@ -153,7 +153,7 @@ def test_ai_repair_plan_removes_unknown_program_promotion_line() -> None:
     }
 
 
-def test_unknown_promotion_requires_valid_issue_type_and_reason() -> None:
+def test_exact_line_plan_does_not_require_issue_type_or_reason() -> None:
     body = (
         f"<p>球队已经确认本轮首发名单。\n{PROGRAM_PROMOTION}\n"
         "赛后报道还将继续更新球员数据。</p>"
@@ -174,9 +174,9 @@ def test_unknown_promotion_requires_valid_issue_type_and_reason() -> None:
         {"issue_type": "program_promotion", "reason": "这是一段内容"},
     ):
         cleaned, matches, error = apply_repair_plan(body, {**base, **extra})
-        assert cleaned == body
-        assert matches == []
-        assert error
+        assert error is None
+        assert PROGRAM_PROMOTION not in cleaned
+        assert len(matches) == 1
 
 
 def test_ai_repair_plan_accepts_explicit_br_line_boundary() -> None:
@@ -439,7 +439,7 @@ def test_ai_plan_removes_scoreboard_marker_when_reason_uses_guidance_wording():
     assert matches[0]["validation"] == "fixed_promotion_rule"
 
 
-def test_scoreboard_marker_without_ai_category_is_not_removed():
+def test_exact_scoreboard_block_plan_does_not_require_ai_category():
     body = (
         f"<p>报道完整介绍了球员转会背景、合同安排和球队计划。</p>"
         f"<p>{SCOREBOARD_MARKER}</p>"
@@ -453,9 +453,9 @@ def test_scoreboard_marker_without_ai_category_is_not_removed():
         "confidence": 0.99,
     })
 
-    assert cleaned == body
-    assert matches == []
-    assert "必须提供明确" in str(error)
+    assert error is None
+    assert SCOREBOARD_MARKER not in cleaned
+    assert matches[0]["validation"] == "fixed_promotion_rule"
 
 
 def test_high_confidence_plan_is_not_rejected_only_for_deletion_ratio():
@@ -568,7 +568,7 @@ def test_ai_repair_plan_rejects_removed_text_over_twenty_five_percent() -> None:
     assert "比例超过25%" in str(error)
 
 
-def test_ai_plan_rejects_normal_news_even_with_promotional_reason():
+def test_exact_high_confidence_block_plan_does_not_require_allowed_issue_type():
     evidence = "球队本轮取得胜利，教练引导球员保持阵型并继续施压，最终赢得比赛。"
     body = f"<p>{evidence}</p><p>报道还补充了赛后采访和球队后续训练安排。</p>"
 
@@ -581,12 +581,12 @@ def test_ai_plan_rejects_normal_news_even_with_promotional_reason():
         "confidence": 0.99,
     })
 
-    assert cleaned == body
-    assert matches == []
-    assert "未命中可处理" in str(error)
+    assert error is None
+    assert evidence not in cleaned
+    assert matches[0]["validation"] == "ai_exact_target"
 
 
-def test_ai_plan_rejects_normal_watch_sentence_even_with_allowed_category():
+def test_exact_high_confidence_block_plan_does_not_require_promotion_shape():
     evidence = "在 ge 体育场，球迷观看了比赛，随后为球队的获胜欢呼。"
     context = "报道还完整回顾了比赛过程、关键进球以及主教练在赛后的采访。"
     body = f"<p>{evidence}</p><p>{context}</p><p>{context}</p>"
@@ -600,12 +600,12 @@ def test_ai_plan_rejects_normal_watch_sentence_even_with_allowed_category():
         "confidence": 0.99,
     })
 
-    assert cleaned == body
-    assert matches == []
-    assert "未命中可处理" in str(error)
+    assert error is None
+    assert evidence not in cleaned
+    assert matches[0]["validation"] == "ai_exact_target"
 
 
-def test_ai_plan_rejects_news_sentences_starting_with_watch_or_sponsorship_terms():
+def test_exact_high_confidence_plans_do_not_depend_on_wording_shape():
     context = "报道还完整回顾了比赛过程、关键进球以及主教练在赛后的采访。"
     for evidence in (
         "观看 Globo 播出的比赛后，主教练分析了球队本轮的防守表现。",
@@ -634,9 +634,9 @@ def test_ai_plan_rejects_news_sentences_starting_with_watch_or_sponsorship_terms
             "confidence": 0.99,
         })
 
-        assert cleaned == body
-        assert matches == []
-        assert "未命中可处理" in str(error)
+        assert error is None
+        assert evidence not in cleaned
+        assert matches[0]["validation"] == "ai_exact_target"
 
 
 def test_ai_repair_plan_requires_allowlisted_tail_promotion_and_exact_evidence() -> None:
@@ -669,17 +669,21 @@ def test_ai_repair_plan_requires_allowlisted_tail_promotion_and_exact_evidence()
     assert [item["block_id"] for item in matches] == ["b2", "b3"]
 
 
-def test_ai_repair_plan_rejects_non_promotion_or_untrusted_plan() -> None:
+def test_ai_repair_plan_accepts_exact_target_without_type_but_rejects_untrusted_plan() -> None:
     body = '<p>这是一段完整的比赛报道，包含比赛过程、球员表现和赛后采访信息。</p>'
     block = content_blocks(body)[0]
 
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": block["block_id"],
+        "action": "remove_block",
+        "evidence": block["text"],
+        "confidence": 0.99,
+    })
+    assert error is None
+    assert cleaned == ""
+    assert matches[0]["validation"] == "ai_exact_target"
+
     for plan in (
-        {
-            "block_id": block["block_id"],
-            "action": "remove_block",
-            "evidence": block["text"],
-            "confidence": 0.99,
-        },
         {
             "block_id": block["block_id"],
             "action": "remove_block",
@@ -820,7 +824,7 @@ def test_general_extraneous_content_plan_removes_exact_plain_text_block() -> Non
 
 
 @pytest.mark.parametrize("prefix", ["【官方】", "【伤停】", "【赛果】", "[Official]"])
-def test_general_issue_type_cannot_delete_normal_labeled_news_fact_paragraph(
+def test_exact_plan_can_delete_labeled_block_without_type_allowlist(
     prefix: str,
 ) -> None:
     evidence = f"{prefix}俱乐部宣布张伟将在9月10日续约至2028年。"
@@ -835,9 +839,9 @@ def test_general_issue_type_cannot_delete_normal_labeled_news_fact_paragraph(
         "confidence": 0.99,
     })
 
-    assert cleaned == body
-    assert matches == []
-    assert "未命中可处理" in str(error)
+    assert error is None
+    assert evidence not in cleaned
+    assert matches[0]["validation"] == "ai_exact_target"
 
 
 def test_structural_label_with_cta_and_artifact_reason_can_be_removed() -> None:
@@ -868,7 +872,7 @@ def test_structural_label_with_cta_and_artifact_reason_can_be_removed() -> None:
         "【直播】主教练赛后表示球队发挥出色。",
     ],
 )
-def test_structural_label_without_cta_cannot_delete_news_fact(
+def test_exact_plan_can_delete_structural_label_without_cta(
     evidence: str,
 ) -> None:
     body = f"<p>{evidence}</p><p>报道还介绍了球队的备战情况。</p>"
@@ -882,9 +886,35 @@ def test_structural_label_without_cta_cannot_delete_news_fact(
         "confidence": 0.99,
     })
 
-    assert cleaned == body
-    assert matches == []
-    assert "未命中可处理" in str(error)
+    assert error is None
+    assert evidence not in cleaned
+    assert matches[0]["validation"] == "ai_exact_target"
+
+
+def test_exact_plan_removes_unrelated_customer_service_block() -> None:
+    news = (
+        "在3-0战胜沙尔克开局后，奥格斯堡又在客场4-1大胜法兰克福，"
+        "并在队史首次登上积分榜榜首。"
+    )
+    customer_service = (
+        "在我们的常见问题中，你可以找到许多关于使用 kicker+ 以及排查问题的实用提示和解答。"
+        "如果你仍有疑问，请通过 +(0) 911 477 911 11 联系我们的客户服务，"
+        "或发送电子邮件至 service@kicker.de。"
+    )
+    body = f"<p>{news}</p>\n<p>{customer_service}</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": customer_service,
+        "issue_type": "extraneous_content",
+        "reason": "该段与比赛报道无关，删除不会影响新闻事实。",
+        "confidence": 0.98,
+    })
+
+    assert error is None
+    assert cleaned == f"<p>{news}</p>\n"
+    assert matches[0]["validation"] == "ai_exact_target"
 
 
 def test_minor_text_defect_replaces_only_the_exact_plain_text_block() -> None:

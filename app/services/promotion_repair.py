@@ -2,9 +2,11 @@
 
 The material feed occasionally appends a call-to-action as a normal ``<p>``
 element instead of a link.  This module only removes a complete, plain-text
-block when its wording is an unambiguous promotion.  Uncertain content is
-left untouched and the caller can route it to manual review.  It also exposes
-a narrow photo-credit normalizer which preserves the human-readable caption.
+block when its wording is an unambiguous promotion.  AI-planned removals use
+exact block or line references instead of a wording allowlist; the caller still
+runs structural safeguards and a complete second quality check before commit.
+It also exposes a narrow photo-credit normalizer which preserves the
+human-readable caption.
 """
 
 from __future__ import annotations
@@ -803,14 +805,6 @@ def apply_repair_plan(
         keep_target_id: str | None = None
         if duplicate_action and issue_type != "duplicate_content":
             return body, [], "重复删除动作必须使用 duplicate_content 类型"
-        if (
-            (
-                _SCOREBOARD_MARKER_RE.fullmatch(evidence)
-                or _VIDEO_TEASER_RE.fullmatch(evidence)
-            )
-            and (item.get("issue_type") is None or item.get("reason") is None)
-        ):
-            return body, [], "媒体或榜单标记必须提供明确的 AI 推广类别和原因"
         if action == "remove_text_line":
             if segment is None:
                 return body, [], "行级修复必须提供 segment_id"
@@ -822,12 +816,6 @@ def apply_repair_plan(
                 item, evidence, fixed_marker=known_promotion_line
             )
             ai_general_removal = _is_ai_general_removal_plan(item)
-            if not known_promotion_line and not ai_promotion and not ai_general_removal:
-                return body, [], "AI 修复目标未命中可处理的局部问题类型"
-            if known_promotion_line and (
-                item.get("issue_type") is not None or item.get("reason") is not None
-            ) and not ai_promotion and not ai_general_removal:
-                return body, [], "AI 修复推广类别或原因无效"
             if issue_type == "duplicate_content":
                 keep_id = str(item.get("keep_segment_id") or "").strip().lower()
                 keep_pair = segments_by_id.get(keep_id)
@@ -860,7 +848,9 @@ def apply_repair_plan(
                 "validation": (
                     "fixed_promotion_rule"
                     if known_promotion_line else (
-                        "ai_general_issue" if ai_general_removal else "ai_promotion_category"
+                        "ai_general_issue" if ai_general_removal else (
+                            "ai_promotion_category" if ai_promotion else "ai_exact_target"
+                        )
                     )
                 ),
             })
@@ -872,23 +862,7 @@ def apply_repair_plan(
             item, evidence, fixed_marker=known_promotion_block
         )
         ai_general_removal = _is_ai_general_removal_plan(item)
-        if (
-            block_identity not in allowed_photo_credits
-            and not known_promotion_block
-            and not ai_promotion
-            and not ai_general_removal
-            and action != "replace_text"
-        ):
-            return body, [], "AI 修复目标未命中可处理的局部问题类型"
-        if known_promotion_block and (
-            item.get("issue_type") is not None or item.get("reason") is not None
-        ) and not ai_promotion and not ai_general_removal:
-            return body, [], "AI 修复推广类别或原因无效"
         if action == "remove_block":
-            if not known_promotion_block and not ai_promotion and not ai_general_removal:
-                return body, [], "图片署名只能规范化，不能删除所在正文块"
-            if not known_promotion_block and len(block.get("segments") or []) != 1:
-                return body, [], "AI 局部修复块包含多行内容，请改用行级修复"
             if issue_type == "duplicate_content":
                 keep_id = str(item.get("keep_block_id") or "").strip().lower()
                 keep_block = by_id.get(keep_id)
@@ -941,7 +915,9 @@ def apply_repair_plan(
                     if known_promotion_block else (
                         "ai_general_issue"
                         if ai_general_removal or issue_type in _AI_REPLACEMENT_ISSUE_TYPES
-                        else "ai_promotion_category"
+                        else (
+                            "ai_promotion_category" if ai_promotion else "ai_exact_target"
+                        )
                     )
                 )
             ),

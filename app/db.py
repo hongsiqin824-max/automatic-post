@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS articles (
     review_note          TEXT,
     reviewed_at          TEXT,
     published_at         TEXT,
+    published_tab_names_json TEXT NOT NULL DEFAULT '[]',
     created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     last_seen_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -193,6 +194,27 @@ CREATE TABLE IF NOT EXISTS settings (
     value_json TEXT NOT NULL DEFAULT 'null',
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS report_deliveries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_start    TEXT NOT NULL,
+    period_end      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'PENDING'
+                    CHECK (status IN ('PENDING', 'SENDING', 'SENT', 'FAILED')),
+    attempts        INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    claim_token     TEXT,
+    claimed_at      TEXT,
+    next_attempt_at TEXT,
+    sent_at         TEXT,
+    response_json   TEXT NOT NULL DEFAULT '{}',
+    error           TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (period_start, period_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_deliveries_status_retry
+    ON report_deliveries(status, next_attempt_at);
 
 CREATE TABLE IF NOT EXISTS open_platform_auth (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -281,6 +303,7 @@ def init_db(database: Optional[PathLike] = None) -> None:
         _migrate_article_quality_claim(connection)
         _migrate_source_publish_mode(connection)
         _migrate_tab_and_article_publish_mode(connection)
+        _migrate_article_published_tabs(connection)
         _migrate_tab_fallback_litpic(connection)
         _migrate_event_tab_routing(connection)
         seed_event_tab_rules(connection)
@@ -625,6 +648,20 @@ def _migrate_tab_and_article_publish_mode(connection: sqlite3.Connection) -> Non
         if "publish_mode_decided_at" not in article_columns:
             connection.execute(
                 "ALTER TABLE articles ADD COLUMN publish_mode_decided_at TEXT"
+            )
+
+
+def _migrate_article_published_tabs(connection: sqlite3.Connection) -> None:
+    """Add the immutable column-name snapshot used by historical reports."""
+
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(articles)").fetchall()
+    }
+    if "published_tab_names_json" not in columns:
+        with connection:
+            connection.execute(
+                "ALTER TABLE articles ADD COLUMN published_tab_names_json TEXT NOT NULL DEFAULT '[]'"
             )
 
 

@@ -134,12 +134,12 @@ def test_material_unique_key_and_external_ids_are_separate(app):
 def test_upsert_material_filters_channels_but_keeps_raw_payload(app):
     with app.app_context():
         article = repo.upsert_material(_material(
-            channels=[89, 845616, 93, 189],
-            raw_payload={"channels": [89, 845616, 93, 189]},
+            channels=[89, 700000001, 93, 189],
+            raw_payload={"channels": [89, 700000001, 93, 189]},
         ))["article"]
 
-        assert article["channels"] == [845616, 189]
-        assert article["raw"] == {"channels": [89, 845616, 93, 189]}
+        assert article["channels"] == [700000001, 189]
+        assert article["raw"] == {"channels": [89, 700000001, 93, 189]}
 
 
 def test_list_articles_filters_by_created_time_newest_first(app):

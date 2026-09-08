@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from .blocked_player_channels import BLOCKED_PLAYER_CHANNEL_IDS
+
 
 # These are generic or unwanted backend tags that must not be sent with an
 # article.  Match numeric IDs exactly so a valid tag such as 189 is retained.
-BLOCKED_CHANNEL_IDS = frozenset({
+_BLOCKED_TEAM_AND_BACKEND_IDS = frozenset({
     # 通用/后台标签
     5, 6, 7, 9, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 26, 29,
     60, 61, 62, 63, 79, 80, 81, 82, 85, 86, 87, 88, 93, 94, 96, 105,
@@ -131,6 +133,11 @@ BLOCKED_CHANNEL_IDS = frozenset({
     13861245,  # 重庆铜梁龙
     1841208,   # 辽宁铁人
 })
+
+
+# The full blacklist is the curated team/backend tags plus every player tag
+# ID exported from 五大联赛及中超球员标签.csv (see blocked_player_channels.py).
+BLOCKED_CHANNEL_IDS = _BLOCKED_TEAM_AND_BACKEND_IDS | BLOCKED_PLAYER_CHANNEL_IDS
 
 
 def filter_blocked_channels(channels: Iterable[Any] | None) -> list[int]:

@@ -1166,10 +1166,13 @@ def test_pipeline_applies_scoreboard_ai_plan_with_guidance_reason_and_preserves_
         conn.close()
 
 
-def test_pipeline_rejects_ai_plan_for_normal_news_paragraph(app, monkeypatch) -> None:
+def test_pipeline_runs_second_quality_for_exact_plan_without_allowed_type(
+    app, monkeypatch
+) -> None:
     database = app.config["DATABASE"]
     _enable_source(database)
-    body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}"
+    retained = "报道还补充了双方主教练的赛后采访、关键球员表现以及下一轮备战安排。"
+    body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{retained}</p>"
     _fetch(monkeypatch, [_item("ai-plan-rejected", body=body)])
     first = deepcopy(FIRST_DIRTY)
     first.update({
@@ -1185,18 +1188,31 @@ def test_pipeline_rejects_ai_plan_for_normal_news_paragraph(app, monkeypatch) ->
         }],
         "repair_plan_error": None,
     })
-    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: first)
+    calls: list[dict] = []
+    answers = iter([first, deepcopy(SECOND_PASS)])
 
-    run_once(_config(database))
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return next(answers)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(calls) == 2
+    assert ARTICLE_TEXT in calls[0]["body"]
+    assert ARTICLE_TEXT not in calls[1]["body"]
 
     conn = _connect(database)
     try:
         article = repo.list_articles(conn)[0]
-        assert article["status"] == "NEEDS_REVIEW"
-        assert article["body_html"] == body
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert article["body_html"] == f"{IMAGE}<p>{retained}</p>"
         repair = article["quality"]["promotion_repair"]
-        assert repair["applied"] is False
-        assert "未命中可处理" in repair["plan_error"]
+        assert repair["applied"] is True
+        assert repair["outcome"] == "passed"
+        assert repair["matches"][0]["validation"] == "ai_exact_target"
     finally:
         conn.close()
 

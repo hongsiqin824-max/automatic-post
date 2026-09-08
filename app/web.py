@@ -31,6 +31,7 @@ from .services.article_images import (
 from .services.open_platform import AUTH_STATUS_LABELS, OpenPlatformClient, auth_record_summary, build_draft_url
 from .services.pipeline import RunController, recheck_article
 from .services.scheduler import Scheduler
+from .services.feishu_report import FeishuReportController, FeishuReportScheduler
 from .services.dqd_open_client import DqdOpenClientError
 from .services.publisher import (
     DraftClaimSkipped,
@@ -641,6 +642,11 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     controller = RunController(cfg)
     confirmation_controller = DraftConfirmationController(cfg)
+    feishu_report_controller = FeishuReportController(cfg)
+    feishu_report_scheduler = FeishuReportScheduler(
+        feishu_report_controller,
+        cfg.feishu_report_check_interval_seconds,
+    )
     scheduler = Scheduler(
         controller,
         cfg.scheduler_interval_seconds,
@@ -649,11 +655,15 @@ def create_app(test_config: dict | None = None) -> Flask:
     )
     app.extensions["run_controller"] = controller
     app.extensions["draft_confirmation_controller"] = confirmation_controller
+    app.extensions["feishu_report_controller"] = feishu_report_controller
+    app.extensions["feishu_report_scheduler"] = feishu_report_scheduler
     app.extensions["scheduler"] = scheduler
     with app.app_context():
         scheduler_enabled = bool(repo.get_setting("scheduler_enabled", cfg.scheduler_enabled))
     if scheduler_enabled and not app.config.get("TESTING") and not test_config:
         scheduler.start()
+    if cfg.feishu_report_configured and not app.config.get("TESTING") and not test_config:
+        feishu_report_scheduler.start()
 
     app.jinja_env.globals["cdn_url"] = cdn_url
     app.jinja_env.globals["status_label"] = lambda value: STATUS_LABELS.get(value, value)

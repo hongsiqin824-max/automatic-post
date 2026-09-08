@@ -129,6 +129,27 @@ class AppConfig:
         60, _env_int("AUTOMATIC_POST_INTERVAL_SECONDS", 600)
     )
 
+    # Daily direct-publish report sent to a Feishu group bot.  The webhook is
+    # intentionally supplied through the environment rather than committed.
+    feishu_report_webhook_url: str = os.getenv(
+        "FEISHU_REPORT_WEBHOOK_URL", ""
+    ).strip()
+    feishu_report_enabled: bool = _env_bool("FEISHU_REPORT_ENABLED", True)
+    feishu_report_hour: int = max(0, min(23, _env_int("FEISHU_REPORT_HOUR", 19)))
+    feishu_report_minute: int = max(0, min(59, _env_int("FEISHU_REPORT_MINUTE", 0)))
+    feishu_report_timeout_seconds: int = max(
+        5, _env_int("FEISHU_REPORT_TIMEOUT_SECONDS", 10)
+    )
+    feishu_report_retry_seconds: int = max(
+        60, _env_int("FEISHU_REPORT_RETRY_SECONDS", 300)
+    )
+    feishu_report_stale_seconds: int = max(
+        300, _env_int("FEISHU_REPORT_STALE_SECONDS", 900)
+    )
+    feishu_report_check_interval_seconds: int = max(
+        15, min(3600, _env_int("FEISHU_REPORT_CHECK_INTERVAL_SECONDS", 30))
+    )
+
     # Open-platform article creation is a write operation, so it stays behind
     # an explicit flag even when credentials are present.
     publisher_enabled: bool = _env_bool("AUTOMATIC_POST_PUBLISHER", False)
@@ -148,6 +169,10 @@ class AppConfig:
     @property
     def dqd_open_configured(self) -> bool:
         return bool(self.dqd_open_appid and self.dqd_open_appsecret and self.dqd_open_enname)
+
+    @property
+    def feishu_report_configured(self) -> bool:
+        return bool(self.feishu_report_enabled and self.feishu_report_webhook_url)
 
 
 def ensure_instance_dir() -> None:

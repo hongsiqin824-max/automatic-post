@@ -1802,6 +1802,51 @@ def count_articles(connection=None, *, status: Optional[str] = None,
     return int(conn.execute("SELECT COUNT(*) FROM articles" + where, params).fetchone()[0])
 
 
+def direct_publish_report(period_start: str, period_end: str, connection=None) -> dict[str, Any]:
+    """Return direct-publish counts for one UTC time window.
+
+    The query keeps the article-to-tab relation used at publish time.  An
+    article mapped to multiple tabs is counted once under each tab, while the
+    total article count remains deduplicated.
+    """
+
+    conn = _conn(connection)
+    rows = conn.execute(
+        """
+        SELECT a.id AS article_id, a.published_tab_names_json,
+               a.tab_id AS legacy_tab_id, legacy.name AS legacy_tab_name
+        FROM articles a
+        LEFT JOIN tabs legacy ON legacy.id=a.tab_id
+        WHERE a.status='PUBLISHED'
+          AND a.publish_mode=1
+          AND a.published_at >= ?
+          AND a.published_at < ?
+        ORDER BY a.id
+        """,
+        (str(period_start), str(period_end)),
+    ).fetchall()
+    article_ids = {int(row["article_id"]) for row in rows}
+    counts: dict[str, int] = {}
+    for row in rows:
+        names = _loads(row["published_tab_names_json"], [])
+        if not isinstance(names, list) or not names:
+            tabs = _tabs_for_article_id(int(row["article_id"]), conn)
+            names = [tab.get("name") for tab in tabs if tab.get("name")]
+        if not names and row["legacy_tab_name"]:
+            names = [row["legacy_tab_name"]]
+        if not names:
+            names = ["未配置栏目"]
+        for tab_name in dict.fromkeys(str(name).strip() for name in names if str(name).strip()):
+            counts[tab_name] = counts.get(tab_name, 0) + 1
+    return {
+        "article_count": len(article_ids),
+        "tab_counts": [
+            {"name": name, "count": count}
+            for name, count in sorted(counts.items(), key=lambda item: item[0])
+        ],
+    }
+
+
 def article_counts(connection=None) -> dict[str, int]:
     rows = _conn(connection).execute(
         "SELECT status, COUNT(*) AS count FROM articles GROUP BY status"
@@ -1826,6 +1871,13 @@ def transition_status(article_id: int, to_status: str, connection=None, *, messa
     old_status = from_status or current["status"]
     now = _now()
     preserve_error = to_status in {"ERROR", "PUBLISH_FAILED"}
+    published_tab_names = [
+        str(tab.get("name") or "").strip()
+        for tab in (current.get("tabs") or [])
+        if str(tab.get("name") or "").strip()
+    ]
+    if not published_tab_names and current.get("tab_name"):
+        published_tab_names = [str(current["tab_name"]).strip()]
     clauses = ["id=?"]
     params: list[Any] = [article_id]
     if quality_claim_token is not None:
@@ -1833,12 +1885,14 @@ def transition_status(article_id: int, to_status: str, connection=None, *, messa
         params.append(str(quality_claim_token))
     with conn:
         cursor = conn.execute(
-            "UPDATE articles SET status=?, error=?, published_at=CASE WHEN ?='PUBLISHED' THEN COALESCE(published_at, ?) ELSE published_at END, updated_at=? WHERE " + " AND ".join(clauses),
+            "UPDATE articles SET status=?, error=?, published_at=CASE WHEN ?='PUBLISHED' THEN COALESCE(published_at, ?) ELSE published_at END, published_tab_names_json=CASE WHEN ?='PUBLISHED' AND (published_tab_names_json IS NULL OR published_tab_names_json='[]') THEN ? ELSE published_tab_names_json END, updated_at=? WHERE " + " AND ".join(clauses),
             (
                 to_status,
                 (message or current.get("error")) if preserve_error else None,
                 to_status,
                 now,
+                to_status,
+                _json(published_tab_names, []),
                 now,
                 *params,
             ),
@@ -1889,6 +1943,13 @@ def transition_status_if_current(
 
     now = _now()
     preserve_error = to_status in {"ERROR", "PUBLISH_FAILED"}
+    published_tab_names = [
+        str(tab.get("name") or "").strip()
+        for tab in (current.get("tabs") or [])
+        if str(tab.get("name") or "").strip()
+    ]
+    if not published_tab_names and current.get("tab_name"):
+        published_tab_names = [str(current["tab_name"]).strip()]
     clauses = ["id=?"]
     params: list[Any] = [article_id]
     if allowed is not None:
@@ -1901,12 +1962,14 @@ def transition_status_if_current(
 
     with conn:
         cursor = conn.execute(
-            "UPDATE articles SET status=?, error=?, published_at=CASE WHEN ?='PUBLISHED' THEN COALESCE(published_at, ?) ELSE published_at END, updated_at=? WHERE " + " AND ".join(clauses),
+            "UPDATE articles SET status=?, error=?, published_at=CASE WHEN ?='PUBLISHED' THEN COALESCE(published_at, ?) ELSE published_at END, published_tab_names_json=CASE WHEN ?='PUBLISHED' AND (published_tab_names_json IS NULL OR published_tab_names_json='[]') THEN ? ELSE published_tab_names_json END, updated_at=? WHERE " + " AND ".join(clauses),
             (
                 to_status,
                 (message or current.get("error")) if preserve_error else None,
                 to_status,
                 now,
+                to_status,
+                _json(published_tab_names, []),
                 now,
                 *params,
             ),
@@ -2203,6 +2266,13 @@ def record_draft_confirmation_result(
     if current_claim_token and str(claim_token or "") != current_claim_token:
         return None
     now = _now()
+    published_tab_names = [
+        str(tab.get("name") or "").strip()
+        for tab in (current.get("tabs") or [])
+        if str(tab.get("name") or "").strip()
+    ]
+    if not published_tab_names and current.get("tab_name"):
+        published_tab_names = [str(current["tab_name"]).strip()]
     archive_id = 0 if dqd_archive_id in (None, "") else int(dqd_archive_id)
     if outcome_key == "CREATED" and archive_id <= 0:
         raise ValueError("dqd_archive_id is required when outcome is CREATED")
@@ -2257,7 +2327,10 @@ def record_draft_confirmation_result(
             SET status=?, dqd_archive_id=?, upstream_request_id=?,
                 draft_next_confirm_at=?, draft_uncertain_since=?,
                 draft_confirm_claimed_at=NULL, draft_confirm_claim_token=NULL,
-                error=?, updated_at=?
+                error=?,
+                published_at=CASE WHEN ?='PUBLISHED' THEN COALESCE(published_at, ?) ELSE published_at END,
+                published_tab_names_json=CASE WHEN ?='PUBLISHED' AND (published_tab_names_json IS NULL OR published_tab_names_json='[]') THEN ? ELSE published_tab_names_json END,
+                updated_at=?
             WHERE """ + " AND ".join(clauses),
             (
                 target_status,
@@ -2266,6 +2339,10 @@ def record_draft_confirmation_result(
                 confirm_at,
                 uncertain_since,
                 error,
+                target_status,
+                now,
+                target_status,
+                _json(published_tab_names, []),
                 now,
                 *params,
             ),
@@ -2661,6 +2738,199 @@ def set_setting(key: str, value: Any, connection=None) -> Any:
             (str(key), _json(value, None), _now()),
         )
     return value
+
+
+def claim_report_delivery(
+    period_start: str,
+    period_end: str,
+    connection=None,
+    *,
+    retry_after_seconds: int = 300,
+    stale_after_seconds: int = 900,
+) -> dict[str, Any] | None:
+    """Claim one report period so only one process sends it."""
+
+    conn = _conn(connection)
+    now = datetime.now(timezone.utc)
+    now_text = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+    token = uuid.uuid4().hex
+    with conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO report_deliveries
+            (period_start, period_end, status, next_attempt_at, created_at, updated_at)
+            VALUES (?, ?, 'PENDING', ?, ?, ?)
+            """,
+            (str(period_start), str(period_end), now_text, now_text, now_text),
+        )
+        row = conn.execute(
+            "SELECT * FROM report_deliveries WHERE period_start=? AND period_end=?",
+            (str(period_start), str(period_end)),
+        ).fetchone()
+        if row is None:
+            return None
+        retry_at = row["next_attempt_at"]
+        due = not retry_at or str(retry_at) <= now_text
+        stale = bool(
+            row["status"] == "SENDING"
+            and row["claimed_at"]
+            and row["next_attempt_at"]
+            and str(row["claimed_at"]) <= (
+                now - timedelta(seconds=max(1, int(stale_after_seconds)))
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        )
+        if row["status"] not in {"PENDING", "FAILED"} and not stale:
+            return None
+        if row["status"] in {"PENDING", "FAILED"} and not due:
+            return None
+        cursor = conn.execute(
+            """
+            UPDATE report_deliveries
+            SET status='SENDING', attempts=attempts+1, claim_token=?, claimed_at=?,
+                next_attempt_at=?, error=NULL, updated_at=?
+            WHERE id=? AND (
+                status IN ('PENDING','FAILED')
+                OR (status='SENDING' AND claimed_at=?)
+            )
+            """,
+            (
+                token,
+                now_text,
+                (now + timedelta(seconds=max(1, int(retry_after_seconds))))
+                .isoformat(timespec="seconds").replace("+00:00", "Z"),
+                now_text,
+                int(row["id"]),
+                row["claimed_at"],
+            ),
+        )
+        if cursor.rowcount != 1:
+            return None
+        claimed = conn.execute(
+            "SELECT * FROM report_deliveries WHERE id=?", (int(row["id"]),)
+        ).fetchone()
+    return _row(claimed)
+
+
+def next_report_period(
+    latest_period_start: str,
+    latest_period_end: str,
+    connection=None,
+) -> tuple[str, str]:
+    """Choose a failed period first, otherwise the next unsent daily period."""
+
+    conn = _conn(connection)
+    pending = conn.execute(
+        """
+        SELECT period_start, period_end
+        FROM report_deliveries
+        WHERE status IN ('PENDING', 'FAILED')
+           OR (status='SENDING' AND claimed_at IS NOT NULL AND next_attempt_at IS NOT NULL)
+        ORDER BY period_end, id
+        LIMIT 1
+        """
+    ).fetchone()
+    if pending is not None:
+        pending_end = datetime.fromisoformat(str(pending["period_end"]).replace("Z", "+00:00"))
+        latest_end = datetime.fromisoformat(str(latest_period_end).replace("Z", "+00:00"))
+        if (pending_end.hour, pending_end.minute) == (latest_end.hour, latest_end.minute):
+            return str(pending["period_start"]), str(pending["period_end"])
+    latest_record = conn.execute(
+        "SELECT MAX(period_end) AS period_end FROM report_deliveries"
+    ).fetchone()
+    previous_end = str(latest_record["period_end"] or "") if latest_record else ""
+    if previous_end and previous_end < str(latest_period_end):
+        parsed = datetime.fromisoformat(previous_end.replace("Z", "+00:00"))
+        latest_end = datetime.fromisoformat(str(latest_period_end).replace("Z", "+00:00"))
+        if (parsed.hour, parsed.minute) != (latest_end.hour, latest_end.minute):
+            return str(latest_period_start), str(latest_period_end)
+        next_end = (parsed + timedelta(days=1)).astimezone(timezone.utc)
+        if next_end <= latest_end:
+            return (
+                previous_end,
+                next_end.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            )
+    return str(latest_period_start), str(latest_period_end)
+
+
+def has_report_deliveries(connection=None) -> bool:
+    row = _conn(connection).execute("SELECT 1 FROM report_deliveries LIMIT 1").fetchone()
+    return row is not None
+
+
+def finish_report_delivery(
+    delivery_id: int,
+    claim_token: str,
+    connection=None,
+    *,
+    response: Any = None,
+) -> bool:
+    conn = _conn(connection)
+    now = _now()
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE report_deliveries
+            SET status='SENT', sent_at=?, updated_at=?, response_json=?, error=NULL
+            WHERE id=? AND status='SENDING' AND claim_token=?
+            """,
+            (now, now, _json(response, {}), int(delivery_id), str(claim_token)),
+        )
+    return cursor.rowcount == 1
+
+
+def fail_report_delivery(
+    delivery_id: int,
+    claim_token: str,
+    error: str,
+    connection=None,
+    *,
+    retry_after_seconds: int = 300,
+    response: Any = None,
+) -> bool:
+    conn = _conn(connection)
+    now = datetime.now(timezone.utc)
+    now_text = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+    next_attempt = (now + timedelta(seconds=max(1, int(retry_after_seconds)))) \
+        .isoformat(timespec="seconds").replace("+00:00", "Z")
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE report_deliveries
+            SET status='FAILED', next_attempt_at=?, updated_at=?, response_json=?, error=?
+            WHERE id=? AND status='SENDING' AND claim_token=?
+            """,
+            (
+                next_attempt,
+                now_text,
+                _json(response, {}),
+                str(error or "发送失败")[:1000],
+                int(delivery_id),
+                str(claim_token),
+            ),
+        )
+    return cursor.rowcount == 1
+
+
+def mark_report_delivery_unknown(
+    delivery_id: int,
+    claim_token: str,
+    error: str,
+    connection=None,
+) -> bool:
+    """Keep an ambiguous request claimed so it is never sent automatically again."""
+
+    conn = _conn(connection)
+    now = _now()
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE report_deliveries
+            SET updated_at=?, next_attempt_at=NULL, error=?
+            WHERE id=? AND status='SENDING' AND claim_token=?
+            """,
+            (now, str(error or "发送结果未知")[:1000], int(delivery_id), str(claim_token)),
+        )
+    return cursor.rowcount == 1
 
 
 # Friendly aliases used by route/worker code.
