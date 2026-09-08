@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from .blocked_extra_channels import BLOCKED_EXTRA_CHANNEL_IDS
 from .blocked_player_channels import BLOCKED_PLAYER_CHANNEL_IDS
 
 
@@ -132,12 +133,27 @@ _BLOCKED_TEAM_AND_BACKEND_IDS = frozenset({
     13857765,  # 大连英博
     13861245,  # 重庆铜梁龙
     1841208,   # 辽宁铁人
+    # 额外补充球队标签（来自 额外8队球员标签.csv）
+    2547,      # 利雅得胜利
+    1573,      # 利雅得新月
+    2128,      # 葡萄牙体育
+    91,        # 本菲卡
+    1099,      # 阿贾克斯
+    1818,      # 西汉姆联
+    533,       # 狼队
+    1807,      # 南安普顿
 })
 
 
 # The full blacklist is the curated team/backend tags plus every player tag
-# ID exported from 五大联赛及中超球员标签.csv (see blocked_player_channels.py).
-BLOCKED_CHANNEL_IDS = _BLOCKED_TEAM_AND_BACKEND_IDS | BLOCKED_PLAYER_CHANNEL_IDS
+# ID exported from 五大联赛及中超球员标签.csv (see blocked_player_channels.py)
+# plus the extra team/player tag IDs from 国内所有赛事/中甲中乙/名宿退役/欧冠
+# 的球队球员标签导出表 (see blocked_extra_channels.py).
+BLOCKED_CHANNEL_IDS = (
+    _BLOCKED_TEAM_AND_BACKEND_IDS
+    | BLOCKED_PLAYER_CHANNEL_IDS
+    | BLOCKED_EXTRA_CHANNEL_IDS
+)
 
 
 def filter_blocked_channels(channels: Iterable[Any] | None) -> list[int]:

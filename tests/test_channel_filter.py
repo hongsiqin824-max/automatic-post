@@ -13,6 +13,20 @@ def test_filter_blocked_channels_removes_player_tag_ids():
     assert filter_blocked_channels([2038889, 82309, 845616, 189]) == [189]
 
 
+def test_filter_blocked_channels_removes_extra_eight_team_tags():
+    # 8 team tags from 额外8队球员标签.csv (Al Nassr/Al Hilal/Sporting/Benfica/
+    # Ajax/West Ham/Wolves/Southampton) plus one of their player tags.
+    extra_teams = [2547, 1573, 2128, 91, 1099, 1818, 533, 1807]
+    assert filter_blocked_channels(extra_teams + [11962998, 189]) == [189]
+
+
+def test_filter_blocked_channels_removes_extra_source_tag_ids():
+    # 球队/球员标签 IDs exported from 国内所有赛事/中甲中乙/名宿退役/欧冠
+    # 的导出表, plus the standalone补充 ID 14774, must all be stripped.
+    extra = [148, 152, 153, 172, 370, 382, 14774]
+    assert filter_blocked_channels(extra + [189]) == [189]
+
+
 def test_filter_blocked_channels_allows_empty_input():
     assert filter_blocked_channels(None) == []
     assert filter_blocked_channels([]) == []
