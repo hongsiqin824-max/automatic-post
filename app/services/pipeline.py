@@ -335,6 +335,21 @@ def _quality_allows_followup_body_repair(
         "advertisement",
         "media_promotion",
         "traffic_generation",
+        "promotion",
+        "call_to_action",
+        "program_promotion",
+        "channel_promotion",
+        "external_promotion",
+        "video_promotion",
+        "无关内容",
+        "重复内容",
+        "模板残留",
+        "格式噪声",
+        "引流",
+        "推广",
+        "广告",
+        "广告引流",
+        "视频引流",
     }
     reason_markers = (
         "孤立",
@@ -354,6 +369,11 @@ def _quality_allows_followup_body_repair(
             return False
         issue_type = str(item.get("issue_type") or item.get("issue_code") or "").strip().lower()
         if issue_type not in allowed_issue_types:
+            return False
+        evidence = str(item.get("evidence") or item.get("before") or "").strip()
+        # A follow-up is intended for short residual markers, not a whole
+        # paragraph that could contain valid match facts.
+        if not evidence or len(evidence) > 120:
             return False
         reason = str(item.get("reason") or "")
         if not any(marker in reason for marker in reason_markers):
