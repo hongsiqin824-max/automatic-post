@@ -278,6 +278,106 @@ def _clear_non_blocking_photo_advisory(
     return normalized
 
 
+def _quality_allows_followup_body_repair(
+    quality: dict[str, Any],
+) -> bool:
+    """Allow one narrowly-scoped retry for a clean result with a local plan.
+
+    Some model responses mark an article clean while also returning a repair
+    plan for a harmless leftover block.  That plan is useful only when every
+    other quality dimension is explicitly clean and the target can be
+    validated by ``apply_repair_plan``.  The caller still limits this path to
+    remove-only operations and runs a complete quality pass afterwards.
+    """
+
+    if not isinstance(quality, dict):
+        return False
+    if quality.get("repair_plan_error") != "AI 修复计划与质检结论矛盾":
+        return False
+    semantic = quality.get("semantic_check")
+    if not isinstance(semantic, dict) or any(
+        semantic.get(key) is not value
+        for key, value in (
+            ("title_complete", True),
+            ("body_complete", True),
+            ("has_ad_or_dirty", False),
+            ("needs_review", False),
+        )
+    ):
+        return False
+    issues = quality.get("issues")
+    if not isinstance(issues, dict):
+        return False
+    if any(
+        not isinstance(issues.get(key), list) or issues.get(key)
+        for key in (
+            "title_problems",
+            "dirty_content",
+            "completeness_problems",
+            "channel_problems",
+        )
+    ):
+        return False
+    semantic_problems = issues.get("semantic_problems")
+    if not isinstance(semantic_problems, list) or any(
+        "修复计划与质检结论矛盾" not in str(item)
+        for item in semantic_problems
+    ):
+        return False
+    plans = quality.get("repair_plans")
+    if not isinstance(plans, list) or not plans:
+        return False
+    allowed_issue_types = {
+        "duplicate_content",
+        "template_artifact",
+        "format_noise",
+        "extraneous_content",
+        "advertisement",
+        "media_promotion",
+        "traffic_generation",
+    }
+    reason_markers = (
+        "孤立",
+        "不完整",
+        "残留",
+        "重复",
+        "无关",
+        "推广",
+        "引流",
+        "广告",
+    )
+    for item in plans:
+        if not isinstance(item, dict):
+            return False
+        action = str(item.get("action") or item.get("operation") or "").strip().lower()
+        if action not in {"remove_block", "remove_text_line", "delete_duplicate"}:
+            return False
+        issue_type = str(item.get("issue_type") or item.get("issue_code") or "").strip().lower()
+        if issue_type not in allowed_issue_types:
+            return False
+        reason = str(item.get("reason") or "")
+        if not any(marker in reason for marker in reason_markers):
+            return False
+    return True
+
+
+def _followup_body_is_safe(before: str, after: str) -> tuple[bool, dict[str, Any], dict[str, Any]]:
+    """Apply the same body/image invariants to a follow-up candidate."""
+
+    before_stats = body_safety_stats(before)
+    after_stats = body_safety_stats(after)
+    safe = bool(
+        after != before
+        and after_stats["visible_text_length"] >= 30
+        and before_stats["parse_ok"]
+        and after_stats["parse_ok"]
+        and before_stats["image_count"] == after_stats["image_count"]
+        and before_stats["image_sources"] == after_stats["image_sources"]
+        and before_stats["image_attributes"] == after_stats["image_attributes"]
+    )
+    return safe, before_stats, after_stats
+
+
 def _record_quality_result(
     article_id: int,
     quality: dict[str, Any],
@@ -798,6 +898,67 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             quality_claim_token=quality_claim_token,
         )
         second_passed = second_error is None and _quality_passes(second_quality)
+        second_quality_round2 = second_quality
+        followup_matches: list[dict[str, Any]] = []
+        followup_quality: dict[str, Any] | None = None
+        followup_error: str | None = None
+        if (
+            second_error is None
+            and not second_passed
+            and _quality_allows_followup_body_repair(second_quality)
+        ):
+            followup_plans = second_quality.get("repair_plans")
+            followup_body, followup_matches, followup_error = apply_repair_plan(
+                body_after,
+                followup_plans,
+            )
+            followup_safe, followup_before_stats, followup_after_stats = (
+                _followup_body_is_safe(body_after, followup_body)
+            )
+            if not followup_safe:
+                followup_error = followup_error or (
+                    "二次局部修复未通过正文或图片安全校验"
+                )
+                followup_matches = []
+            if followup_error is None and followup_matches:
+                try:
+                    followup_quality = evaluate(
+                        title=current.get("title_final", ""),
+                        body=followup_body,
+                        channels=current.get("channels", []),
+                        llm=_make_llm(config),
+                    )
+                    if not isinstance(followup_quality, dict):
+                        raise TypeError("最终质检返回结果格式错误")
+                except Exception as exc:  # fail closed; keep canonical body
+                    followup_error = str(exc)[:300]
+                    followup_quality = _second_quality_error(second_quality, exc)
+                if followup_quality.get("title_after") not in {
+                    None,
+                    current.get("title_final", ""),
+                }:
+                    followup_error = "最终质检提出标题修改，局部修复不自动改标题"
+                    followup_quality = dict(followup_quality)
+                    followup_quality["pass"] = False
+                    followup_quality["needs_review"] = True
+                _record_quality_result(
+                    article_id,
+                    followup_quality,
+                    3,
+                    connection,
+                    status="QUALITY_CHECKING",
+                    quality_claim_token=quality_claim_token,
+                )
+                body_after = followup_body
+                second_quality = followup_quality
+                second_passed = followup_error is None and _quality_passes(
+                    followup_quality
+                )
+            else:
+                followup_quality = second_quality
+        if followup_matches:
+            removed = [*removed, *followup_matches]
+            repair["removed_count"] = len(removed)
         applied_event_message: str | None = None
         applied_event_payload: dict[str, Any] | None = None
         if second_passed:
@@ -824,12 +985,32 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 "image_attributes_unchanged": image_attributes_unchanged,
                 "title_unchanged": True,
             }
+            if followup_matches:
+                applied_event_payload["followup_repair"] = {
+                    "removed_blocks": _audit_matches(followup_matches),
+                    "removed_count": len(followup_matches),
+                    "quality_round": 3,
+                }
         repair.update({
             "outcome": "error" if second_error else ("passed" if second_passed else "failed"),
             "second_quality": second_quality,
         })
+        if followup_matches or followup_error:
+            repair["followup_repair"] = {
+                "attempted": True,
+                "applied": bool(followup_matches),
+                "outcome": "passed" if second_passed and followup_matches else (
+                    "failed" if followup_error or followup_matches else "skipped"
+                ),
+                "matches": _audit_matches(followup_matches),
+                "before": followup_before_stats,
+                "after": followup_after_stats,
+                "error": followup_error,
+            }
         if second_error is not None:
             repair["error"] = str(second_error)[:300]
+        if followup_matches or followup_error:
+            repair["second_quality_round2"] = second_quality_round2
         final_quality = {**second_quality, "promotion_repair": repair}
         target = (
             "READY_TO_PUBLISH"

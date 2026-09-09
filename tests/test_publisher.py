@@ -1147,3 +1147,54 @@ def test_non_chinese_downgrade_stays_draft_during_502_retry(app, monkeypatch):
     assert result["confirmed"] == 1
     assert updated["publish_mode"] == 0
     assert updated["status"] == "DRAFT_CREATED"
+
+
+def test_publish_controller_skips_when_publisher_disabled():
+    from app.services.publisher import PublishController
+
+    controller = PublishController(
+        AppConfig(scheduler_enabled=False, publisher_enabled=False)
+    )
+    assert controller.start() is False
+    assert controller.status()["running"] is False
+
+
+def test_publish_controller_drains_ready_queue_in_background(app, monkeypatch):
+    import time
+
+    from app.services.publisher import PublishController
+
+    class FakeClient:
+        def __init__(self, config):
+            self.config = config
+
+        def create_article(self, article, tab, **kwargs):
+            return DqdOpenDraftResult(
+                archive_id=3809999,
+                payload={"code": 0, "data": {"archive_id": 3809999}},
+                request_url="https://platform.dongqiudi.com/open/v1/do",
+                form_fields=[("title", article["title_final"])],
+            )
+
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", FakeClient)
+    with app.app_context():
+        tab = repo.list_tabs()[0]
+        repo.update_source("marca", tab_id=tab["id"], enabled=True)
+        article = repo.upsert_material(_ready_article())["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH")
+        article_id = article["id"]
+
+    controller = PublishController(_open_config(app.config["DATABASE"]))
+    assert controller.start() is True
+
+    deadline = time.monotonic() + 5
+    while controller.status()["running"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    with app.app_context():
+        updated = repo.get_article(article_id)
+    result = controller.status()["last_result"]
+    assert result is not None
+    assert result["draft_created"] == 1
+    assert updated["status"] == "DRAFT_CREATED"
+    assert updated["dqd_archive_id"] == 3809999

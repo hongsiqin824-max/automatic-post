@@ -964,6 +964,93 @@ def test_pipeline_keeps_contradictory_remove_plan_blocked_on_second_pass(
         conn.close()
 
 
+def test_pipeline_allows_one_safe_followup_repair_after_second_pass(
+    app, monkeypatch
+) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    orphan = "里尔前锋上田绮世"
+    body = f"<p>{ARTICLE_TEXT}</p><p>{orphan}</p>{IMAGE}<p>{PROMOTION}</p>"
+    _fetch(monkeypatch, [_item("followup-repair", body=body)])
+    first = deepcopy(FIRST_DIRTY)
+    first.update({
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "repairable": True,
+            "needs_review": False,
+        },
+        "repair_plans": [{
+            "block_id": "b3",
+            "action": "remove_block",
+            "evidence": PROMOTION,
+            "confidence": 0.99,
+        }],
+        "repair_plan_error": None,
+    })
+    second = deepcopy(SECOND_PASS)
+    second.update({
+        "pass": False,
+        "needs_review": True,
+        "issues": {
+            "title_problems": [],
+            "dirty_content": [],
+            "completeness_problems": [],
+            "channel_problems": [],
+            "semantic_problems": ["AI 修复计划与质检结论矛盾，需要人工确认"],
+        },
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": False,
+            "needs_review": False,
+        },
+        "repair_plans": [{
+            "block_id": "b2",
+            "action": "remove_block",
+            "evidence": orphan,
+            "issue_type": "template_artifact",
+            "reason": "不完整的孤立片段，与正文事实无关",
+            "confidence": 0.99,
+        }],
+        "repair_plan_error": "AI 修复计划与质检结论矛盾",
+    })
+    calls: list[dict] = []
+    answers = iter([first, second, deepcopy(SECOND_PASS)])
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return next(answers)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(calls) == 3
+    assert PROMOTION in calls[0]["body"]
+    assert PROMOTION not in calls[1]["body"]
+    assert orphan in calls[1]["body"]
+    assert orphan not in calls[2]["body"]
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert PROMOTION not in article["body_html"]
+        assert orphan not in article["body_html"]
+        assert IMAGE in article["body_html"]
+        repair = article["quality"]["promotion_repair"]
+        assert repair["outcome"] == "passed"
+        assert repair["removed_count"] == 2
+        assert repair["followup_repair"]["attempted"] is True
+        assert repair["followup_repair"]["applied"] is True
+        events = _event_map(article["id"], conn)
+        assert [event["payload"]["quality_round"] for event in events["QUALITY_RESULT"]] == [1, 2, 3]
+    finally:
+        conn.close()
+
+
 def test_pipeline_applies_ai_line_plan_and_runs_second_quality(
     app, monkeypatch
 ) -> None:

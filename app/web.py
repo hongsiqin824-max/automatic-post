@@ -36,6 +36,7 @@ from .services.dqd_open_client import DqdOpenClientError
 from .services.publisher import (
     DraftClaimSkipped,
     DraftConfirmationController,
+    PublishController,
     create_draft_for_article,
 )
 from .services.preview_html import sanitize_preview_html
@@ -642,19 +643,31 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     controller = RunController(cfg)
     confirmation_controller = DraftConfirmationController(cfg)
+    publish_controller = PublishController(cfg)
     feishu_report_controller = FeishuReportController(cfg)
     feishu_report_scheduler = FeishuReportScheduler(
         feishu_report_controller,
         cfg.feishu_report_check_interval_seconds,
     )
+    # The independent publish worker drains READY_TO_PUBLISH on its own cadence
+    # and already reconciles due draft confirmations, so it takes the scheduler's
+    # maintenance slot when enabled. Turning it off falls back to the original
+    # confirmation-only maintenance worker.
+    if cfg.publish_worker_enabled:
+        maintenance_controller = publish_controller
+        maintenance_interval_seconds = cfg.publish_worker_interval_seconds
+    else:
+        maintenance_controller = confirmation_controller
+        maintenance_interval_seconds = min(15, cfg.dqd_open_502_retry_delay_seconds)
     scheduler = Scheduler(
         controller,
         cfg.scheduler_interval_seconds,
-        maintenance_controller=confirmation_controller,
-        maintenance_interval_seconds=min(15, cfg.dqd_open_502_retry_delay_seconds),
+        maintenance_controller=maintenance_controller,
+        maintenance_interval_seconds=maintenance_interval_seconds,
     )
     app.extensions["run_controller"] = controller
     app.extensions["draft_confirmation_controller"] = confirmation_controller
+    app.extensions["publish_controller"] = publish_controller
     app.extensions["feishu_report_controller"] = feishu_report_controller
     app.extensions["feishu_report_scheduler"] = feishu_report_scheduler
     app.extensions["scheduler"] = scheduler

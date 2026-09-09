@@ -154,6 +154,15 @@ class AppConfig:
     # an explicit flag even when credentials are present.
     publisher_enabled: bool = _env_bool("AUTOMATIC_POST_PUBLISHER", False)
 
+    # Independent publish worker: drains READY_TO_PUBLISH on its own cadence so
+    # queued articles no longer wait for a full (and slow) ingestion cycle to
+    # finish before the end-of-run publish step reaches them. When disabled the
+    # scheduler falls back to the draft-confirmation maintenance worker.
+    publish_worker_enabled: bool = _env_bool("AUTOMATIC_POST_PUBLISH_WORKER", True)
+    publish_worker_interval_seconds: int = max(
+        5, min(3600, _env_int("AUTOMATIC_POST_PUBLISH_WORKER_INTERVAL_SECONDS", 30))
+    )
+
     @property
     def material_configured(self) -> bool:
         return bool(self.material_api_key and self.material_caller)

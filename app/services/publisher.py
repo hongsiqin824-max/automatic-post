@@ -1280,6 +1280,62 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
     }
 
 
+class PublishController:
+    """Drain READY_TO_PUBLISH on a short cadence, decoupled from ingestion.
+
+    ``publish_ready_articles`` already performs stale recovery, due-confirmation
+    reconciliation, and draft creation in one pass, so this controller subsumes
+    the work of ``DraftConfirmationController`` while also emptying the publish
+    queue without waiting for the heavy end-of-``run_once`` publish step.
+    """
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self._lock = threading.Lock()
+        self._running = False
+        self._last_result: dict[str, Any] | None = None
+
+    def start(self) -> bool:
+        # Publishing is the explicit purpose here; when the publisher is off
+        # nothing should be created and the scheduler stays quiet, matching the
+        # previous draft-confirmation gating.
+        if not self.config.publisher_enabled:
+            return False
+        with self._lock:
+            if self._running:
+                return False
+            self._running = True
+        thread = threading.Thread(
+            target=self._run,
+            name="publish-worker",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception:
+            with self._lock:
+                self._running = False
+            raise
+        return True
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {"running": self._running, "last_result": self._last_result}
+
+    def _run(self) -> None:
+        connection = _connect(self.config.database_path)
+        try:
+            result = publish_ready_articles(self.config, connection)
+            with self._lock:
+                self._last_result = result
+        except Exception:  # noqa: BLE001 - keep future publish ticks alive
+            logger.exception("独立发布 worker 执行失败")
+        finally:
+            connection.close()
+            with self._lock:
+                self._running = False
+
+
 def create_draft_for_article(config: AppConfig, connection, article_id: int) -> dict[str, Any]:
     if not config.publisher_enabled:
         raise ValueError("发布 worker 未启用，无法创建草稿")

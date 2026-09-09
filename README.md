@@ -49,6 +49,8 @@ cp .env.example .env
 
 若要启用草稿创建，在 `.env` 填写 `DQD_OPEN_APPID`、`DQD_OPEN_APPSECRET`、`DQD_OPEN_ENNAME`，并设置 `AUTOMATIC_POST_PUBLISHER=true`。创建文章接口使用 `status=0`，只落后台草稿。
 
+发布默认由一个独立的发布 worker 按固定间隔清空待发队列（`AUTOMATIC_POST_PUBLISH_WORKER=true`，间隔 `AUTOMATIC_POST_PUBLISH_WORKER_INTERVAL_SECONDS=30` 秒），与重量级的素材拉取轮次解耦，因此待发文章不必等整轮拉取和质检跑完才会被提交。该 worker 每次运行同时完成卡住 `PUBLISHING` 的恢复与到期草稿结果确认，逐篇提交仍通过数据库状态声明保证与拉取轮次末尾的发布步骤互不重复。将其设为 `false` 时回退为仅做草稿结果确认的旧维护线程，发布只在每轮素材拉取结束时统一执行。
+
 当开放平台返回 5xx、请求超时/断连，或成功响应缺少 `archive_id` 时，文章会进入 `DRAFT_CONFIRMING`。默认仅对 HTTP 502 在 5 秒后自动再次调用一次创建接口（`DQD_OPEN_502_RETRY_ENABLED=true`、`DQD_OPEN_502_RETRY_DELAY_SECONDS=5`）；第二次仍未拿到 `archive_id` 时停止继续重试。503、504、超时和缺少 `archive_id` 不会在非幂等模式下自动重发。由于创建接口未承诺幂等，502 单次重试仍存在第一次已成功、第二次又创建一份草稿的风险。只有在上游已经实现以 `client_request_id`（或配置的字段名）做幂等唯一约束后，才可设置 `DQD_OPEN_IDEMPOTENCY_ENABLED=true`；此时 worker 会用同一请求号按 15 秒、1 分钟、3 分钟、10 分钟、30 分钟自动确认。
 
 执行单轮任务：
