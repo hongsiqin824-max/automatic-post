@@ -30,6 +30,7 @@ VALID_STATUSES = {
     "ALREADY_PUBLISHED",
     "MAPPING_BLOCKED",
     "SOURCE_DUPLICATE",
+    "TITLE_DUPLICATE",
     "ERROR",
 }
 VALID_LEVELS = {"S", "A", "B", "C"}
@@ -314,6 +315,7 @@ def _status_label(value: str) -> str:
         "ALREADY_PUBLISHED": "已存在后台文章",
         "MAPPING_BLOCKED": "待匹配后台素材",
         "SOURCE_DUPLICATE": "来源重复（已拦截）",
+        "TITLE_DUPLICATE": "标题重复（已取消自动发布）",
         "ERROR": "处理失败",
     }
     return labels.get(value, value or "未知")
@@ -1845,6 +1847,36 @@ def direct_publish_report(period_start: str, period_end: str, connection=None) -
             for name, count in sorted(counts.items(), key=lambda item: item[0])
         ],
     }
+
+
+def list_title_dedup_candidates(since: str, exclude_id: int, connection=None) -> list[dict]:
+    """Recent published plus in-flight articles usable as title dedup targets.
+
+    Published articles are bounded by ``published_at`` inside the window, while
+    in-flight queue states are bounded by ``created_at`` so two articles of one
+    ingestion batch can still see each other before either is published.
+    """
+
+    rows = _conn(connection).execute(
+        """
+        SELECT id, title_final, channels_json, status, published_at, dqd_archive_id
+        FROM articles
+        WHERE id <> ?
+          AND (
+            (status = 'PUBLISHED' AND published_at >= ?)
+            OR (
+              status IN ('READY_TO_PUBLISH', 'PUBLISHING', 'DRAFT_CONFIRMING')
+              AND created_at >= ?
+            )
+          )
+        ORDER BY id
+        """,
+        (int(exclude_id), str(since), str(since)),
+    ).fetchall()
+    return [
+        {**_row(row), "channels": _loads(row["channels_json"], [])}
+        for row in rows
+    ]
 
 
 def article_counts(connection=None) -> dict[str, int]:

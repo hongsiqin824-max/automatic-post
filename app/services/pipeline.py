@@ -14,6 +14,7 @@ from .. import repository as repo
 from ..config import AppConfig
 from ..db import _connect
 from ..statuses import STATUS_LABELS
+from . import title_dedup
 from .material_client import MaterialClient, MaterialClientError, normalize_item
 from .publisher import publish_ready_articles
 from .quality import (
@@ -81,6 +82,65 @@ def _make_llm(config: AppConfig) -> LLMService | None:
         config.llm_max_retries,
         config.llm_retry_delay_seconds,
     )
+
+
+def _make_fallback_llm(config: AppConfig) -> LLMService | None:
+    if not config.llm_fallback_configured:
+        return None
+    return LLMService(
+        config.llm_api_key2,
+        config.llm_base_url2,
+        config.llm_model2,
+        config.llm_timeout2,
+        config.llm_max_retries2,
+        config.llm_retry_delay_seconds2,
+    )
+
+
+def _apply_title_dedup(article_id: int, current: dict[str, Any], config: AppConfig, connection) -> str | None:
+    """Block or reroute a queue-bound direct-publish article on title duplicates.
+
+    Returns the replacement final status, or ``None`` when the article keeps
+    its queue destination.  A failed judgement follows the configured policy
+    and routes the article to manual review instead of publishing blindly.
+    """
+
+    if not config.title_dedup_enabled:
+        return None
+    mode = title_dedup.direct_publish_mode(article_id, current, connection)
+    if mode != 1:
+        return None
+    candidates = repo.list_title_dedup_candidates(
+        title_dedup.dedup_window_since(config.title_dedup_hours),
+        article_id,
+        connection,
+    )
+    result = title_dedup.check_title_duplicate(config, current, candidates, publish_mode=mode)
+    if not result["checked"] or result["outcome"] not in {"duplicate", "needs_review"}:
+        return None
+    if result["outcome"] == "duplicate":
+        matched = result["matched"] or {}
+        repo.transition_status(
+            article_id,
+            "TITLE_DUPLICATE",
+            connection,
+            event_type="TITLE_DUPLICATE_DETECTED",
+            message=(
+                f"与文章 #{matched.get('id')}《{matched.get('title')}》标题高度相似"
+                f"（共同标签 {result['shared_channels']}），已取消自动发布"
+            ),
+            payload=result,
+        )
+        return "TITLE_DUPLICATE"
+    repo.transition_status(
+        article_id,
+        "NEEDS_REVIEW",
+        connection,
+        event_type="TITLE_DUPLICATE_REVIEW",
+        message=f"标题查重判定失败：{result['error']}，转人工审核",
+        payload=result,
+    )
+    return "NEEDS_REVIEW"
 
 
 def _audit_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -632,6 +692,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             body=current.get("body_html", ""),
             channels=current.get("channels", []),
             llm=_make_llm(config),
+            llm_fallback=_make_fallback_llm(config),
         )
         _record_quality_result(
             article_id,
@@ -905,6 +966,9 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     quality_claim_token=quality_claim_token,
                 )
                 return "ALREADY_PUBLISHED"
+            dedup_status = _apply_title_dedup(article_id, current, config, connection)
+            if dedup_status:
+                return dedup_status
             return target
 
         audit_matches = _audit_matches(candidates)
@@ -1051,6 +1115,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 body=body_after,
                 channels=current.get("channels", []),
                 llm=_make_llm(config),
+                llm_fallback=_make_fallback_llm(config),
             )
             if not isinstance(second_quality, dict):
                 raise TypeError("二次质检返回结果格式错误")
@@ -1120,6 +1185,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                         body=followup_body,
                         channels=current.get("channels", []),
                         llm=_make_llm(config),
+                        llm_fallback=_make_fallback_llm(config),
                     )
                     if not isinstance(followup_quality, dict):
                         raise TypeError("最终质检返回结果格式错误")
@@ -1294,12 +1360,18 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 quality_claim_token=quality_claim_token,
             )
             final_status = "ALREADY_PUBLISHED"
+        if final_status == "READY_TO_PUBLISH":
+            dedup_status = _apply_title_dedup(article_id, current, config, connection)
+            if dedup_status:
+                final_status = dedup_status
         finish_payload: dict[str, Any] = {
             "outcome": repair["outcome"],
             "candidate_committed": repair["candidate_committed"],
             "final_status": final_status,
             "destination": "发布队列" if final_status == "READY_TO_PUBLISH" else (
-                "不重复发布" if final_status == "ALREADY_PUBLISHED" else "人工审核"
+                "不重复发布" if final_status == "ALREADY_PUBLISHED" else (
+                    "标题查重拦截" if final_status == "TITLE_DUPLICATE" else "人工审核"
+                )
             ),
             "cumulative_removed_visible_chars": cumulative_removed_visible_chars,
             "removed_visible_chars_limit": MAX_AI_REPAIR_REMOVED_CHARS,
@@ -1323,7 +1395,11 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     else (
                         "局部修复后二次质检通过，候选正文已提交"
                         if final_status in {"READY_TO_PUBLISH", "ALREADY_PUBLISHED"}
-                        else "候选正文二次质检未通过，原正文未改动并转人工审核"
+                        else (
+                            "标题查重命中近窗口已发布文章，已取消自动发布"
+                            if final_status == "TITLE_DUPLICATE"
+                            else "候选正文二次质检未通过，原正文未改动并转人工审核"
+                        )
                     )
                 )
             ),
@@ -1504,6 +1580,8 @@ def _run_once_locked(config: AppConfig, *, database_path: str | None = None) -> 
             message += f"，失败 {publish_result.get('failed', 0)} 篇"
         if publish_result.get("confirming"):
             message += f"，{publish_result.get('confirming', 0)} 篇进入自动核对"
+        if publish_result.get("title_duplicate_skipped"):
+            message += f"，标题查重拦截 {publish_result.get('title_duplicate_skipped')} 篇"
         result = {
             "run_id": run_id,
             "fetched": fetched,

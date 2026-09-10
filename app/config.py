@@ -90,6 +90,19 @@ class AppConfig:
         0.1, min(10.0, _env_float("LLM_RETRY_DELAY_SECONDS", 0.5))
     )
 
+    # Fallback LLM: tried when the primary model is temporarily unavailable
+    # (timeout / connection / rate_limit / http 5xx).  The retry budget is
+    # deliberately small (1 attempt) because this is an emergency switch, not
+    # a retry loop — the primary already exhausted its own retries.
+    llm_api_key2: str = os.getenv("LLM_API_KEY2", "")
+    llm_base_url2: str = os.getenv("LLM_BASE_URL2", "https://api.openai.com/v1")
+    llm_model2: str = os.getenv("LLM_MODEL2", "gpt-5.5")
+    llm_timeout2: int = max(10, _env_int("LLM_TIMEOUT_SECONDS2", 80))
+    llm_max_retries2: int = max(0, min(2, _env_int("LLM_MAX_RETRIES2", 1)))
+    llm_retry_delay_seconds2: float = max(
+        0.1, min(10.0, _env_float("LLM_RETRY_DELAY_SECONDS2", 1.0))
+    )
+
     dqd_base_url: str = os.getenv(
         "DQD_BASE_URL", "https://dadmin.dongqiudi.com"
     ).rstrip("/")
@@ -163,6 +176,14 @@ class AppConfig:
         5, min(3600, _env_int("AUTOMATIC_POST_PUBLISH_WORKER_INTERVAL_SECONDS", 30))
     )
 
+    # Title dedup for direct-publish articles: lexical recall against locally
+    # published (window) and in-flight articles, then an LLM same-fact decision.
+    title_dedup_enabled: bool = _env_bool("AUTOMATIC_POST_TITLE_DEDUP_ENABLED", True)
+    title_dedup_hours: int = max(1, min(72, _env_int("AUTOMATIC_POST_TITLE_DEDUP_HOURS", 24)))
+    title_dedup_dice_min: float = max(0.0, min(1.0, _env_float("AUTOMATIC_POST_TITLE_DEDUP_DICE_MIN", 0.25)))
+    title_dedup_lcs_min: int = max(2, min(12, _env_int("AUTOMATIC_POST_TITLE_DEDUP_LCS_MIN", 4)))
+    title_dedup_max_candidates: int = max(1, min(10, _env_int("AUTOMATIC_POST_TITLE_DEDUP_MAX_CANDIDATES", 3)))
+
     @property
     def material_configured(self) -> bool:
         return bool(self.material_api_key and self.material_caller)
@@ -170,6 +191,10 @@ class AppConfig:
     @property
     def llm_configured(self) -> bool:
         return bool(self.llm_api_key)
+
+    @property
+    def llm_fallback_configured(self) -> bool:
+        return bool(self.llm_api_key2)
 
     @property
     def dqd_configured(self) -> bool:

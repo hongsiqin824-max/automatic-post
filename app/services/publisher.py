@@ -11,6 +11,7 @@ from typing import Any
 from .. import repository as repo
 from ..config import AppConfig
 from ..db import _connect
+from . import title_dedup
 from .dqd_open_client import DqdOpenClient, DqdOpenClientError
 from .open_platform import build_draft_url
 from .quality import analyze_body_language
@@ -115,6 +116,26 @@ def _create_article_with_stable_key(
 
 def _publish_eligible(article: dict[str, Any]) -> bool:
     return article.get("status") == "READY_TO_PUBLISH"
+
+
+def _title_dedup_gate(config: AppConfig, connection, current: dict[str, Any]) -> dict[str, Any] | None:
+    """Safety net: re-run title dedup right before draft creation.
+
+    Catches duplicates whose earlier twin was published after the ingestion
+    time check ran (manual review releases, slow batches).
+    """
+
+    if not config.title_dedup_enabled:
+        return None
+    mode = title_dedup.direct_publish_mode(int(current["id"]), current, connection)
+    if mode != 1:
+        return None
+    candidates = repo.list_title_dedup_candidates(
+        title_dedup.dedup_window_since(config.title_dedup_hours),
+        int(current["id"]),
+        connection,
+    )
+    return title_dedup.check_title_duplicate(config, current, candidates, publish_mode=mode)
 
 
 def _retry_eligible(article: dict[str, Any]) -> bool:
@@ -1109,6 +1130,7 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
             "failed": 0,
             "skipped": 0,
             "duplicate_skipped": 0,
+            "title_duplicate_skipped": 0,
             "mapping_blocked": 0,
             "recovered": recovery["recovered"],
             "timed_out": recovery["timed_out"],
@@ -1126,6 +1148,7 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
             "failed": 0,
             "skipped": 0,
             "duplicate_skipped": 0,
+            "title_duplicate_skipped": 0,
             "mapping_blocked": 0,
             "recovered": recovery["recovered"],
             "timed_out": recovery["timed_out"],
@@ -1139,6 +1162,7 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
     articles = repo.list_articles(connection, status="READY_TO_PUBLISH", limit=limit)
     result_items: list[dict[str, Any]] = []
     draft_created = published = failed = skipped = duplicate_skipped = mapping_blocked = confirming = 0
+    title_duplicate_skipped = 0
     confirmed_published = sum(
         1 for item in confirmation.get("items", []) if item.get("published")
     )
@@ -1166,6 +1190,41 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
                 "article_id": article_id,
                 "source": current.get("source"),
                 "error": f"与本地文章 #{duplicate_of['id']} 的来源文章 ID 相同，已自动拦截",
+                "skipped": True,
+            })
+            continue
+        dedup_result = _title_dedup_gate(config, connection, current)
+        if dedup_result is not None and dedup_result["outcome"] in {"duplicate", "needs_review"}:
+            skipped += 1
+            if dedup_result["outcome"] == "duplicate":
+                title_duplicate_skipped += 1
+                matched = dedup_result["matched"] or {}
+                repo.transition_status(
+                    article_id,
+                    "TITLE_DUPLICATE",
+                    connection,
+                    event_type="TITLE_DUPLICATE_DETECTED",
+                    message=(
+                        f"与文章 #{matched.get('id')}《{matched.get('title')}》标题高度相似"
+                        f"（共同标签 {dedup_result['shared_channels']}），已取消自动发布"
+                    ),
+                    payload=dedup_result,
+                )
+                error_text = f"与文章 #{matched.get('id')} 标题高度相似，已取消自动发布"
+            else:
+                repo.transition_status(
+                    article_id,
+                    "NEEDS_REVIEW",
+                    connection,
+                    event_type="TITLE_DUPLICATE_REVIEW",
+                    message=f"标题查重判定失败：{dedup_result['error']}，转人工审核",
+                    payload=dedup_result,
+                )
+                error_text = f"标题查重判定失败：{dedup_result['error']}，转人工审核"
+            result_items.append({
+                "article_id": article_id,
+                "source": current.get("source"),
+                "error": error_text,
                 "skipped": True,
             })
             continue
@@ -1259,6 +1318,8 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
         message += f"，失败 {failed} 条"
     if confirming:
         message += f"，{confirming} 条进入自动核对"
+    if title_duplicate_skipped:
+        message += f"，标题查重拦截 {title_duplicate_skipped} 篇"
     if published:
         message += f"，直接发布 {published} 篇"
     return {
@@ -1268,6 +1329,7 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
         "failed": failed,
         "skipped": skipped,
         "duplicate_skipped": duplicate_skipped,
+        "title_duplicate_skipped": title_duplicate_skipped,
         "mapping_blocked": mapping_blocked,
         "confirming": confirming + confirmation["pending"],
         "recovered": recovery["recovered"],

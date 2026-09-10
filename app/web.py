@@ -58,6 +58,7 @@ STATUS_ALIASES = {
     "published": "PUBLISHED",
     "already_published": "ALREADY_PUBLISHED",
     "source_duplicate": "SOURCE_DUPLICATE",
+    "title_duplicate": "TITLE_DUPLICATE",
     "rejected": "REJECTED",
     "failed": "ERROR",
     "error": "ERROR",
@@ -94,6 +95,8 @@ EVENT_LABELS = {
     "PUBLISHING_RECOVERED": "草稿状态已自动恢复",
     "PUBLISHING_TIMED_OUT": "草稿创建超时自动恢复",
     "SOURCE_DUPLICATE_DETECTED": "发现同来源重复文章",
+    "TITLE_DUPLICATE_DETECTED": "标题查重拦截",
+    "TITLE_DUPLICATE_REVIEW": "标题查重转人工",
     "STATUS_CHANGED": "状态更新",
 }
 
@@ -600,6 +603,7 @@ def _dashboard_status_groups(stats: dict[str, int]) -> list[dict]:
         ("PUBLISH_FAILED", "提交懂球帝失败", "开放平台调用失败"),
         ("ALREADY_PUBLISHED", "已存在后台文章", "接口记录已有文章 ID"),
         ("SOURCE_DUPLICATE", "来源重复（已拦截）", "相同来源文章 ID 已存在"),
+        ("TITLE_DUPLICATE", "标题重复（已取消自动发布）", "与近窗口已发布文章标题高度相似且标签相同"),
         ("REJECTED", "已驳回", "不会进入发布队列"),
         ("ERROR", "处理失败", "可查看详情后重试"),
     ]

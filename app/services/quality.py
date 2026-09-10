@@ -650,8 +650,15 @@ def evaluate(
     body: str,
     channels: list[int] | None = None,
     llm: LLMService | None = None,
+    llm_fallback: LLMService | None = None,
 ) -> dict[str, Any]:
-    """Evaluate one article; all uncertain cases are routed to review."""
+    """Evaluate one article; all uncertain cases are routed to review.
+
+    When *llm_fallback* is provided and the primary model fails with a
+    transport-level error (timeout / connection / rate_limit / http 5xx),
+    the fallback model is tried once before giving up.  The primary error
+    is preserved in ``primary_error`` for audit.
+    """
     title_issues = _title_problems(title)
     completeness, dirty = _body_problems(body)
     channel_issues: list[str] = []
@@ -663,6 +670,7 @@ def evaluate(
     repair_plan_warning: str | None = None
     semantic_error: dict[str, Any] | None = None
     title_error: dict[str, Any] | None = None
+    primary_error: dict[str, Any] | None = None
     language_check = analyze_body_language(body)
     if channels is None:
         channel_issues.append("channels 缺失")
@@ -734,13 +742,91 @@ def evaluate(
                 semantic_issues.append(reason)
         except LLMCallError as exc:
             logger.warning("AI 语义质检失败 category=%s status=%s attempts=%s: %s", exc.category, exc.status_code, exc.attempts, exc)
-            semantic_error = exc.as_dict()
-            if exc.category in {"timeout", "connection", "rate_limit", "http_error"} and exc.retryable:
-                semantic_issues.append("AI 服务暂时不可用，已重试仍未返回，需要人工确认")
-            elif exc.category == "invalid_response":
-                semantic_issues.append("AI 返回格式无效，需要人工确认")
-            else:
-                semantic_issues.append("AI 服务调用失败，需要人工确认")
+            primary_error = exc.as_dict()
+            semantic_error = primary_error
+            # Try fallback once for transport-level errors.
+            if (
+                exc.category in {"timeout", "connection", "rate_limit", "http_error"}
+                and exc.retryable
+                and llm_fallback is not None
+                and llm_fallback.configured
+            ):
+                logger.info("主模型 %s 语义质检失败，尝试降级模型 %s", getattr(llm, "model", "?"), llm_fallback.model)
+                try:
+                    semantic = semantic_check(title, body, llm_fallback)
+                    repair_plans, repair_plan_error = _repair_plans_from_semantic(semantic)
+                    reason = str(semantic.get("reason") or "AI 语义质检提示")[:200]
+                    invalid_fields = [
+                        key for key in (
+                            "title_complete", "body_complete", "has_ad_or_dirty", "needs_review"
+                        )
+                        if not isinstance(semantic.get(key), bool)
+                    ]
+                    if "repairable" in semantic and not isinstance(semantic.get("repairable"), bool):
+                        invalid_fields.append("repairable")
+                    if invalid_fields:
+                        repair_plan_error = "AI 质检返回字段格式错误：" + ",".join(invalid_fields)
+                    # Clear the transport error — the fallback produced a result.
+                    semantic_error = None
+                    semantic_issues.clear()
+                    # Re-use the advisory/ephemeral-logic from the primary branch.
+                    advisory_only = False
+                    if (
+                        repair_plans
+                        and semantic.get("has_ad_or_dirty") is not True
+                        and semantic.get("needs_review") is not True
+                        and not invalid_fields
+                    ):
+                        advisory_only = (
+                            semantic.get("needs_review") is False
+                            and semantic.get("title_complete") is True
+                            and semantic.get("body_complete") is True
+                            and is_photo_credit_advisory_plans(repair_plans, body=body)
+                        )
+                        if not advisory_only:
+                            repair_plan_warning = (
+                                "AI 修复计划与质检结论矛盾，按可验证的局部修复候选处理"
+                            )
+                        elif not invalid_fields:
+                            advisory_repair_plans = [dict(item) for item in repair_plans]
+                            repair_plans = []
+                    if repair_plans and (
+                        semantic.get("title_complete") is not True
+                        or semantic.get("body_complete") is not True
+                    ):
+                        repair_plan_error = "AI 修复计划与标题或正文完整性结论矛盾"
+                    if (
+                        repair_plans
+                        and semantic.get("repairable") is not True
+                        and not advisory_only
+                        and not repair_plan_error
+                    ):
+                        repair_plan_warning = repair_plan_warning or (
+                            "AI repairable 结论与修复计划矛盾，按可验证的局部修复候选处理"
+                        )
+                    if repair_plan_error:
+                        semantic_issues.append(repair_plan_error + "，需要人工确认")
+                    if semantic.get("title_complete") is False and not title_issues:
+                        title_issues.append(f"AI 判断标题可能不完整：{reason}")
+                    if semantic.get("body_complete") is False and not completeness:
+                        completeness.append(f"AI 判断正文可能不完整：{reason}")
+                    if semantic.get("has_ad_or_dirty") is True and not dirty:
+                        dirty.append(f"AI 判断可能含广告或脏内容：{reason}")
+                    if semantic.get("needs_review") is True and not (title_issues or completeness or dirty):
+                        semantic_issues.append(reason)
+                except LLMCallError as fallback_exc:
+                    logger.warning("降级模型也失败: %s", fallback_exc)
+                    # Keep the primary error as the canonical failure record.
+                except Exception as fallback_exc:
+                    logger.warning("降级模型异常: %s", fallback_exc)
+                    # Keep the primary error; the fallback didn't help.
+            if semantic_error is not None:
+                if exc.category in {"timeout", "connection", "rate_limit", "http_error"} and exc.retryable:
+                    semantic_issues.append("AI 服务暂时不可用，已重试仍未返回，需要人工确认")
+                elif exc.category == "invalid_response":
+                    semantic_issues.append("AI 返回格式无效，需要人工确认")
+                else:
+                    semantic_issues.append("AI 服务调用失败，需要人工确认")
         except Exception as exc:  # noqa: BLE001 - uncertainty must stop auto-pass
             logger.warning("AI 语义质检失败: %s", exc)
             semantic_error = {
@@ -830,6 +916,7 @@ def evaluate(
         "semantic_check": semantic,
         "semantic_error": semantic_error,
         "title_error": title_error,
+        "primary_error": primary_error,
         "repair_plans": repair_plans,
         "advisory_repair_plans": advisory_repair_plans,
         "advisory_reason": (
