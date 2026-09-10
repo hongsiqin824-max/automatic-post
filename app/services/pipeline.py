@@ -1569,6 +1569,8 @@ def _run_once_locked(config: AppConfig, *, database_path: str | None = None) -> 
             status_counts["MAPPING_BLOCKED"] = status_counts.get("MAPPING_BLOCKED", 0) + int(publish_result["mapping_blocked"])
         if publish_result.get("duplicate_skipped"):
             status_counts["SOURCE_DUPLICATE"] = status_counts.get("SOURCE_DUPLICATE", 0) + int(publish_result["duplicate_skipped"])
+        if publish_result.get("title_duplicate_skipped"):
+            status_counts["TITLE_DUPLICATE"] = status_counts.get("TITLE_DUPLICATE", 0) + int(publish_result["title_duplicate_skipped"])
         message = f"本轮完成，草稿创建 {publish_result.get('draft_created', 0)} 篇"
         if publish_result.get("published"):
             message += f"，直接发布 {publish_result.get('published', 0)} 篇"
