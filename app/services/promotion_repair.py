@@ -19,6 +19,8 @@ import unicodedata
 from html.parser import HTMLParser
 from typing import Any
 
+from .link_sanitizer import remove_clickable_links, remove_empty_content_blocks
+
 
 # Keep this deliberately narrow.  A news paragraph can contain words such as
 # "查看" or "赛程" without being an advert; the combination of a call to
@@ -154,10 +156,20 @@ _PROGRAM_PROMOTION_RE = re.compile(
     re.IGNORECASE,
 )
 
-_AI_PLAN_ACTIONS = {"remove_block", "remove_text_line", "replace_text"}
+_AI_PLAN_ACTIONS = {
+    "remove_block",
+    "remove_text_line",
+    "remove_link",
+    "remove_empty_block",
+    "replace_text",
+}
 _AI_PLAN_ACTION_ALIASES = {
     "delete_block": "remove_block",
     "delete_segment": "remove_text_line",
+    "delete_link": "remove_link",
+    "remove_anchor": "remove_link",
+    "delete_empty_block": "remove_empty_block",
+    "remove_empty_node": "remove_empty_block",
     "replace_exact_text": "replace_text",
 }
 
@@ -167,7 +179,6 @@ _AI_PLAN_ACTION_ALIASES = {
 MAX_AI_REPAIR_PLANS = 3
 MIN_AI_REPAIR_CONFIDENCE = 0.95
 MAX_AI_REPAIR_REMOVED_CHARS = 600
-MAX_AI_REPAIR_REMOVED_RATIO = 0.25
 
 # The model is allowed to describe a new promotion wording without waiting
 # for a new regular expression.  These are content categories, rather than
@@ -638,6 +649,132 @@ def content_blocks(body_html: str | None) -> list[dict[str, Any]]:
     return blocks
 
 
+_EMPTY_NODE_RE = re.compile(
+    r"<(?P<tag>p|div|li)(?P<attrs>\s[^>]*)?>\s*"
+    r"(?:(?:<!--.*?-->\s*)|"
+    r"<(?P<fmt>strong|b|span|em|i)\b[^>]*>\s*</(?P=fmt)\s*>\s*)*"
+    r"</(?P=tag)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+class _AnchorIndexParser(HTMLParser):
+    """Collect real closed anchors with source offsets and parsed attributes."""
+
+    def __init__(self, body: str) -> None:
+        super().__init__(convert_charrefs=False)
+        self.body = body
+        self.line_starts = [0]
+        for index, value in enumerate(body):
+            if value == "\n":
+                self.line_starts.append(index + 1)
+        self.stack: list[dict[str, Any]] = []
+        self.matches: list[dict[str, Any]] = []
+
+    def _offset(self) -> int:
+        line, column = self.getpos()
+        if line <= 0 or line > len(self.line_starts):
+            return len(self.body)
+        return min(len(self.body), self.line_starts[line - 1] + column)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        raw_start = self.get_starttag_text() or ""
+        start = self._offset()
+        self.stack.append({
+            "start": start,
+            "start_tag_end": start + len(raw_start),
+            "href": next(
+                (str(value or "") for name, value in attrs if name.lower() == "href" and value),
+                "",
+            ),
+        })
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        # A self-closing anchor has no linked content and is not a repair target.
+        return
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "a" or not self.stack:
+            return
+        record = self.stack.pop()
+        end_start = self._offset()
+        closing = re.match(r"</\s*a\s*>", self.body[end_start:], re.IGNORECASE)
+        if closing is None or not record.get("href"):
+            return
+        start = int(record["start"])
+        end = end_start + closing.end()
+        content_start = int(record.get("start_tag_end") or 0)
+        content_end = end_start
+        if content_start <= start or content_start > content_end:
+            return
+        content = self.body[content_start:content_end]
+        self.matches.append({
+            "start": start,
+            "end": end,
+            "content_start": content_start,
+            "content_end": content_end,
+            "href": str(record["href"]),
+            "text": _plain_text(content),
+            "image_count": len(re.findall(r"<img\b", content, re.IGNORECASE)),
+        })
+
+
+def content_links(body_html: str | None) -> list[dict[str, Any]]:
+    """Expose closed anchor nodes as separate, stable repair targets.
+
+    Link targets are intentionally independent from ``block_id`` because a
+    link can be nested inside a rich-text paragraph that cannot be safely
+    indexed by the text-only block matcher. Only closed anchors are exposed;
+    malformed anchors remain fail-closed and are handled by preprocessing.
+    """
+
+    body = str(body_html or "")
+    excluded_spans = _excluded_context_spans(body)
+    links: list[dict[str, Any]] = []
+    parser = _AnchorIndexParser(body)
+    try:
+        parser.feed(body)
+        parser.close()
+    except (AssertionError, TypeError, ValueError):
+        return []
+    for index, match in enumerate(sorted(parser.matches, key=lambda item: int(item["start"])), start=1):
+        if _inside_excluded_context(int(match["start"]), excluded_spans):
+            continue
+        links.append({
+            "link_id": f"l{index}",
+            "tag": "a",
+            "text": str(match["text"]),
+            "href": str(match["href"]),
+            "image_count": int(match["image_count"]),
+            "start": int(match["start"]),
+            "end": int(match["end"]),
+            "content_start": int(match["content_start"]),
+            "content_end": int(match["content_end"]),
+        })
+    return links
+
+
+def empty_content_blocks(body_html: str | None) -> list[dict[str, Any]]:
+    """Expose empty text containers as separate, image-safe targets."""
+
+    body = str(body_html or "")
+    excluded_spans = _excluded_context_spans(body)
+    result: list[dict[str, Any]] = []
+    for index, match in enumerate(_EMPTY_NODE_RE.finditer(body), start=1):
+        if _inside_excluded_context(match.start(), excluded_spans):
+            continue
+        result.append({
+            "empty_block_id": f"e{index}",
+            "tag": match.group("tag").lower(),
+            "text": "",
+            "start": match.start(),
+            "end": match.end(),
+        })
+    return result
+
+
 def _line_segments(match: re.Match[str], block_id: str) -> list[dict[str, Any]]:
     """Return text-only line spans and their explicit separators.
 
@@ -727,6 +864,8 @@ def _plan_list(plan: Any) -> tuple[list[dict[str, Any]], str | None]:
 def apply_repair_plan(
     body_html: str | None,
     plan: Any,
+    *,
+    _allow_partial: bool = False,
 ) -> tuple[str, list[dict[str, Any]], str | None]:
     """Apply only an exact, text-block AI plan.
 
@@ -743,8 +882,39 @@ def apply_repair_plan(
         return body, [], None
     if len(plans) > MAX_AI_REPAIR_PLANS:
         return body, [], f"AI 修复计划超过单次最多{MAX_AI_REPAIR_PLANS}个局部操作"
+    if len(plans) > 1 and not _allow_partial:
+        # Validate each model item independently first. A malformed item
+        # should not discard unrelated safe targets. The combined pass below
+        # still rejects overlaps and duplicate keep-target conflicts.
+        valid_plans: list[dict[str, Any]] = []
+        rejected_errors: list[str] = []
+        for item in plans:
+            _, _, item_error = apply_repair_plan(
+                body,
+                item,
+                _allow_partial=True,
+            )
+            if item_error:
+                rejected_errors.append(str(item_error))
+            else:
+                valid_plans.append(item)
+        if not valid_plans:
+            return body, [], rejected_errors[0] if rejected_errors else "AI 修复计划无可执行项目"
+        cleaned, applied, combined_error = apply_repair_plan(
+            body,
+            valid_plans,
+            _allow_partial=True,
+        )
+        if combined_error:
+            return body, [], combined_error
+        if applied and rejected_errors:
+            applied[0]["skipped_plan_items"] = len(rejected_errors)
+            applied[0]["skipped_plan_errors"] = rejected_errors[:3]
+        return cleaned, applied, None
     blocks = content_blocks(body)
     by_id = {item["block_id"]: item for item in blocks}
+    links = content_links(body)
+    links_by_id = {str(item["link_id"]): item for item in links}
     segments_by_id = {
         str(segment["segment_id"]): (block, segment)
         for block in blocks
@@ -773,6 +943,74 @@ def apply_repair_plan(
             action = _AI_PLAN_ACTION_ALIASES.get(raw_action, raw_action)
         if action not in _AI_PLAN_ACTIONS:
             return body, [], "AI 修复动作不在允许范围内"
+        if action == "remove_link":
+            link_id = str(item.get("link_id") or "").strip().lower()
+            link = links_by_id.get(link_id)
+            if link is None:
+                return body, [], "AI 修复目标链接不存在"
+            evidence = _plain_text(str(item.get("evidence") or item.get("before") or ""))
+            expected_link_text = str(link.get("text") or "")
+            if evidence != expected_link_text or (not evidence and not int(link.get("image_count") or 0)):
+                return body, [], "AI 修复证据与目标链接文字不一致"
+            raw_confidence = item.get("confidence")
+            if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
+                return body, [], "AI 修复置信度缺失或格式错误"
+            confidence = float(raw_confidence)
+            if not math.isfinite(confidence) or confidence < MIN_AI_REPAIR_CONFIDENCE or confidence > 1:
+                return body, [], "AI 修复置信度不足"
+            fragment = body[int(link["start"]):int(link["end"])]
+            # Reuse the submission boundary's exact anchor semantics: remove
+            # linked text and wrapper, while retaining any linked images.
+            replacement = remove_clickable_links(fragment)
+            operations.append({
+                "action": action,
+                "start": int(link["start"]),
+                "end": int(link["end"]),
+                "replacement": replacement,
+                "evidence": evidence,
+                "item": item,
+                "block_id": None,
+                "segment_id": None,
+                "link_id": link_id,
+                "keep_target_id": None,
+                "tag": "a",
+                "validation": "structured_link_target",
+                "whole_node": True,
+            })
+            continue
+        if action == "remove_empty_block":
+            empty_id = str(item.get("empty_block_id") or "").strip().lower()
+            empty = next(
+                (candidate for candidate in empty_content_blocks(body)
+                 if str(candidate.get("empty_block_id")) == empty_id),
+                None,
+            )
+            if empty is None:
+                return body, [], "AI 修复目标空正文块不存在"
+            evidence = _plain_text(str(item.get("evidence") or item.get("before") or ""))
+            if evidence:
+                return body, [], "AI 修复空正文块证据必须为空"
+            raw_confidence = item.get("confidence")
+            if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
+                return body, [], "AI 修复置信度缺失或格式错误"
+            confidence = float(raw_confidence)
+            if not math.isfinite(confidence) or confidence < MIN_AI_REPAIR_CONFIDENCE or confidence > 1:
+                return body, [], "AI 修复置信度不足"
+            operations.append({
+                "action": action,
+                "start": int(empty["start"]),
+                "end": int(empty["end"]),
+                "replacement": "",
+                "evidence": "",
+                "item": item,
+                "block_id": None,
+                "segment_id": None,
+                "empty_block_id": empty_id,
+                "keep_target_id": None,
+                "tag": str(empty.get("tag") or "p"),
+                "validation": "structured_empty_block",
+            })
+            continue
         target_id = str(item.get("segment_id") or item.get("block_id") or "").strip().lower()
         block_id = target_id.split(".s", 1)[0]
         block = by_id.get(block_id)
@@ -929,7 +1167,7 @@ def apply_repair_plan(
     removed_target_ids = {
         str(operation.get("segment_id") or operation.get("block_id") or "")
         for operation in operations
-        if operation.get("action") in {"remove_block", "remove_text_line"}
+        if operation.get("action") in {"remove_block", "remove_text_line", "remove_link"}
     }
     if any(
         operation.get("keep_target_id") in removed_target_ids
@@ -941,26 +1179,11 @@ def apply_repair_plan(
     removed_visible_chars = sum(
         len(_plain_text(str(operation.get("evidence") or "")))
         for operation in operations
-        if operation.get("action") in {"remove_block", "remove_text_line"}
+        if operation.get("action") in {"remove_block", "remove_text_line", "remove_link"}
     )
     if removed_visible_chars:
-        # Use only indexed article blocks for the denominator. This is a
-        # conservative lower bound when a body contains headings or other
-        # unsupported markup, and therefore fails closed rather than allowing
-        # a large fraction of visible article text to be deleted.
-        visible_body_chars = sum(
-            len(_plain_text(str(block.get("text") or ""))) for block in blocks
-        )
         if removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS:
             return body, [], "AI 修复计划删除可见文字超过单次上限"
-        # A short article can legitimately contain one standalone promotion
-        # that is large relative to the rest of the text. The absolute cap
-        # still applies; use the ratio guard only for sufficiently long bodies.
-        if (
-            visible_body_chars >= 240
-            and removed_visible_chars / visible_body_chars > MAX_AI_REPAIR_REMOVED_RATIO
-        ):
-            return body, [], "AI 修复计划删除可见文字比例超过25%"
     cleaned_parts: list[str] = []
     cursor = 0
     applied: list[dict[str, Any]] = []
@@ -976,7 +1199,9 @@ def apply_repair_plan(
             return body, [], "AI 修复计划操作范围重叠"
         cleaned_parts.append(body[cursor:start])
         original = body[start:end]
-        if replacement:
+        if operation.get("whole_node"):
+            original = replacement
+        elif replacement:
             content_start = original.find(">") + 1
             content_end = original.rfind("<")
             if content_start <= 0 or content_end < content_start:
@@ -987,7 +1212,7 @@ def apply_repair_plan(
         audit_item: dict[str, Any] = {
             "rule": "ai_targeted_repair",
             "action": str(operation["action"]),
-            "block_id": str(operation["block_id"]),
+            "block_id": str(operation["block_id"] or ""),
             "tag": str(operation["tag"]),
             "text": evidence,
             "validation": str(operation["validation"]),
@@ -995,6 +1220,10 @@ def apply_repair_plan(
         }
         if operation.get("segment_id"):
             audit_item["segment_id"] = str(operation["segment_id"])
+        if operation.get("link_id"):
+            audit_item["link_id"] = str(operation["link_id"])
+        if operation.get("empty_block_id"):
+            audit_item["empty_block_id"] = str(operation["empty_block_id"])
         if issue_type:
             audit_item["issue_type"] = issue_type
         for keep_key in ("keep_block_id", "keep_segment_id"):
@@ -1008,6 +1237,29 @@ def apply_repair_plan(
         previous_end = end
     cleaned_parts.append(body[cursor:])
     cleaned = "".join(cleaned_parts)
+    # Removing a whole link can leave its containing paragraph empty. Prune
+    # those containers in the same candidate so a second pass does not see a
+    # formatting-only residue. Image-only containers are excluded by the
+    # structural matcher and remain intact.
+    empty_before_prune = (
+        empty_content_blocks(cleaned)
+        if any(
+            operation.get("action") in {"remove_link", "remove_empty_block"}
+            for operation in operations
+        )
+        else []
+    )
+    if empty_before_prune:
+        cleaned = remove_empty_content_blocks(cleaned)
+        for empty in empty_before_prune:
+            applied.append({
+                "rule": "empty_content_block_cleanup",
+                "action": "remove_empty_block",
+                "empty_block_id": str(empty["empty_block_id"]),
+                "tag": str(empty["tag"]),
+                "text": "",
+                "validation": "structured_empty_block",
+            })
     if cleaned == body:
         return body, [], "AI 修复计划未改变正文"
     return cleaned, applied, None

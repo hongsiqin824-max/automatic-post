@@ -54,6 +54,16 @@ _QUALITY_MARKER_TEXT_BLOCK = re.compile(
     r"</(?P=tag)\s*>",
     re.IGNORECASE,
 )
+# A link-only paragraph becomes empty after ``remove_clickable_links``.
+# Remove only containers that contain whitespace/comments or empty
+# presentational wrappers; image-only containers are intentionally retained.
+_EMPTY_CONTENT_BLOCK = re.compile(
+    r"<(?P<tag>p|div|li)(?P<attrs>\s[^>]*)?>\s*"
+    r"(?:(?:<!--.*?-->\s*)|"
+    r"<(?P<fmt>strong|b|span|em|i)\b[^>]*>\s*</(?P=fmt)\s*>\s*)*"
+    r"</(?P=tag)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
 # ``sponichi`` publishes a CMS template as ordinary text in the translated
 # body.  These markers can occur in the same paragraph as real reporting, so
 # they must be removed as exact tokens rather than by deleting the paragraph.
@@ -228,6 +238,23 @@ def remove_clickable_links(body_html: str | None) -> str:
     return _RESIDUAL_ANCHOR.sub("", cleaned)
 
 
+def remove_empty_content_blocks(body_html: str | None) -> str:
+    """Drop empty text containers while retaining image-only containers.
+
+    This is deliberately narrower than a generic HTML minifier. It only
+    removes ``p``, ``div`` and ``li`` nodes with no visible text, media, or
+    arbitrary nested markup. Repeating the substitution handles an empty
+    wrapper revealed by removing an inner empty block.
+    """
+
+    body = str(body_html or "")
+    previous = None
+    while body != previous:
+        previous = body
+        body = _EMPTY_CONTENT_BLOCK.sub("", body)
+    return body
+
+
 def preprocess_quality_body(body_html: str | None, *, source: str | None = None) -> str:
     """Remove non-article embeds and feed markers before quality checks.
 
@@ -268,11 +295,13 @@ def preprocess_quality_body(body_html: str | None, *, source: str | None = None)
     if source_code == "sponichi":
         body = _SPONICHI_TEMPLATE_MARKER.sub("", body)
         body = _SPONICHI_TEMPLATE_LABEL.sub("", body)
+    body = remove_empty_content_blocks(body)
     # Remove complete embed containers.  Unclosed tags are intentionally left
     # in place; the quality layer will flag them instead of swallowing article
     # text after a malformed upstream fragment.
     body = _QUALITY_DROP_CONTENT.sub("", body)
     body = _QUALITY_DROP_SELF_CLOSING.sub("", body)
+    body = remove_empty_content_blocks(body)
     body = _CLICKABLE_ATTRIBUTE.sub("", body)
     body = _MARKDOWN_LINK.sub("", body)
     return _remove_markdown_reference_links(body)

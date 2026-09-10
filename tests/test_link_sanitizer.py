@@ -25,6 +25,18 @@ def test_removes_case_insensitive_anchor_tags():
     assert remove_clickable_links('<P><A HREF="https://example.com">推荐</A></P>') == "<P></p>"
 
 
+def test_quality_preprocess_removes_empty_container_left_by_text_link():
+    body = '<p>正文内容足够完整，包含比赛过程和赛后采访。</p><p><a href="https://example.com">阅读全文</a></p>'
+
+    assert preprocess_quality_body(body) == '<p>正文内容足够完整，包含比赛过程和赛后采访。</p>'
+
+
+def test_quality_preprocess_keeps_image_only_container_after_link_cleanup():
+    body = '<p>正文内容足够完整，包含比赛过程和赛后采访。</p><p><a href="https://example.com"><img src="/cover.jpg" alt="比赛图"></a></p>'
+
+    assert preprocess_quality_body(body) == '<p>正文内容足够完整，包含比赛过程和赛后采访。</p><p><img src="/cover.jpg" alt="比赛图"></p>'
+
+
 def test_removes_inline_linked_entity_text():
     body = '<p>据<a href="https://example.com/sydney">悉尼FC官方</a>消息，球队已完成签约。</p>'
 

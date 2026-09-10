@@ -43,6 +43,16 @@ class _FakeClient:
         self.chat = type("Chat", (), {"completions": _FlakyCompletions(failures)})()
 
 
+class _SequencedCompletions:
+    def __init__(self, contents):
+        self.contents = iter(contents)
+        self.requests = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        return _FakeResponse(next(self.contents))
+
+
 def test_clean_article_passes_without_llm():
     result = evaluate(
         title="主队在联赛中取得关键胜利",
@@ -64,10 +74,23 @@ def test_llm_http_502_retries_and_exposes_diagnostics(monkeypatch):
     assert fake.chat.completions.calls == 3
 
 
-def test_llm_invalid_json_is_not_retried(monkeypatch):
+def test_llm_invalid_json_is_retried_once_with_strict_instruction(monkeypatch):
     service = LLMService("key", "https://example.test/v1", "test", max_retries=2, retry_delay_seconds=0.1)
+    completions = _SequencedCompletions(["not-json", '{"ok":true}'])
     fake = _FakeClient([])
-    fake.chat.completions.create = lambda **kwargs: _FakeResponse("not-json")
+    fake.chat.completions = completions
+    monkeypatch.setattr(service, "_get_client", lambda: fake)
+
+    assert service.chat_json("{}") == {"ok": True}
+    assert len(completions.requests) == 2
+    assert "上次返回为空或格式无效" in completions.requests[1]["messages"][0]["content"]
+
+
+def test_llm_invalid_json_stops_after_one_strict_retry(monkeypatch):
+    service = LLMService("key", "https://example.test/v1", "test", max_retries=2, retry_delay_seconds=0.1)
+    completions = _SequencedCompletions(["not-json", "still-not-json"])
+    fake = _FakeClient([])
+    fake.chat.completions = completions
     monkeypatch.setattr(service, "_get_client", lambda: fake)
 
     try:
@@ -75,9 +98,21 @@ def test_llm_invalid_json_is_not_retried(monkeypatch):
     except LLMCallError as exc:
         assert exc.category == "invalid_response"
         assert exc.retryable is False
-        assert exc.attempts == 1
+        assert exc.attempts == 2
     else:
         raise AssertionError("expected LLMCallError")
+    assert len(completions.requests) == 2
+
+
+def test_llm_empty_content_gets_the_same_single_strict_retry(monkeypatch):
+    service = LLMService("key", "https://example.test/v1", "test", max_retries=0)
+    completions = _SequencedCompletions(["", '{"ok":true}'])
+    fake = _FakeClient([])
+    fake.chat.completions = completions
+    monkeypatch.setattr(service, "_get_client", lambda: fake)
+
+    assert service.chat_json("{}") == {"ok": True}
+    assert len(completions.requests) == 2
 
 
 def test_incomplete_body_goes_to_review():
@@ -580,7 +615,7 @@ class _ContradictoryRepairPlanLLM:
             "needs_review": False,
             "reason": "内容正常",
             "repair_plans": [{
-                "block_id": "b1",
+                "block_id": "b2",
                 "action": "remove_block",
                 "evidence": "点击这里关注 WhatsApp 频道，获取最新消息",
                 "confidence": 0.99,
@@ -591,14 +626,20 @@ class _ContradictoryRepairPlanLLM:
 def test_repair_plan_cannot_coexist_with_semantic_pass():
     result = evaluate(
         title="球队公布本轮联赛完整比赛结果",
-        body="<p>点击这里关注 WhatsApp 频道，获取最新消息</p>",
+        body=(
+            "<p>球队在本轮联赛中取胜，报道包含比赛过程、球员表现和赛后采访。</p>"
+            "<p>点击这里关注 WhatsApp 频道，获取最新消息</p>"
+        ),
         channels=[1],
         llm=_ContradictoryRepairPlanLLM(),
     )
 
     assert result["pass"] is False
     assert result["needs_review"] is True
-    assert result["repair_plan_error"] == "AI 修复计划与质检结论矛盾"
+    assert result["decision"] == "repairable"
+    assert result["repair_plan_error"] is None
+    assert "矛盾" in result["repair_plan_warning"]
+    assert result["reason"]
 
 
 class _RepairablePromotionLLM:
@@ -671,8 +712,9 @@ def test_repair_plan_requires_explicit_repairable_true():
 
     assert result["pass"] is False
     assert result["repair_plans"]
-    assert result["repair_plan_error"] == "AI 修复计划与 repairable 结论矛盾"
-    assert result["issues"]["semantic_problems"]
+    assert result["decision"] == "repairable"
+    assert result["repair_plan_error"] is None
+    assert result["repair_plan_warning"]
 
 
 class _IncompleteBodyWithPlanLLM:

@@ -24,6 +24,7 @@ from .quality import (
 )
 from .link_sanitizer import preprocess_quality_body
 from .promotion_repair import (
+    MAX_AI_REPAIR_REMOVED_CHARS,
     MAX_AI_REPAIR_PLANS,
     apply_repair_plan,
     body_safety_stats,
@@ -94,6 +95,7 @@ def _audit_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for key in (
             "block_id",
             "segment_id",
+            "link_id",
             "action",
             "validation",
             "issue_type",
@@ -124,11 +126,15 @@ def _audit_repair_plans(plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in plans[:MAX_AI_REPAIR_PLANS]:
         segment_id = str(item.get("segment_id") or "")[:40]
         block_id = str(item.get("block_id") or "")[:40]
+        link_id = str(item.get("link_id") or "")[:40]
+        empty_block_id = str(item.get("empty_block_id") or "")[:40]
         if not block_id and ".s" in segment_id.lower():
             block_id = segment_id.lower().split(".s", 1)[0]
         entry: dict[str, Any] = {
             "block_id": block_id,
             "segment_id": segment_id,
+            "link_id": link_id,
+            "empty_block_id": empty_block_id,
             "action": str(item.get("action") or item.get("operation") or "")[:40],
             "evidence": str(item.get("evidence") or item.get("before") or "")[:300],
         }
@@ -152,6 +158,8 @@ def _quality_passes(quality: Any) -> bool:
     """Require an explicit, empty-issues pass before entering publication."""
 
     if not isinstance(quality, dict):
+        return False
+    if quality.get("decision") not in {None, "clean"}:
         return False
     if quality.get("pass") is not True or quality.get("needs_review") is not False:
         return False
@@ -200,7 +208,12 @@ def _quality_has_repairable_ai_plan(
     if not plans:
         return False
     semantic = quality.get("semantic_check")
-    if not isinstance(semantic, dict) or semantic.get("repairable") is not True:
+    if not isinstance(semantic, dict):
+        return False
+    if (
+        quality.get("decision") != "repairable"
+        and semantic.get("repairable") is not True
+    ):
         return False
     if semantic.get("title_complete") is False or semantic.get("body_complete") is False:
         return False
@@ -217,7 +230,8 @@ def _quality_has_repairable_ai_plan(
     ):
         return False
     return bool(
-        issues.get("dirty_content")
+        quality.get("decision") == "repairable"
+        or issues.get("dirty_content")
         or issues.get("semantic_problems")
         or (isinstance(semantic, dict) and semantic.get("needs_review") is True)
     )
@@ -238,6 +252,36 @@ def _quality_allows_body_repair_planning(quality: dict[str, Any]) -> bool:
         ))
         and (issues.get("dirty_content") or issues.get("semantic_problems"))
     )
+
+
+def _plan_error_allows_dedicated_planner(error: Any) -> bool:
+    """Allow the planner to replace only malformed or empty plan payloads."""
+
+    if not error:
+        return True
+    return str(error) in {
+        "AI 修复计划项目为空",
+        "AI 修复计划包含无效项目",
+        "AI 修复计划必须是对象或数组",
+    }
+
+
+def _repair_validation_error_allows_replan(error: Any) -> bool:
+    """Re-plan locators only; never let the model retry a safety rejection."""
+
+    return str(error or "") in {
+        "AI 修复目标正文块不存在",
+        "AI 修复目标正文行不存在",
+        "AI 修复目标链接不存在",
+        "AI 修复证据与目标链接文字不一致",
+        "AI 修复目标空正文块不存在",
+        "AI 修复空正文块证据必须为空",
+        "AI 修复证据与目标正文块不一致",
+        "行级修复必须提供 segment_id",
+        "行级修复目标缺少明确边界",
+        "重复内容修复缺少有效的保留正文行",
+        "重复内容修复缺少有效的保留正文块",
+    }
 
 
 def _clear_non_blocking_photo_advisory(
@@ -292,17 +336,20 @@ def _quality_allows_followup_body_repair(
 
     if not isinstance(quality, dict):
         return False
-    if quality.get("repair_plan_error") != "AI 修复计划与质检结论矛盾":
+    decision_repairable = quality.get("decision") == "repairable"
+    legacy_contradiction = (
+        quality.get("repair_plan_error") == "AI 修复计划与质检结论矛盾"
+    )
+    if not decision_repairable and not legacy_contradiction:
         return False
     semantic = quality.get("semantic_check")
-    if not isinstance(semantic, dict) or any(
-        semantic.get(key) is not value
-        for key, value in (
-            ("title_complete", True),
-            ("body_complete", True),
-            ("has_ad_or_dirty", False),
-            ("needs_review", False),
-        )
+    if not isinstance(semantic, dict):
+        return False
+    if semantic.get("title_complete") is not True or semantic.get("body_complete") is not True:
+        return False
+    if legacy_contradiction and (
+        semantic.get("has_ad_or_dirty") is not False
+        or semantic.get("needs_review") is not False
     ):
         return False
     issues = quality.get("issues")
@@ -312,14 +359,15 @@ def _quality_allows_followup_body_repair(
         not isinstance(issues.get(key), list) or issues.get(key)
         for key in (
             "title_problems",
-            "dirty_content",
             "completeness_problems",
             "channel_problems",
         )
     ):
         return False
     semantic_problems = issues.get("semantic_problems")
-    if not isinstance(semantic_problems, list) or any(
+    if not isinstance(semantic_problems, list):
+        return False
+    if legacy_contradiction and any(
         "修复计划与质检结论矛盾" not in str(item)
         for item in semantic_problems
     ):
@@ -340,6 +388,9 @@ def _quality_allows_followup_body_repair(
         "program_promotion",
         "channel_promotion",
         "external_promotion",
+        "schedule_promotion",
+        "social_promotion",
+        "sponsorship_promotion",
         "video_promotion",
         "无关内容",
         "重复内容",
@@ -360,20 +411,35 @@ def _quality_allows_followup_body_repair(
         "推广",
         "引流",
         "广告",
+        "链接",
+        "跳转",
+        "外链",
+        "空块",
     )
     for item in plans:
         if not isinstance(item, dict):
             return False
         action = str(item.get("action") or item.get("operation") or "").strip().lower()
-        if action not in {"remove_block", "remove_text_line", "delete_duplicate"}:
+        if action not in {
+            "remove_block",
+            "remove_text_line",
+            "remove_link",
+            "delete_link",
+            "remove_anchor",
+            "remove_empty_block",
+            "delete_empty_block",
+            "delete_duplicate",
+        }:
             return False
         issue_type = str(item.get("issue_type") or item.get("issue_code") or "").strip().lower()
         if issue_type not in allowed_issue_types:
             return False
         evidence = str(item.get("evidence") or item.get("before") or "").strip()
-        # A follow-up is intended for short residual markers, not a whole
-        # paragraph that could contain valid match facts.
-        if not evidence or len(evidence) > 120:
+        if not evidence and action not in {
+            "remove_link",
+            "remove_empty_block",
+            "delete_empty_block",
+        }:
             return False
         reason = str(item.get("reason") or "")
         if not any(marker in reason for marker in reason_markers):
@@ -396,6 +462,16 @@ def _followup_body_is_safe(before: str, after: str) -> tuple[bool, dict[str, Any
         and before_stats["image_attributes"] == after_stats["image_attributes"]
     )
     return safe, before_stats, after_stats
+
+
+def _removed_visible_chars(matches: list[dict[str, Any]]) -> int:
+    """Count exact removed evidence without HTML block separator artifacts."""
+
+    return sum(
+        len(str(item.get("text") or item.get("before") or ""))
+        for item in matches
+        if str(item.get("action") or "") != "replace_text"
+    )
 
 
 def _record_quality_result(
@@ -576,11 +652,12 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
         else:
             repair_plans = []
         repair_plan_error = first_quality.get("repair_plan_error")
+        original_repair_plan_error = repair_plan_error
         repair_planner: dict[str, Any] | None = None
         if (
             first_failed
             and not repair_plans
-            and not repair_plan_error
+            and _plan_error_allows_dedicated_planner(repair_plan_error)
             and not previous_repair.get("attempted")
             and _quality_allows_body_repair_planning(first_quality)
         ):
@@ -600,6 +677,10 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     repair_planner = {
                         "repairable": planner_result.get("repairable") is True,
                         "reason": str(planner_result.get("reason") or "")[:500],
+                        "trigger_error": (
+                            str(original_repair_plan_error)[:300]
+                            if original_repair_plan_error else None
+                        ),
                         "repair_plans": _audit_repair_plans(repair_plans),
                         "repair_plan_error": (
                             str(repair_plan_error)[:300] if repair_plan_error else None
@@ -610,12 +691,17 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     repair_planner = {
                         "repairable": False,
                         "reason": "AI 局部修复规划调用失败",
+                        "trigger_error": (
+                            str(original_repair_plan_error)[:300]
+                            if original_repair_plan_error else None
+                        ),
                         "repair_plans": [],
                         "repair_plan_error": str(exc)[:300],
                     }
         ai_plan_error: str | None = None
         ai_plan_matches: list[dict[str, Any]] = []
         ai_body_after = body_before
+        repair_replanner: dict[str, Any] | None = None
         promotion_candidates: list[dict[str, Any]] = []
         attribution_candidates: list[dict[str, Any]] = []
         repair_scope_is_dirty_only = _quality_repair_scope_is_dirty_only(first_quality)
@@ -634,6 +720,73 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             ai_body_after, ai_plan_matches, ai_plan_error = apply_repair_plan(
                 body_before, repair_plans
             )
+            if (
+                _repair_validation_error_allows_replan(ai_plan_error)
+                and (
+                    first_quality.get("decision") == "repairable"
+                    or _quality_allows_body_repair_planning(first_quality)
+                )
+            ):
+                rejected_plans = [dict(item) for item in repair_plans]
+                replanner_llm = _make_llm(config)
+                if replanner_llm is not None:
+                    trigger_error = str(ai_plan_error)[:300]
+                    try:
+                        replanner_result = plan_local_repair(
+                            title=current.get("title_final", ""),
+                            body=body_before,
+                            first_quality=first_quality,
+                            llm=replanner_llm,
+                            validation_error=trigger_error,
+                            rejected_plans=rejected_plans,
+                        )
+                        replanned = replanner_result.get("repair_plans")
+                        replanned_plans = (
+                            [item for item in replanned if isinstance(item, dict)]
+                            if isinstance(replanned, list) else []
+                        )
+                        replanner_error = replanner_result.get("repair_plan_error")
+                        repair_replanner = {
+                            "attempted": True,
+                            "trigger_error": trigger_error,
+                            "rejected_plans": _audit_repair_plans(rejected_plans),
+                            "repairable": replanner_result.get("repairable") is True,
+                            "reason": str(replanner_result.get("reason") or "")[:500],
+                            "repair_plans": _audit_repair_plans(replanned_plans),
+                            "repair_plan_error": (
+                                str(replanner_error)[:300] if replanner_error else None
+                            ),
+                        }
+                        if (
+                            replanner_result.get("repairable") is True
+                            and replanned_plans
+                            and not replanner_error
+                        ):
+                            repair_plans = replanned_plans
+                            ai_body_after, ai_plan_matches, ai_plan_error = apply_repair_plan(
+                                body_before,
+                                repair_plans,
+                            )
+                            repair_replanner["validation_error"] = (
+                                str(ai_plan_error)[:300] if ai_plan_error else None
+                            )
+                        else:
+                            ai_plan_error = str(
+                                replanner_error
+                                or "AI 重新规划未提供可执行的局部修复计划"
+                            )[:300]
+                    except Exception as exc:  # one failed re-plan still preserves the original body
+                        logger.warning("AI 局部修复重新规划失败 article_id=%s: %s", article_id, exc)
+                        repair_replanner = {
+                            "attempted": True,
+                            "trigger_error": trigger_error,
+                            "rejected_plans": _audit_repair_plans(rejected_plans),
+                            "repairable": False,
+                            "reason": "AI 局部修复重新规划调用失败",
+                            "repair_plans": [],
+                            "repair_plan_error": str(exc)[:300],
+                        }
+                        ai_plan_error = str(exc)[:300]
             promotion_candidates = []
             attribution_candidates = []
         elif first_failed and repair_plans and not previous_repair.get("attempted"):
@@ -668,6 +821,8 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             }
             if repair_planner is not None:
                 repair["repair_planner"] = repair_planner
+            if repair_replanner is not None:
+                repair["repair_replanner"] = repair_replanner
             final_quality = {**first_quality, "promotion_repair": repair}
             repo.save_quality(
                 article_id,
@@ -766,6 +921,8 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
         }
         if repair_planner is not None:
             repair["repair_planner"] = repair_planner
+        if repair_replanner is not None:
+            repair["repair_replanner"] = repair_replanner
         progress_quality = {**first_quality, "promotion_repair": repair}
         # Persist the one-attempt marker before mutating the body. If a worker
         # stops between steps, a later run cannot delete more content.
@@ -815,6 +972,10 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             body_after, removed = remove_promotional_blocks(body_normalized)
         before_stats = body_safety_stats(body_before)
         after_stats = body_safety_stats(body_after)
+        removed_visible_chars = _removed_visible_chars(removed)
+        net_visible_text_reduction = max(
+            0, before_stats["visible_text_length"] - after_stats["visible_text_length"]
+        )
         images_unchanged = before_stats["image_sources"] == after_stats["image_sources"]
         image_attributes_unchanged = (
             before_stats["image_attributes"] == after_stats["image_attributes"]
@@ -828,6 +989,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             and before_stats["image_count"] == after_stats["image_count"]
             and images_unchanged
             and image_attributes_unchanged
+            and removed_visible_chars <= MAX_AI_REPAIR_REMOVED_CHARS
         )
         repair.update({
             "removed_count": len(removed) if safe_to_apply else 0,
@@ -839,11 +1001,22 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             ),
             "before": before_stats,
             "after": after_stats,
+            "cumulative_removed_visible_chars": removed_visible_chars,
+            "net_visible_text_reduction": net_visible_text_reduction,
+            "removed_visible_chars_limit": MAX_AI_REPAIR_REMOVED_CHARS,
+            "cumulative_limit_exceeded": (
+                removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS
+            ),
             "candidate_created": safe_to_apply,
             "candidate_committed": False,
         })
         if not safe_to_apply:
             repair.update({"outcome": "failed", "safety_check_passed": False})
+            safety_error = (
+                f"整次局部修复累计删除可见文字超过 {MAX_AI_REPAIR_REMOVED_CHARS} 字上限"
+                if removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS
+                else "优化后正文过短、正文未变化或图片地址发生变化"
+            )
             final_quality = {**first_quality, "promotion_repair": repair}
             repo.save_quality(
                 article_id,
@@ -861,7 +1034,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     "outcome": "failed",
                     "final_status": "NEEDS_REVIEW",
                     "destination": "人工审核（自动优化安全校验未通过）",
-                    "error": "优化后正文过短、正文未变化或图片地址发生变化",
+                    "error": safety_error,
                 },
                 from_status="NEEDS_REVIEW",
                 to_status="NEEDS_REVIEW",
@@ -970,15 +1143,58 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     quality_claim_token=quality_claim_token,
                 )
                 body_after = followup_body
-                second_quality = followup_quality
-                second_passed = followup_error is None and _quality_passes(
-                    followup_quality
+                cumulative_removed_visible_chars = _removed_visible_chars(
+                    [*removed, *followup_matches]
                 )
+                if cumulative_removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS:
+                    followup_error = (
+                        "整次局部修复累计删除可见文字超过 "
+                        f"{MAX_AI_REPAIR_REMOVED_CHARS} 字上限"
+                        f"（实际 {cumulative_removed_visible_chars} 字）"
+                    )
+                    second_quality = dict(followup_quality)
+                    issues = dict(second_quality.get("issues") or {})
+                    semantic_problems = list(issues.get("semantic_problems") or [])
+                    semantic_problems.append(followup_error)
+                    issues["semantic_problems"] = semantic_problems
+                    semantic_check = dict(second_quality.get("semantic_check") or {})
+                    semantic_check["needs_review"] = True
+                    second_quality.update({
+                        "pass": False,
+                        "needs_review": True,
+                        "decision": "manual_review",
+                        "decision_reason": followup_error,
+                        "score": min(int(second_quality.get("score") or 50), 50),
+                        "issues": issues,
+                        "semantic_check": semantic_check,
+                        "reason": followup_error,
+                    })
+                else:
+                    second_quality = followup_quality
+                second_passed = followup_error is None and _quality_passes(second_quality)
             else:
                 followup_quality = second_quality
         if followup_matches:
             removed = [*removed, *followup_matches]
             repair["removed_count"] = len(removed)
+        after_stats = body_safety_stats(body_after)
+        images_unchanged = before_stats["image_sources"] == after_stats["image_sources"]
+        image_attributes_unchanged = (
+            before_stats["image_attributes"] == after_stats["image_attributes"]
+        )
+        cumulative_removed_visible_chars = _removed_visible_chars(removed)
+        net_visible_text_reduction = max(
+            0, before_stats["visible_text_length"] - after_stats["visible_text_length"]
+        )
+        repair.update({
+            "after": after_stats,
+            "cumulative_removed_visible_chars": cumulative_removed_visible_chars,
+            "net_visible_text_reduction": net_visible_text_reduction,
+            "removed_visible_chars_limit": MAX_AI_REPAIR_REMOVED_CHARS,
+            "cumulative_limit_exceeded": (
+                cumulative_removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS
+            ),
+        })
         applied_event_message: str | None = None
         applied_event_payload: dict[str, Any] | None = None
         if second_passed:
@@ -1003,6 +1219,9 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 "image_count_after": after_stats["image_count"],
                 "image_sources_unchanged": images_unchanged,
                 "image_attributes_unchanged": image_attributes_unchanged,
+                "cumulative_removed_visible_chars": cumulative_removed_visible_chars,
+                "removed_visible_chars_limit": MAX_AI_REPAIR_REMOVED_CHARS,
+                "net_visible_text_reduction": net_visible_text_reduction,
                 "title_unchanged": True,
             }
             if followup_matches:
@@ -1018,7 +1237,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
         if followup_matches or followup_error:
             repair["followup_repair"] = {
                 "attempted": True,
-                "applied": bool(followup_matches),
+                "applied": bool(second_passed and followup_matches),
                 "outcome": "passed" if second_passed and followup_matches else (
                     "failed" if followup_error or followup_matches else "skipped"
                 ),
@@ -1026,8 +1245,15 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 "before": followup_before_stats,
                 "after": followup_after_stats,
                 "error": followup_error,
+                "cumulative_removed_visible_chars": cumulative_removed_visible_chars,
+                "removed_visible_chars_limit": MAX_AI_REPAIR_REMOVED_CHARS,
+                "cumulative_limit_exceeded": (
+                    cumulative_removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS
+                ),
             }
-        if second_error is not None:
+        if followup_error:
+            repair["error"] = followup_error
+        elif second_error is not None:
             repair["error"] = str(second_error)[:300]
         if followup_matches or followup_error:
             repair["second_quality_round2"] = second_quality_round2
@@ -1075,11 +1301,15 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             "destination": "发布队列" if final_status == "READY_TO_PUBLISH" else (
                 "不重复发布" if final_status == "ALREADY_PUBLISHED" else "人工审核"
             ),
+            "cumulative_removed_visible_chars": cumulative_removed_visible_chars,
+            "removed_visible_chars_limit": MAX_AI_REPAIR_REMOVED_CHARS,
         }
         if second_error is None:
             finish_payload["second_quality"] = second_quality
         else:
             finish_payload["error"] = str(second_error)[:300]
+        if followup_error:
+            finish_payload["repair_error"] = followup_error
         repo.add_article_event(
             article_id,
             "AUTO_REPAIR_FINISHED",
@@ -1088,9 +1318,13 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 "候选正文二次完整质检异常，原正文未改动并转人工审核"
                 if second_error is not None
                 else (
-                    "局部修复后二次质检通过，候选正文已提交"
-                    if final_status in {"READY_TO_PUBLISH", "ALREADY_PUBLISHED"}
-                    else "候选正文二次质检未通过，原正文未改动并转人工审核"
+                    "最终质检完成，但累计删除超过安全上限，原正文未改动并转人工审核"
+                    if repair.get("cumulative_limit_exceeded")
+                    else (
+                        "局部修复后二次质检通过，候选正文已提交"
+                        if final_status in {"READY_TO_PUBLISH", "ALREADY_PUBLISHED"}
+                        else "候选正文二次质检未通过，原正文未改动并转人工审核"
+                    )
                 )
             ),
             payload=finish_payload,

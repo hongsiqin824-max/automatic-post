@@ -6,6 +6,7 @@ from app.services.promotion_repair import (
     apply_repair_plan,
     body_safety_stats,
     content_blocks,
+    content_links,
     find_promotional_blocks,
     find_promotional_lines,
     normalize_photo_credits,
@@ -20,6 +21,119 @@ SCOREBOARD_MARKER = "【积分榜】明治安田J1联赛2026/27"
 BRANDED_WATCH_PROMOTION = (
     "请在 ge、Globo 和 SporTV 上观看关于瓦斯科达伽马的全部内容："
 )
+
+
+def test_structured_link_target_removes_link_text_and_preserves_linked_image() -> None:
+    body = (
+        '<p>报道正文介绍了比赛过程和赛后采访，信息完整。</p>'
+        '<p>更多信息请<a href="https://example.com/news"><strong>点击查看完整赛程</strong></a>。</p>'
+        '<p><a href="https://example.com/photo"><img src="/match.jpg" alt="比赛图"></a></p>'
+    )
+    links = content_links(body)
+    assert [item["link_id"] for item in links] == ["l1", "l2"]
+    assert links[0]["text"] == "点击查看完整赛程"
+    assert links[1]["text"] == ""
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "link_id": "l1",
+        "action": "remove_link",
+        "evidence": "点击查看完整赛程",
+        "issue_type": "promotion",
+        "reason": "该链接文字是引流内容，与新闻事实无关",
+        "confidence": 0.99,
+    })
+
+    assert error is None
+    assert cleaned == (
+        '<p>报道正文介绍了比赛过程和赛后采访，信息完整。</p>'
+        '<p>更多信息请。</p>'
+        '<p><a href="https://example.com/photo"><img src="/match.jpg" alt="比赛图"></a></p>'
+    )
+    assert matches[0]["link_id"] == "l1"
+    assert matches[0]["validation"] == "structured_link_target"
+
+
+def test_structured_link_index_uses_parsed_href_and_ignores_named_anchor_or_attribute_text() -> None:
+    body = (
+        '<p title="<a href=\"x\">not a link node</a>">报道正文内容足够完整。</p>'
+        '<a id="jump">普通命名锚点</a>'
+        '<p><a href="https://example.com/?a=1>2">点击查看完整赛程</a></p>'
+    )
+
+    links = content_links(body)
+
+    assert len(links) == 1
+    assert links[0]["text"] == "点击查看完整赛程"
+    assert links[0]["href"] == "https://example.com/?a=1>2"
+
+
+def test_structured_link_target_can_remove_image_wrapper_without_losing_image() -> None:
+    body = '<p>报道正文介绍了比赛过程和赛后采访，信息完整。</p><p><a href="https://example.com/photo"><img src="/match.jpg" alt="比赛图"></a></p>'
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "link_id": "l1",
+        "action": "remove_link",
+        "evidence": "",
+        "confidence": 0.99,
+    })
+
+    assert error is None
+    assert cleaned == '<p>报道正文介绍了比赛过程和赛后采访，信息完整。</p><p><img src="/match.jpg" alt="比赛图"></p>'
+    assert matches[0]["link_id"] == "l1"
+
+
+def test_link_repair_prunes_empty_parent_but_keeps_surrounding_and_images() -> None:
+    body = (
+        '<p>报道正文介绍了比赛过程和赛后采访，信息完整。</p>'
+        '<p><a href="https://example.com">点击查看完整赛程</a></p>'
+        '<p><img src="/match.jpg" alt="比赛图"></p>'
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "link_id": "l1",
+        "action": "remove_link",
+        "evidence": "点击查看完整赛程",
+        "issue_type": "promotion",
+        "reason": "该链接文字是引流内容，与新闻事实无关",
+        "confidence": 0.99,
+    })
+
+    assert error is None
+    assert cleaned == (
+        '<p>报道正文介绍了比赛过程和赛后采访，信息完整。</p>'
+        '<p><img src="/match.jpg" alt="比赛图"></p>'
+    )
+    assert any(item["action"] == "remove_empty_block" for item in matches)
+
+
+def test_repair_plan_executes_valid_item_when_another_item_is_malformed() -> None:
+    keep = "报道正文介绍了比赛过程和赛后采访，信息完整。"
+    removable = "点击查看2026/27赛季完整赛程"
+    body = f"<p>{keep}</p><p>{removable}</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, [
+        {
+            "block_id": "b2",
+            "action": "remove_block",
+            "evidence": removable,
+            "issue_type": "promotion",
+            "reason": "该段是引流内容，与新闻事实无关",
+            "confidence": 0.99,
+        },
+        {
+            "block_id": "b1",
+            "action": "remove_block",
+            "evidence": "不存在的正文",
+            "issue_type": "promotion",
+            "reason": "该段是引流内容，与新闻事实无关",
+            "confidence": 0.99,
+        },
+    ])
+
+    assert error is None
+    assert cleaned == f"<p>{keep}</p>"
+    assert matches[0]["block_id"] == "b2"
+    assert matches[0]["skipped_plan_items"] == 1
 
 
 def test_ai_repair_plan_removes_10878_video_line_only() -> None:
@@ -551,7 +665,7 @@ def test_ai_repair_plan_rejects_removed_text_over_absolute_budget() -> None:
     assert "超过单次上限" in str(error)
 
 
-def test_ai_repair_plan_rejects_removed_text_over_twenty_five_percent() -> None:
+def test_ai_repair_plan_allows_long_candidate_over_twenty_five_percent() -> None:
     context = "报道完整介绍了比赛过程、球员表现和赛后采访信息。" * 9
     promotion = "点击查看本轮赛事完整赛程和比赛详情官网" * 4
     body = f"<p>{context}</p><p>{promotion}</p>"
@@ -563,9 +677,10 @@ def test_ai_repair_plan_rejects_removed_text_over_twenty_five_percent() -> None:
         "confidence": 0.99,
     })
 
-    assert cleaned == body
-    assert matches == []
-    assert "比例超过25%" in str(error)
+    assert error is None
+    assert cleaned == f"<p>{context}</p>"
+    assert len(matches) == 1
+    assert matches[0]["text"] == promotion
 
 
 def test_exact_high_confidence_block_plan_does_not_require_allowed_issue_type():
