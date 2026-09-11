@@ -1105,6 +1105,54 @@ def test_minor_text_defect_cannot_change_numeric_expressions(
     assert "轻微局部修复" in str(error)
 
 
+def test_format_noise_strips_multiline_template_residue() -> None:
+    evidence = "{{c|东京绿茵}可\n33 前锋一美和成\n门将高居丈流(二种)"
+    after = "东京绿茵可\n33 前锋一美和成\n门将高居丈流(二种)"
+    body = (
+        "<p>■J1 水户蜀葵 30 中场奥村仁</p>"
+        f"<p>{evidence}</p>"
+        "<p>町田泽维亚 2 后卫</p>"
+    )
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "replace_text",
+        "evidence": evidence,
+        "after": after,
+        "issue_type": "format_noise",
+        "reason": "目标块混入上游高亮标签的花括号残留，仅清理该噪声",
+        "confidence": 0.98,
+    })
+
+    assert error is None
+    assert cleaned == (
+        "<p>■J1 水户蜀葵 30 中场奥村仁</p>"
+        f"<p>{after}</p>"
+        "<p>町田泽维亚 2 后卫</p>"
+    )
+    assert matches[0]["after"] == after
+
+
+def test_format_noise_multiline_rejected_without_template_residue() -> None:
+    evidence = "本场比赛精彩纷呈。\n主队最终取得胜利。"
+    after = "本场比赛精彩纷呈。\n客队最终取得胜利。"
+    body = f"<p>赛前双方均全力备战。</p><p>{evidence}</p>"
+
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "replace_text",
+        "evidence": evidence,
+        "after": after,
+        "issue_type": "format_noise",
+        "reason": "模型声称只做轻微修正",
+        "confidence": 0.98,
+    })
+
+    assert cleaned == body
+    assert matches == []
+    assert "轻微局部修复" in str(error)
+
+
 def test_removes_only_high_confidence_standalone_plain_text_block() -> None:
     body = (
         '<p class="lead">球队在下半场完成逆转。</p>'

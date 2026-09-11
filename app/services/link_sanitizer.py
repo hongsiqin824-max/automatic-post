@@ -124,6 +124,16 @@ _EDITORIAL_BYLINE_TAIL = re.compile(
     r"[^<>\r\n。！？!?]{1,40}[ \t\u3000]*$",
     re.IGNORECASE,
 )
+# Upstream feeds occasionally leak the Dongqiudi highlight-tag syntax into the
+# article body, e.g. ``{{c|东京绿茵}可`` or ``{{吉田真信}连``.  The braces are
+# never legitimate article characters, so they are stripped before quality
+# checks.  A pipe form ``{{X|Y}`` (closing brace optional) keeps the display
+# value ``Y``; any remaining stray braces are dropped and the surrounding text
+# is preserved.  The probe is used both to gate ``preprocess_quality_body`` and
+# to detect that a cleanup pass is required.
+_TEMPLATE_RESIDUE_PROBE = re.compile(r"\{\{|\}\}|\{[^{}\r\n]*\||\{|\}")
+_TEMPLATE_RESIDUE_PIPE = re.compile(r"\{{1,2}[^{}|\r\n]*\|([^{}\r\n]*?)\}?")
+_TEMPLATE_RESIDUE_BRACE = re.compile(r"\{{1,2}|\}{1,2}")
 _MARKDOWN_DESTINATION = (
     r"(?:https?://|//|/|#|\.\.?/|mailto:|tel:|javascript:|data:)"
     r"[^)\s>]+"
@@ -150,6 +160,22 @@ _MARKDOWN_REFERENCE_DEFINITION = re.compile(
     + r")(?:\s+(?:\"[^\"\r\n]*\"|'[^'\r\n]*'))?\s*$",
     re.IGNORECASE,
 )
+
+
+def _strip_template_residue(body_html: str | None) -> str:
+    """Remove leaked highlight-tag braces before quality checks.
+
+    ``{{X|Y}`` (closing brace optional) collapses to the display value ``Y``;
+    any remaining ``{{``/``}}``/``{``/``}`` braces are dropped while their
+    surrounding text is preserved.  The operation is idempotent because a
+    cleaned body no longer contains braces for the probe to match.
+    """
+
+    body = str(body_html or "")
+    if _TEMPLATE_RESIDUE_PROBE.search(body) is None:
+        return body
+    body = _TEMPLATE_RESIDUE_PIPE.sub(lambda m: m.group(1), body)
+    return _TEMPLATE_RESIDUE_BRACE.sub("", body)
 
 
 def _normalise_markdown_label(value: str) -> str:
@@ -444,6 +470,7 @@ def preprocess_quality_body(body_html: str | None, *, source: str | None = None)
         or _CLICKABLE_ATTRIBUTE.search(body)
         or has_source_template_marker
         or _MEDIA_ARTIFACT_PROBE.search(body) is not None
+        or _TEMPLATE_RESIDUE_PROBE.search(body) is not None
         or re.search(r"(?:brightcove|video-js|jwplayer|vjs-player|player-container)", body, re.IGNORECASE)
         or re.search(r"<\s*(?:area|embed|iframe|math|noscript|object|script|style|svg|template|video|audio)\b", body, re.IGNORECASE)
     ):
@@ -455,6 +482,7 @@ def preprocess_quality_body(body_html: str | None, *, source: str | None = None)
     body = _QUALITY_MARKER_TEXT_BLOCK.sub("", body)
     body = _QUALITY_EMPTY_MARKER_BLOCK.sub("", body)
     body = remove_media_artifact_lines(body)
+    body = _strip_template_residue(body)
     if source_code == "sponichi":
         body = _SPONICHI_TEMPLATE_MARKER.sub("", body)
         body = _SPONICHI_TEMPLATE_LABEL.sub("", body)

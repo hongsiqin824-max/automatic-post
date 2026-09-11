@@ -19,7 +19,11 @@ import unicodedata
 from html.parser import HTMLParser
 from typing import Any
 
-from .link_sanitizer import remove_clickable_links, remove_empty_content_blocks
+from .link_sanitizer import (
+    remove_clickable_links,
+    remove_empty_content_blocks,
+    _strip_template_residue,
+)
 
 
 # Keep this deliberately narrow.  A news paragraph can contain words such as
@@ -533,6 +537,22 @@ def _is_ai_general_removal_plan(item: dict[str, Any]) -> bool:
 def _substantive_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", _plain_text(value)).casefold()
     return "".join(character for character in normalized if character.isalnum())
+
+
+def _is_template_residue_cleanup(evidence: str, replacement: str) -> bool:
+    """Return ``True`` when the edit only strips leaked highlight-tag braces.
+
+    The deterministic cleanup in :func:`_strip_template_residue` removes the
+    upstream ``{{X|Y}`` / stray-brace residue.  When an AI plan proposes exactly
+    that cleaned text, the edit is a verifiable, mechanical noise removal even
+    though it changes ``_substantive_text`` (e.g. dropping the tag label ``c``)
+    or spans multiple segments, so the stricter guards can be relaxed for it.
+    """
+
+    if "{" not in evidence and "}" not in evidence:
+        return False
+    cleaned = _strip_template_residue(evidence)
+    return cleaned != evidence and _plain_text(replacement) == _plain_text(cleaned)
 
 
 def _numeric_expressions(value: str) -> list[str]:
@@ -1129,9 +1149,12 @@ def apply_repair_plan(
                 issue_type not in _AI_REPLACEMENT_ISSUE_TYPES
                 or not _has_valid_ai_reason(item)
                 or replacement == evidence
-                or len(block.get("segments") or []) != 1
-                or _substantive_text(replacement) != _substantive_text(evidence)
                 or _numeric_expressions(replacement) != _numeric_expressions(evidence)
+            ):
+                return body, [], "AI 文本替换不是可验证的轻微局部修复"
+            elif not _is_template_residue_cleanup(evidence, replacement) and (
+                len(block.get("segments") or []) != 1
+                or _substantive_text(replacement) != _substantive_text(evidence)
             ):
                 return body, [], "AI 文本替换不是可验证的轻微局部修复"
         operations.append({

@@ -295,3 +295,33 @@ def test_quality_preprocess_keeps_sentence_that_merely_mentions_editor():
     body = "<p>这名记者曾长期担任报社编辑，负责国际足球报道多年。</p>"
 
     assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_strips_leaked_highlight_tag_braces():
+    body = (
+        "<p>■J1 水户蜀葵 30 中场奥村仁</p>"
+        "<p>{{c|东京绿茵}可\n33 前锋一美和成\n门将高居丈流(二种)</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert "{" not in cleaned and "}" not in cleaned
+    assert "东京绿茵可" in cleaned
+    assert "33 前锋一美和成" in cleaned
+    # Idempotent: a cleaned body has no braces left for the probe to match.
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_drops_stray_braces_and_keeps_names():
+    body = (
+        "<p>{{吉田真信}连入两球，浦和青年队最终将比分扳成2-2。</p>"
+        "<p>[广}}驹野友春（第17分钟）</p>"
+        "<p>DF望月亨利海辉}紧急替补登场。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert "{" not in cleaned and "}" not in cleaned
+    assert "吉田真信连入两球" in cleaned
+    assert "驹野友春" in cleaned
+    assert "望月亨利海辉紧急替补登场" in cleaned
