@@ -1853,8 +1853,10 @@ def list_title_dedup_candidates(since: str, exclude_id: int, connection=None) ->
     """Recent published plus in-flight articles usable as title dedup targets.
 
     Published articles are bounded by ``published_at`` inside the window, while
-    in-flight queue states are bounded by ``created_at`` so two articles of one
-    ingestion batch can still see each other before either is published.
+    in-flight queue states (including QUALITY_SAVED for articles that just
+    finished quality but haven't entered the publish queue yet) are bounded by
+    ``created_at`` so two articles of one ingestion batch can still see each
+    other before either is published.
     """
 
     rows = _conn(connection).execute(
@@ -1865,7 +1867,7 @@ def list_title_dedup_candidates(since: str, exclude_id: int, connection=None) ->
           AND (
             (status = 'PUBLISHED' AND published_at >= ?)
             OR (
-              status IN ('READY_TO_PUBLISH', 'PUBLISHING', 'DRAFT_CONFIRMING')
+              status IN ('READY_TO_PUBLISH', 'PUBLISHING', 'DRAFT_CONFIRMING', 'QUALITY_SAVED')
               AND created_at >= ?
             )
           )

@@ -80,6 +80,36 @@ _SPONICHI_TEMPLATE_LABEL = re.compile(
     r"(?:^|(?<=\r)|(?<=\n)|(?<=>))[ \t]*(?:导语|前言|正文|本文)[ \t]*(?=\r?\n|$|<)",
     re.IGNORECASE | re.MULTILINE,
 )
+# Upstream feeds embed template captions such as ``【图片】…`` and bylines such
+# as ``编写●…编辑部`` as ordinary text.  They are either a standalone block or a
+# ``<br>``/newline separated line inside a reporting paragraph, so the cleanup
+# works line by line and never touches an image node.
+_ARTIFACT_LINE_SEPARATOR = re.compile(r"((?:\r\n|\r|\n|<br\b[^>]*>))", re.IGNORECASE)
+_ARTIFACT_TEXT_BLOCK = re.compile(
+    r"<(?P<tag>p|div|li)(?P<attrs>\s[^>]*)?>"
+    r"(?P<content>(?:[^<>]|<br\b[^>]*>)*?)"
+    r"</(?P=tag)\s*>",
+    re.IGNORECASE,
+)
+_MEDIA_ARTIFACT_PROBE = re.compile(
+    r"【\s*(?:图片|写真|视频|集锦|实战|直播|积分榜|赛程)"
+    r"|\[\s*(?:图片|写真|photo|video|视频|集锦|直播|积分榜|赛程)"
+    r"|(?:编写|撰文|编辑|记者|文|著者)\s*[●•・·:：]",
+    re.IGNORECASE,
+)
+# The Chinese full stop is excluded on purpose: a caption glued to a following
+# sentence reads as one line, and dropping that line would delete reporting.
+_MEDIA_CAPTION_LINE = re.compile(
+    r"[ \t\u3000]*(?:"
+    r"【\s*(?:图片|写真|视频|集锦|实战|直播|积分榜|赛程)[^】\r\n]{0,20}】"
+    r"|\[\s*(?:图片|写真|photo|video|视频|集锦|直播|积分榜|赛程)[^\]\r\n]{0,20}\]"
+    r")[^<>\r\n。]{0,120}[ \t\u3000]*",
+    re.IGNORECASE,
+)
+_EDITORIAL_BYLINE_LINE = re.compile(
+    r"[ \t\u3000]*(?:编写|撰文|编辑|记者|文|著者)\s*[●•・·:：]\s*[^<>\r\n。]{1,80}[ \t\u3000]*",
+    re.IGNORECASE,
+)
 _MARKDOWN_DESTINATION = (
     r"(?:https?://|//|/|#|\.\.?/|mailto:|tel:|javascript:|data:)"
     r"[^)\s>]+"
@@ -255,6 +285,93 @@ def remove_empty_content_blocks(body_html: str | None) -> str:
     return body
 
 
+def _artifact_line_rule(line: str) -> str | None:
+    value = str(line or "").strip().strip("\u3000").strip()
+    if not value or len(value) > 200:
+        return None
+    if _MEDIA_CAPTION_LINE.fullmatch(value):
+        return "media_caption_line"
+    if _EDITORIAL_BYLINE_LINE.fullmatch(value):
+        return "editorial_byline_line"
+    return None
+
+
+def _media_artifact_block_replacements(body: str) -> list[tuple[int, int, str, list[dict[str, str]]]]:
+    """Locate caption/byline lines and return their block-level replacements."""
+
+    replacements: list[tuple[int, int, str, list[dict[str, str]]]] = []
+    for match in _ARTIFACT_TEXT_BLOCK.finditer(body):
+        tokens = _ARTIFACT_LINE_SEPARATOR.split(match.group("content"))
+        lines = tokens[0::2]
+        separators = tokens[1::2]
+        removed: list[dict[str, str]] = []
+        kept: list[int] = []
+        for index, line in enumerate(lines):
+            rule = _artifact_line_rule(line)
+            if rule is None:
+                kept.append(index)
+                continue
+            removed.append({"rule": rule, "text": line.strip()[:180]})
+        if not removed:
+            continue
+        if not kept:
+            replacements.append((match.start(), match.end(), "", removed))
+            continue
+        parts: list[str] = []
+        for position, index in enumerate(kept):
+            parts.append(lines[index])
+            if position < len(kept) - 1 and index < len(separators):
+                parts.append(separators[index])
+        content_start = match.start("content") - match.start()
+        content_end = match.end("content") - match.start()
+        original = match.group(0)
+        replacements.append((
+            match.start(),
+            match.end(),
+            f"{original[:content_start]}{''.join(parts)}{original[content_end:]}",
+            removed,
+        ))
+    return replacements
+
+
+def find_media_artifact_lines(body_html: str | None) -> list[dict[str, str]]:
+    """Report caption/byline lines that deterministic cleanup would remove."""
+
+    body = str(body_html or "")
+    if not body or _MEDIA_ARTIFACT_PROBE.search(body) is None:
+        return []
+    found: list[dict[str, str]] = []
+    for _start, _end, _replacement, removed in _media_artifact_block_replacements(body):
+        found.extend(removed)
+    return found
+
+
+def remove_media_artifact_lines(body_html: str | None) -> str:
+    """Delete template caption and byline lines while keeping every image.
+
+    Only text-only ``p``/``div``/``li`` blocks are inspected, so a block that
+    carries markup such as ``img`` is left byte-for-byte unchanged.  Inside a
+    matched block a single caption line is removed together with one adjacent
+    ``<br>``/newline separator; when every line of the block is an artifact the
+    whole block disappears.  The operation is idempotent.
+    """
+
+    body = str(body_html or "")
+    if not body or _MEDIA_ARTIFACT_PROBE.search(body) is None:
+        return body
+    replacements = _media_artifact_block_replacements(body)
+    if not replacements:
+        return body
+    parts: list[str] = []
+    cursor = 0
+    for start, end, replacement, _removed in replacements:
+        parts.append(body[cursor:start])
+        parts.append(replacement)
+        cursor = end
+    parts.append(body[cursor:])
+    return "".join(parts)
+
+
 def preprocess_quality_body(body_html: str | None, *, source: str | None = None) -> str:
     """Remove non-article embeds and feed markers before quality checks.
 
@@ -282,6 +399,7 @@ def preprocess_quality_body(body_html: str | None, *, source: str | None = None)
         or _QUALITY_EMPTY_MARKER_BLOCK.search(body)
         or _CLICKABLE_ATTRIBUTE.search(body)
         or has_source_template_marker
+        or _MEDIA_ARTIFACT_PROBE.search(body) is not None
         or re.search(r"(?:brightcove|video-js|jwplayer|vjs-player|player-container)", body, re.IGNORECASE)
         or re.search(r"<\s*(?:area|embed|iframe|math|noscript|object|script|style|svg|template|video|audio)\b", body, re.IGNORECASE)
     ):
@@ -292,6 +410,7 @@ def preprocess_quality_body(body_html: str | None, *, source: str | None = None)
     body = _QUALITY_PLAIN_MARKER_LINE.sub("", body)
     body = _QUALITY_MARKER_TEXT_BLOCK.sub("", body)
     body = _QUALITY_EMPTY_MARKER_BLOCK.sub("", body)
+    body = remove_media_artifact_lines(body)
     if source_code == "sponichi":
         body = _SPONICHI_TEMPLATE_MARKER.sub("", body)
         body = _SPONICHI_TEMPLATE_LABEL.sub("", body)

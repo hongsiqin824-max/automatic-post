@@ -184,6 +184,9 @@ class AppConfig:
     title_dedup_lcs_min: int = max(2, min(12, _env_int("AUTOMATIC_POST_TITLE_DEDUP_LCS_MIN", 4)))
     title_dedup_max_candidates: int = max(1, min(10, _env_int("AUTOMATIC_POST_TITLE_DEDUP_MAX_CANDIDATES", 3)))
 
+    # Concurrent quality workers per ingestion run; 1 keeps serial behavior.
+    quality_workers: int = max(1, min(8, _env_int("AUTOMATIC_POST_QUALITY_WORKERS", 4)))
+
     @property
     def material_configured(self) -> bool:
         return bool(self.material_api_key and self.material_caller)

@@ -275,6 +275,7 @@ def test_classified_llm_failure_is_persisted_without_passing_quality():
     assert result["semantic_error"] == {
         "category": "http_error",
         "retryable": True,
+        "fallback_eligible": True,
         "status_code": 502,
         "request_id": None,
         "attempts": 3,
@@ -283,6 +284,80 @@ def test_classified_llm_failure_is_persisted_without_passing_quality():
         "timeout_seconds": 12,
         "message": "bad gateway",
     }
+
+
+class _ProviderDownLLM:
+    """Primary provider is entirely down (e.g. 403 key/group revoked)."""
+
+    configured = True
+    model = "primary-model"
+    timeout = 45
+
+    def chat_json(self, prompt):
+        raise LLMCallError(
+            "AI 服务调用失败: Error code: 403 - API Key 所属分组已删除",
+            category="http_error", retryable=False, fallback_eligible=True,
+            status_code=403, attempts=1, elapsed_ms=5780,
+            model=self.model, timeout_seconds=self.timeout,
+        )
+
+
+class _HealthyFallbackLLM:
+    configured = True
+    model = "fallback-model"
+
+    def chat_json(self, prompt):
+        return {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": False,
+            "needs_review": False,
+            "reason": "内容完整",
+        }
+
+
+def test_provider_down_403_switches_to_fallback_model():
+    fallback = _HealthyFallbackLLM()
+    result = evaluate(
+        title="球队公布完整比赛安排",
+        body="<p>球队今天公布了完整比赛安排，包括比赛时间、地点、参赛名单以及面向球迷的交通信息。</p>",
+        channels=[],
+        llm=_ProviderDownLLM(),
+        llm_fallback=fallback,
+    )
+    # The fallback provider was healthy, so the article is not forced to review
+    # by the primary's 403 and the transport error is cleared.
+    assert result["semantic_error"] is None
+    assert result["needs_review"] is False
+    assert "AI 服务调用失败，需要人工确认" not in result["issues"]["semantic_problems"]
+
+
+class _InvalidResponseLLM:
+    """Primary returns an unusable payload (non-transport failure)."""
+
+    configured = True
+    model = "primary-model"
+    timeout = 45
+
+    def chat_json(self, prompt):
+        raise LLMCallError(
+            "AI 返回不是合法 JSON", category="invalid_response", retryable=False,
+            model=self.model, timeout_seconds=self.timeout,
+        )
+
+
+def test_any_primary_failure_switches_to_fallback_model():
+    # Even a non-transport failure (invalid_response) must try the fallback.
+    result = evaluate(
+        title="球队公布完整比赛安排",
+        body="<p>球队今天公布了完整比赛安排，包括比赛时间、地点、参赛名单以及面向球迷的交通信息。</p>",
+        channels=[],
+        llm=_InvalidResponseLLM(),
+        llm_fallback=_HealthyFallbackLLM(),
+    )
+    assert result["semantic_error"] is None
+    assert result["needs_review"] is False
+    assert "AI 服务调用失败，需要人工确认" not in result["issues"]["semantic_problems"]
 
 
 class _SemanticTitleFixLLM:

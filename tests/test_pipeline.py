@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import threading
+import time
+
+import pytest
+
 from app import repository as repo
 from app.config import AppConfig
 from app.db import _connect
+from app.services import pipeline as pipeline_module
 from app.services.material_client import MaterialFetchResult
 from app.services.pipeline import run_once
 
@@ -198,5 +204,63 @@ def test_quality_item_error_marks_run_partial(app, monkeypatch):
     conn = _connect(database)
     try:
         assert repo.list_run_logs(conn, limit=1)[0]["status"] == "PARTIAL"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("workers,expected_peak", [(4, 4), (1, 1)])
+def test_quality_workers_control_concurrency(app, monkeypatch, workers, expected_peak) -> None:
+    database = app.config["DATABASE"]
+    with app.app_context():
+        tab = repo.list_tabs()[0]
+        repo.update_source("marca", tab_id=tab["id"], enabled=True)
+
+    items = [
+        dict(
+            ITEM,
+            source_url=f"https://example.com/pipeline/parallel/{index}",
+            translate_title=f"客队在杯赛中完成逆转并顺利晋级第{index}轮",
+        )
+        for index in range(1, 5)
+    ]
+    monkeypatch.setattr(
+        "app.services.pipeline.MaterialClient.fetch_all",
+        lambda self, sources, **kwargs: MaterialFetchResult(items=items, total=len(items), pages=1),
+    )
+
+    active: list[int] = []
+    peak = [0]
+    lock = threading.Lock()
+    original = pipeline_module._process_article
+
+    def spy(article, config, connection):
+        with lock:
+            active.append(article["id"])
+            peak[0] = max(peak[0], len(active))
+        try:
+            time.sleep(0.25)
+            return original(article, config, connection)
+        finally:
+            with lock:
+                active.remove(article["id"])
+
+    monkeypatch.setattr(pipeline_module, "_process_article", spy)
+    result = run_once(AppConfig(
+        database_path=database,
+        material_api_key="test-key",
+        material_caller="test-caller",
+        llm_api_key="",
+        publisher_enabled=False,
+        scheduler_enabled=False,
+        quality_workers=workers,
+    ))
+    assert peak[0] == expected_peak
+    assert result["inserted"] == 4
+    assert sum(result["status_counts"].values()) == 4
+    conn = _connect(database)
+    try:
+        articles = repo.list_articles(conn)
+        assert len(articles) == 4
+        assert {item["status"] for item in articles} == {"READY_TO_PUBLISH"}
     finally:
         conn.close()

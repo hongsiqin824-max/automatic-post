@@ -7,6 +7,7 @@ import errno
 import fcntl
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -23,7 +24,7 @@ from .quality import (
     is_photo_credit_advisory_plans,
     plan_local_repair,
 )
-from .link_sanitizer import preprocess_quality_body
+from .link_sanitizer import find_media_artifact_lines, preprocess_quality_body
 from .promotion_repair import (
     MAX_AI_REPAIR_REMOVED_CHARS,
     MAX_AI_REPAIR_PLANS,
@@ -665,13 +666,13 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 "LINKS_REMOVED",
                 connection,
                 message=(
-                    "质检前已清理可跳转内容、播放器和采集残留"
+                    "质检前已清理可跳转内容、播放器、图注署名等采集残留"
                     if preprocess_safe
                     else "检测到可清理的可跳转内容或采集残留，但安全校验未通过，正文未改动"
                 ),
                 payload={
                     "source": "quality_preprocess",
-                    "rule_version": "quality-preprocess-v1",
+                    "rule_version": "quality-preprocess-v2",
                     "before_sha256": preprocess_before["sha256"],
                     "after_sha256": preprocess_after["sha256"],
                     "before_length": len(body_before_preprocess),
@@ -682,6 +683,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     "image_sources_after": preprocess_after["image_sources"],
                     "image_attributes_before": preprocess_before["image_attributes"],
                     "image_attributes_after": preprocess_after["image_attributes"],
+                    "media_artifact_lines": find_media_artifact_lines(body_before_preprocess)[:20],
                     "applied": preprocess_safe,
                 },
                 quality_claim_token=quality_claim_token,
@@ -730,6 +732,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                         body=body_before,
                         first_quality=first_quality,
                         llm=planner_llm,
+                        llm_fallback=_make_fallback_llm(config),
                     )
                     repair_plan_error = planner_result.get("repair_plan_error")
                     planned = planner_result.get("repair_plans")
@@ -798,6 +801,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                             body=body_before,
                             first_quality=first_quality,
                             llm=replanner_llm,
+                            llm_fallback=_make_fallback_llm(config),
                             validation_error=trigger_error,
                             rejected_plans=rejected_plans,
                         )
@@ -1439,6 +1443,75 @@ def recheck_article(article_id: int, config: AppConfig, connection) -> str:
     return _process_article(claimed, config, connection)
 
 
+def _quality_failure_item(article: dict[str, Any], connection) -> dict[str, str]:
+    failed = repo.get_article(article["id"], connection) or article
+    return {
+        "source": str(failed.get("source") or "未知来源"),
+        "source_url": str(failed.get("source_url") or ""),
+        "error": str(failed.get("error") or "质检失败")[:300],
+    }
+
+
+def _process_one_article(
+    article: dict[str, Any], config: AppConfig, connection
+) -> tuple[int, str, dict[str, str] | None]:
+    """Process one article and classify its outcome for the run summary."""
+
+    try:
+        state = _process_article(article, config, connection)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("素材处理失败")
+        return int(article.get("id") or 0), "ERROR", {
+            "source": str(article.get("source") or "未知来源"),
+            "source_url": str(article.get("source_url") or ""),
+            "error": str(exc)[:300],
+        }
+    if state == "ERROR":
+        return int(article.get("id") or 0), state, _quality_failure_item(article, connection)
+    return int(article.get("id") or 0), state, None
+
+
+def _process_article_worker(
+    database_path: str, config: AppConfig, article: dict[str, Any]
+) -> tuple[int, str, dict[str, str] | None]:
+    """Worker entry: an isolated connection keeps transactions thread-local."""
+
+    connection = _connect(database_path)
+    try:
+        return _process_one_article(article, config, connection)
+    finally:
+        connection.close()
+
+
+def _process_articles(
+    articles: list[dict[str, Any]],
+    config: AppConfig,
+    database_path: str,
+    connection,
+    *,
+    workers: int,
+) -> list[tuple[int, str, dict[str, str] | None]]:
+    """Run quality processing; LLM-bound work overlaps when workers > 1.
+
+    Concurrency safety relies on the existing quality lease: only one worker
+    can claim an article, and every write is guarded by the claim token.
+    """
+
+    if not articles:
+        return []
+    if workers <= 1 or len(articles) == 1:
+        return [_process_one_article(article, config, connection) for article in articles]
+    results: list[tuple[int, str, dict[str, str] | None]] = []
+    with ThreadPoolExecutor(max_workers=min(workers, len(articles))) as pool:
+        futures = [
+            pool.submit(_process_article_worker, database_path, config, article)
+            for article in articles
+        ]
+        for future in futures:
+            results.append(future.result())
+    return results
+
+
 def _try_acquire_run_lock(database_path: str):
     """Acquire a crash-safe, non-blocking lock shared by all processes."""
 
@@ -1523,6 +1596,7 @@ def _run_once_locked(config: AppConfig, *, database_path: str | None = None) -> 
             limit=config.fetch_limit,
         )
         fetched = len(fetched_result.items)
+        pending: list[dict[str, Any]] = []
         for raw in fetched_result.items:
             try:
                 item = normalize_item(raw)
@@ -1532,16 +1606,7 @@ def _run_once_locked(config: AppConfig, *, database_path: str | None = None) -> 
                     inserted += 1
                 else:
                     updated += 1
-                state = _process_article(article, config, conn)
-                status_counts[state] = status_counts.get(state, 0) + 1
-                if state == "ERROR":
-                    errors += 1
-                    failed = repo.get_article(article["id"], conn) or article
-                    failed_items.append({
-                        "source": str(failed.get("source") or "未知来源"),
-                        "source_url": str(failed.get("source_url") or ""),
-                        "error": str(failed.get("error") or "质检失败")[:300],
-                    })
+                pending.append(article)
             except Exception as exc:  # noqa: BLE001
                 errors += 1
                 logger.exception("素材处理失败")
@@ -1550,6 +1615,14 @@ def _run_once_locked(config: AppConfig, *, database_path: str | None = None) -> 
                     "source_url": str(raw.get("source_url") or "") if isinstance(raw, dict) else "",
                     "error": str(exc)[:300],
                 })
+        for _article_id, state, failed in _process_articles(
+            pending, config, database_path, conn, workers=config.quality_workers
+        ):
+            status_counts[state] = status_counts.get(state, 0) + 1
+            if state == "ERROR":
+                errors += 1
+                if failed is not None:
+                    failed_items.append(failed)
         publish_result = publish_ready_articles(config, conn)
         # 无论 publisher 是否启用，publish_ready_articles 都会执行 recovery（P2-4 修复）
         if publish_result.get("draft_created"):

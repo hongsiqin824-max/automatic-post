@@ -17,9 +17,7 @@ from app.services.promotion_repair import (
 TITLE = "澳超新赛季赛程公布及揭幕战安排确认"
 ARTICLE_TEXT = "澳超官方公布了新赛季安排，揭幕战将在十月进行，各支球队正在按计划完成季前备战。"
 PROMOTION = "点击查看2026/27赛季五十铃UTE澳超完整赛程"
-VIDEO_TEASER = "【视频】佐藤龙之介送出引发进球的凶狠逼抢，以及他的威胁场面"
 PROGRAM_PROMOTION = "●矢部浩之先生的新节目《J.LEAGUE WEEKEND 周日的矢部萨卡》开播！ ｜ J联赛"
-SCOREBOARD_MARKER = "【积分榜】明治安田J1联赛2026/27"
 BRANDED_WATCH_PROMOTION = (
     "请在 ge、Globo 和 SporTV 上观看关于瓦斯科达伽马的全部内容："
 )
@@ -322,11 +320,11 @@ def test_pipeline_uses_separate_planner_when_first_failure_has_no_plan(
 ) -> None:
     database = app.config["DATABASE"]
     _enable_source(database)
-    extra = "【图片】三井寺眞崇拜的两位世界级球员"
+    extra = "【广告】点击查看新赛季完整赛程与购票入口"
     body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{extra}</p>"
     _fetch(monkeypatch, [_item("separate-planner", body=body)])
-    first = _quality(needs_review=True, reason="正文含与新闻无关的图片入口")
-    first["issues"]["semantic_problems"] = ["正文含与新闻无关的图片入口"]
+    first = _quality(needs_review=True, reason="正文含与新闻无关的广告入口")
+    first["issues"]["semantic_problems"] = ["正文含与新闻无关的广告入口"]
     first["semantic_check"] = {
         "title_complete": True,
         "body_complete": True,
@@ -341,13 +339,13 @@ def test_pipeline_uses_separate_planner_when_first_failure_has_no_plan(
         "app.services.pipeline.plan_local_repair",
         lambda **kwargs: {
             "repairable": True,
-            "reason": "可删除精确定位的图片入口",
+            "reason": "可删除精确定位的广告入口",
             "repair_plans": [{
                 "block_id": "b2",
                 "action": "remove_block",
                 "evidence": extra,
                 "issue_type": "extraneous_content",
-                "reason": "该图片入口与新闻事实无关",
+                "reason": "该广告入口与新闻事实无关",
                 "confidence": 0.95,
             }],
             "repair_plan_error": None,
@@ -1436,7 +1434,7 @@ def test_pipeline_applies_ai_line_plan_and_runs_second_quality(
     database = app.config["DATABASE"]
     _enable_source(database)
     body = (
-        f"<p>{ARTICLE_TEXT}\n{VIDEO_TEASER}\n赛后主教练接受采访并肯定了球队的表现。</p>"
+        f"<p>{ARTICLE_TEXT}\n{PROGRAM_PROMOTION}\n赛后主教练接受采访并肯定了球队的表现。</p>"
         f"{IMAGE}<p>{ARTICLE_TEXT}</p><p>{ARTICLE_TEXT}</p>"
         f"<p>{ARTICLE_TEXT}</p><p>{ARTICLE_TEXT}</p>"
     )
@@ -1451,9 +1449,9 @@ def test_pipeline_applies_ai_line_plan_and_runs_second_quality(
         "repair_plans": [{
             "segment_id": "b1.s2",
             "action": "remove_text_line",
-            "evidence": VIDEO_TEASER,
-            "issue_type": "video_promotion",
-            "reason": "该独立视频引流行与新闻事实无关",
+            "evidence": PROGRAM_PROMOTION,
+            "issue_type": "program_promotion",
+            "reason": "该独立节目推广行与新闻事实无关",
             "confidence": 0.99,
         }],
         "repair_plan_error": None,
@@ -1471,15 +1469,15 @@ def test_pipeline_applies_ai_line_plan_and_runs_second_quality(
 
     assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
     assert len(calls) == 2
-    assert VIDEO_TEASER in calls[0]["body"]
-    assert VIDEO_TEASER not in calls[1]["body"]
+    assert PROGRAM_PROMOTION in calls[0]["body"]
+    assert PROGRAM_PROMOTION not in calls[1]["body"]
     assert ARTICLE_TEXT in calls[1]["body"]
     assert IMAGE in calls[1]["body"]
     conn = _connect(database)
     try:
         article = repo.list_articles(conn)[0]
         assert article["status"] == "READY_TO_PUBLISH"
-        assert VIDEO_TEASER not in article["body_html"]
+        assert PROGRAM_PROMOTION not in article["body_html"]
         repair = article["quality"]["promotion_repair"]
         assert repair["removed_count"] == 1
         assert repair["matches"][0]["segment_id"] == "b1.s2"
@@ -1552,17 +1550,18 @@ def test_pipeline_applies_unknown_ai_program_promotion_and_audits_reason(
         conn.close()
 
 
-def test_pipeline_applies_scoreboard_ai_plan_with_guidance_reason_and_preserves_images(
+def test_pipeline_applies_bracketed_artifact_ai_plan_and_preserves_images(
     app, monkeypatch
 ) -> None:
     database = app.config["DATABASE"]
     _enable_source(database)
+    artifact = "【广告】点击查看新赛季完整赛程与购票入口"
     image_one = (
-        '<IMG SRC="/fastdfs8/scoreboard-main.jpg" ALT="主图" width="640" '
+        '<IMG SRC="/fastdfs8/artifact-main.jpg" ALT="主图" width="640" '
         'loading="lazy" class="hero" data-slot="main">'
     )
     image_two = (
-        '<img class="detail" src="https://img.example/scoreboard-detail.jpg" '
+        '<img class="detail" src="https://img.example/artifact-detail.jpg" '
         'alt="细节图" width="320" height="180" data-slot="detail">'
     )
     context = (
@@ -1570,10 +1569,10 @@ def test_pipeline_applies_scoreboard_ai_plan_with_guidance_reason_and_preserves_
         "并引用了俱乐部及相关人员对下一阶段工作的说明。"
     )
     body = (
-        f"<p>{context}</p>{image_one}<p>{SCOREBOARD_MARKER}</p>"
+        f"<p>{context}</p>{image_one}<p>{artifact}</p>"
         f"{image_two}<p>{context}</p><p>{context}</p>"
     )
-    _fetch(monkeypatch, [_item("ai-scoreboard", body=body)])
+    _fetch(monkeypatch, [_item("ai-bracketed-artifact", body=body)])
     first = deepcopy(FIRST_DIRTY)
     first.update({
         "semantic_check": {
@@ -1586,9 +1585,9 @@ def test_pipeline_applies_scoreboard_ai_plan_with_guidance_reason_and_preserves_
         "repair_plans": [{
             "block_id": "b2",
             "action": "remove_block",
-            "evidence": SCOREBOARD_MARKER,
-            "issue_type": "traffic_generation",
-            "reason": "该独立积分榜入口用于引导访问赛事榜单，与球员转会新闻事实无关",
+            "evidence": artifact,
+            "issue_type": "extraneous_content",
+            "reason": "该广告入口属于采集模板残留，与球员转会新闻事实无关",
             "confidence": 0.99,
         }],
         "repair_plan_error": None,
@@ -1607,8 +1606,8 @@ def test_pipeline_applies_scoreboard_ai_plan_with_guidance_reason_and_preserves_
 
     assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
     assert len(calls) == 2
-    assert SCOREBOARD_MARKER in calls[0]["body"]
-    assert SCOREBOARD_MARKER not in calls[1]["body"]
+    assert artifact in calls[0]["body"]
+    assert artifact not in calls[1]["body"]
     assert body_safety_stats(calls[1]["body"])["image_count"] == before_stats["image_count"]
     assert body_safety_stats(calls[1]["body"])["image_sources"] == before_stats["image_sources"]
     assert body_safety_stats(calls[1]["body"])["image_attributes"] == before_stats["image_attributes"]
@@ -1617,15 +1616,15 @@ def test_pipeline_applies_scoreboard_ai_plan_with_guidance_reason_and_preserves_
     try:
         article = repo.list_articles(conn)[0]
         assert article["status"] == "READY_TO_PUBLISH"
-        assert SCOREBOARD_MARKER not in article["body_html"]
+        assert artifact not in article["body_html"]
         assert body_safety_stats(article["body_html"])["image_attributes"] == before_stats["image_attributes"]
         events = _event_map(article["id"], conn)
         assert [event["payload"]["quality_round"] for event in events["QUALITY_RESULT"]] == [1, 2]
         applied = events["AUTO_REPAIR_APPLIED"][0]["payload"]
         assert applied["image_sources_unchanged"] is True
         assert applied["image_attributes_unchanged"] is True
-        assert applied["removed_blocks"][0]["issue_type"] == "traffic_generation"
-        assert applied["removed_blocks"][0]["reason"] == "该独立积分榜入口用于引导访问赛事榜单，与球员转会新闻事实无关"
+        assert applied["removed_blocks"][0]["issue_type"] == "extraneous_content"
+        assert applied["removed_blocks"][0]["reason"] == "该广告入口属于采集模板残留，与球员转会新闻事实无关"
         finished = events["AUTO_REPAIR_FINISHED"][0]["payload"]
         assert finished["destination"] == "发布队列"
     finally:
@@ -1828,5 +1827,54 @@ def test_pipeline_does_not_batch_process_unfetched_historical_article(app, monke
         events = _event_map(old_article["id"], conn)
         assert "QUALITY_STARTED" not in events
         assert "AUTO_REPAIR_TRIGGERED" not in events
+    finally:
+        conn.close()
+
+
+def test_pipeline_strips_caption_and_byline_before_first_quality(
+    app, monkeypatch
+) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    caption = "【图片】“感觉很强”大阪钢巴新援卡马拉！"
+    byline = "编写●足球文摘Web编辑部"
+    body = (
+        f"<p>{ARTICLE_TEXT}</p>{IMAGE}"
+        f"<p>{ARTICLE_TEXT}<br>{caption}<br>{ARTICLE_TEXT}</p>"
+        f"<p>{byline}</p>"
+    )
+    _fetch(monkeypatch, [_item("caption-strip", body=body)])
+    calls: list[dict] = []
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return deepcopy(SECOND_PASS)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    # The artifacts are gone before the first check, so no repair round is needed.
+    assert len(calls) == 1
+    assert caption not in calls[0]["body"]
+    assert byline not in calls[0]["body"]
+    assert calls[0]["body"].count(ARTICLE_TEXT) == 3
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert caption not in article["body_html"]
+        assert byline not in article["body_html"]
+        assert IMAGE in article["body_html"]
+        payload = _event_map(article["id"], conn)["LINKS_REMOVED"][0]["payload"]
+        assert payload["rule_version"] == "quality-preprocess-v2"
+        assert payload["applied"] is True
+        assert payload["image_count_before"] == payload["image_count_after"] == 1
+        assert [item["text"] for item in payload["media_artifact_lines"]] == [caption, byline]
+        assert [item["rule"] for item in payload["media_artifact_lines"]] == [
+            "media_caption_line",
+            "editorial_byline_line",
+        ]
     finally:
         conn.close()

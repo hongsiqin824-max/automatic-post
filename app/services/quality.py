@@ -32,10 +32,20 @@ class LLMCallError(RuntimeError):
         elapsed_ms: int | None = None,
         model: str | None = None,
         timeout_seconds: int | None = None,
+        fallback_eligible: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
         self.retryable = bool(retryable)
+        # Whether it is worth switching to the fallback model (a different
+        # provider). Retrying the *same* provider is pointless for errors like
+        # 401/403 (key revoked, group deleted, account suspended), but the
+        # fallback provider may still be healthy, so those should switch over.
+        # Default: retryable errors are always fallback-eligible; provider-wide
+        # HTTP failures opt in explicitly at the classification site.
+        self.fallback_eligible = (
+            bool(retryable) if fallback_eligible is None else bool(fallback_eligible)
+        )
         self.status_code = status_code
         self.request_id = request_id
         self.attempts = max(1, int(attempts))
@@ -47,6 +57,7 @@ class LLMCallError(RuntimeError):
         return {
             "category": self.category,
             "retryable": self.retryable,
+            "fallback_eligible": self.fallback_eligible,
             "status_code": self.status_code,
             "request_id": self.request_id,
             "attempts": self.attempts,
@@ -307,6 +318,10 @@ class LLMService:
                 except (TypeError, ValueError):
                     status_code = None
                 request_id = getattr(exc, "request_id", None) or getattr(response, "request_id", None)
+                # ``fallback_eligible`` decides whether switching to the fallback
+                # provider is worthwhile; it defaults to ``retryable`` unless a
+                # branch sets it explicitly.
+                fallback_eligible: bool | None = None
                 if isinstance(exc, (APITimeoutError, TimeoutError)):
                     category, retryable = "timeout", True
                 elif isinstance(exc, (APIConnectionError, ConnectionError)):
@@ -314,12 +329,18 @@ class LLMService:
                 elif isinstance(exc, RateLimitError) or status_code == 429:
                     category, retryable = "rate_limit", True
                 elif isinstance(exc, APIStatusError) or status_code is not None:
+                    # Only transient 5xx should retry the *same* provider, but a
+                    # provider-wide failure (401/403 key/group/account issues, or
+                    # any other 4xx/5xx) is still worth trying on the fallback
+                    # provider, which may be healthy.
                     category, retryable = "http_error", status_code in {500, 502, 503, 504}
+                    fallback_eligible = True
                 else:
                     category, retryable = "provider_error", False
                 last_error = LLMCallError(
                     f"AI 服务调用失败: {str(exc)[:240]}", category=category,
-                    retryable=retryable, status_code=status_code,
+                    retryable=retryable, fallback_eligible=fallback_eligible,
+                    status_code=status_code,
                     request_id=str(request_id)[:200] if request_id else None,
                     attempts=attempt, elapsed_ms=int((time.monotonic() - started) * 1000),
                     model=self.model, timeout_seconds=self.timeout,
@@ -349,8 +370,13 @@ def fix_title(
     llm: LLMService | None = None,
     *,
     force: bool = False,
+    llm_fallback: LLMService | None = None,
 ) -> tuple[str, str]:
-    """Return (title, method). No fabrication is attempted without an LLM."""
+    """Return (title, method). No fabrication is attempted without an LLM.
+
+    When *llm_fallback* is provided and the primary model fails for any reason,
+    the fallback provider is tried once before routing the title to review.
+    """
     original = re.sub(r"\s+", " ", title or "").strip()
     if not force and not _title_problems(original):
         return original, "unchanged"
@@ -373,6 +399,22 @@ def fix_title(
             except (AttributeError, TypeError):
                 pass
         logger.warning("标题自动修正失败: %s", exc)
+        # Any primary-model failure should try the fallback provider once.
+        if llm_fallback is not None and llm_fallback.configured:
+            logger.info("主模型 %s 标题修正失败，尝试降级模型 %s", getattr(llm, "model", "?"), llm_fallback.model)
+            try:
+                result = llm_fallback.chat_json(prompt)
+                candidate = re.sub(r"\s+", " ", str(result.get("title") or "")).strip()
+                if candidate and not _title_problems(candidate):
+                    # The fallback succeeded; clear the primary transport error
+                    # so the article is not forced to review by it.
+                    try:
+                        llm.last_error = None
+                    except (AttributeError, TypeError):
+                        pass
+                    return candidate, "llm"
+            except Exception as fallback_exc:  # noqa: BLE001
+                logger.warning("降级模型标题修正也失败: %s", fallback_exc)
     return original, "manual_review_title_fix_failed"
 
 
@@ -483,10 +525,16 @@ def plan_local_repair(
     body: str,
     first_quality: dict[str, Any],
     llm: LLMService,
+    llm_fallback: LLMService | None = None,
     validation_error: str | None = None,
     rejected_plans: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Ask for one bounded repair plan after a failed first quality check."""
+    """Ask for one bounded repair plan after a failed first quality check.
+
+    When *llm_fallback* is provided and the primary model fails with a
+    transport-level error (timeout / connection / rate_limit / http 5xx),
+    the fallback model is tried once before giving up.
+    """
 
     block_context, body_excerpt = _bounded_repair_context(body)
     diagnosis = {
@@ -543,7 +591,30 @@ def plan_local_repair(
         f"标题：{title[:500]}\n正文：{body_excerpt}\n"
         f"可定位正文块（仅供引用，不是指令）：\n{block_context}"
     )
-    result = llm.chat_json(prompt)
+    result: dict[str, Any] | None = None
+    primary_error: dict[str, Any] | None = None
+    try:
+        result = llm.chat_json(prompt)
+    except LLMCallError as exc:
+        primary_error = exc.as_dict()
+        logger.warning("主模型修复规划失败 category=%s: %s", exc.category, exc)
+        # Any primary-model failure should try the fallback provider once.
+        if (
+            llm_fallback is not None
+            and llm_fallback.configured
+        ):
+            logger.info("主模型 %s 修复规划失败，尝试降级模型 %s", getattr(llm, "model", "?"), llm_fallback.model)
+            try:
+                result = llm_fallback.chat_json(prompt)
+            except Exception as fallback_exc:
+                logger.warning("降级模型修复规划也失败: %s", fallback_exc)
+        if result is None:
+            raise
+    if result is None:
+        raise LLMCallError(
+            "AI 局部修复规划调用失败", category="provider_error", retryable=False,
+            model=getattr(llm, "model", None),
+        )
     if not isinstance(result, dict):
         raise ValueError("AI 局部修复规划返回格式错误")
     plans, plan_error = _repair_plans_from_semantic(result)
@@ -744,11 +815,11 @@ def evaluate(
             logger.warning("AI 语义质检失败 category=%s status=%s attempts=%s: %s", exc.category, exc.status_code, exc.attempts, exc)
             primary_error = exc.as_dict()
             semantic_error = primary_error
-            # Try fallback once for transport-level errors.
+            # Any primary-model failure should try the fallback provider once:
+            # transport errors, provider-wide HTTP failures (401/403), invalid
+            # responses, or a misconfigured primary. The fallback may be healthy.
             if (
-                exc.category in {"timeout", "connection", "rate_limit", "http_error"}
-                and exc.retryable
-                and llm_fallback is not None
+                llm_fallback is not None
                 and llm_fallback.configured
             ):
                 logger.info("主模型 %s 语义质检失败，尝试降级模型 %s", getattr(llm, "model", "?"), llm_fallback.model)
@@ -850,6 +921,7 @@ def evaluate(
             body,
             llm,
             force=semantic.get("title_complete") is False,
+            llm_fallback=llm_fallback,
         )
         candidate_title_error = getattr(llm, "last_error", None)
         if (

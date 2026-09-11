@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from app.services.link_sanitizer import preprocess_quality_body, remove_clickable_links
+from app.services.link_sanitizer import (
+    find_media_artifact_lines,
+    preprocess_quality_body,
+    remove_clickable_links,
+    remove_media_artifact_lines,
+)
 
 
 def test_removes_linked_text_nested_markup_and_keeps_surrounding_body():
@@ -162,3 +167,102 @@ def test_sponichi_template_cleanup_does_not_apply_to_other_sources():
     body = "<p>正文\n主帅介绍了球队状态。 google_ad_section_end(name=s1)</p>"
 
     assert preprocess_quality_body(body, source="foxsprt") == body
+
+
+def test_quality_preprocess_removes_standalone_caption_and_byline_blocks():
+    body = (
+        "<p>正文内容足够完整，包含比赛过程和赛后采访。</p>"
+        "<p>【图片】“感觉很强”大阪钢巴新援卡马拉！</p>"
+        '<p><img src="/story.jpg" alt="比赛图"></p>'
+        "<p>编写●足球文摘Web编辑部</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == (
+        "<p>正文内容足够完整，包含比赛过程和赛后采访。</p>"
+        '<p><img src="/story.jpg" alt="比赛图"></p>'
+    )
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_removes_caption_line_inside_paragraph():
+    body = (
+        "<p>J1联赛大阪钢巴9月10日宣布签下后卫卡马拉。"
+        "<br>【图片】“感觉很强”大阪钢巴新援卡马拉！"
+        "<br>现年24岁的这名后卫上赛季效力于葡萄牙联赛。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == (
+        "<p>J1联赛大阪钢巴9月10日宣布签下后卫卡马拉。"
+        "<br>现年24岁的这名后卫上赛季效力于葡萄牙联赛。</p>"
+    )
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_removes_newline_separated_caption_and_byline_lines():
+    body = (
+        "<p>正文第一段足够完整。\n【视频】上田绮世让球迷震惊的瞬间\n正文第二段也足够完整。</p>"
+        "<p>撰文：足球文摘网编辑部</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == "<p>正文第一段足够完整。\n正文第二段也足够完整。</p>"
+
+
+def test_quality_preprocess_removes_half_width_caption_markers():
+    body = "<p>[视频]南野最美好的回忆！卡拉宝杯劲射破门！</p><p>[图片]维尼修斯与恋人拥抱</p>"
+
+    assert preprocess_quality_body(body) == ""
+
+
+def test_quality_preprocess_removes_byline_variants():
+    body = (
+        "<p>文●白鸟和洋（足球文摘TV编辑长）</p>"
+        "<p>编辑●《足球文摘》网络版编辑部</p>"
+        "<p>文●沢田啓明</p>"
+        "<p>正文内容足够完整，包含比赛过程和赛后采访。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == "<p>正文内容足够完整，包含比赛过程和赛后采访。</p>"
+
+
+def test_quality_preprocess_keeps_caption_glued_to_reporting_sentence():
+    body = (
+        "<p>【视频】谷口彰悟打进戏剧性制胜球！圣图尔登首发4名日本球员。"
+        "下半场双方迟迟未能破门，比赛以0-0进入补时。</p>"
+    )
+
+    assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_keeps_caption_marker_inside_a_sentence():
+    body = "<p>官方账号发布了【图片】维尼修斯与恋人拥抱的照片，引发热议。</p>"
+
+    assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_keeps_block_that_carries_an_image():
+    body = '<p><img src="/one.jpg" alt="合影">【图片】维尼修斯与恋人拥抱</p>'
+
+    assert preprocess_quality_body(body) == body
+    assert find_media_artifact_lines(body) == []
+
+
+def test_media_artifact_helpers_report_rules_and_are_idempotent():
+    body = "<p>【积分榜】明治安田J1联赛最新排名</p><p>编写●足球文摘Web编辑部</p>"
+
+    found = find_media_artifact_lines(body)
+
+    assert [item["rule"] for item in found] == [
+        "media_caption_line",
+        "editorial_byline_line",
+    ]
+    assert remove_media_artifact_lines(body) == ""
+    assert remove_media_artifact_lines("") == ""
+    assert find_media_artifact_lines("<p>正文内容足够完整。</p>") == []
