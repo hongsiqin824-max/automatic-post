@@ -94,7 +94,7 @@ _ARTIFACT_TEXT_BLOCK = re.compile(
 _MEDIA_ARTIFACT_PROBE = re.compile(
     r"【\s*(?:图片|写真|视频|集锦|实战|直播|积分榜|赛程)"
     r"|\[\s*(?:图片|写真|photo|video|视频|集锦|直播|积分榜|赛程)"
-    r"|(?:编写|撰文|编辑|记者|编排|整理|构成|供稿|文|著者)\s*[●•・·:：]",
+    r"|(?:编写|撰文|编撰|编辑|记者|编排|整理|构成|供稿|文|著者)\s*[●•・·:：]",
     re.IGNORECASE,
 )
 # The Chinese full stop is excluded on purpose: a caption glued to a following
@@ -120,7 +120,7 @@ _EDITORIAL_BYLINE_LINE = re.compile(
 # and stay short so a normal sentence is never truncated.
 _EDITORIAL_BYLINE_TAIL = re.compile(
     r"(?<=[。！？!?])[ \t\u3000]*"
-    r"(?:编写|撰文|编辑|记者|编排|整理|构成|供稿|文|著者)\s*[●•・·]\s*"
+    r"(?:编写|撰文|编撰|编辑|记者|编排|整理|构成|供稿|文|著者)\s*[●•・·]\s*"
     r"[^<>\r\n。！？!?]{1,40}[ \t\u3000]*$",
     re.IGNORECASE,
 )

@@ -289,6 +289,27 @@ def test_quality_preprocess_strips_byline_glued_to_sentence_tail():
     ]
 
 
+def test_quality_preprocess_strips_byline_lead_in_bianzhuan():
+    # Real feed shape from a Yahoo Japan translation: the byline lead-in token
+    # ``编撰`` was previously missing from the matcher, so the signature tail
+    # survived at the end of the reporting sentence.
+    body = (
+        "<p>这位在2025年7月东亚杯完成日本国家队首秀的后腰，"
+        "外界也在等待他的新东家首秀。 编撰●足球文摘Web编辑部</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == (
+        "<p>这位在2025年7月东亚杯完成日本国家队首秀的后腰，"
+        "外界也在等待他的新东家首秀。</p>"
+    )
+    assert preprocess_quality_body(cleaned) == cleaned
+    assert [item["rule"] for item in find_media_artifact_lines(body)] == [
+        "editorial_byline_tail",
+    ]
+
+
 def test_quality_preprocess_keeps_sentence_that_merely_mentions_editor():
     # A normal sentence containing "编辑" without a ●-style byline marker after
     # a full stop must never be truncated.
