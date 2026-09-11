@@ -68,13 +68,13 @@ def test_create_article_form_filters_blacklisted_channels_at_submission_boundary
         "title_final": "发布边界标签过滤",
         "body_html": "<p>完整正文，信息充分。</p>",
         "channels": [89, 700000001, 93, 189],
-        "channelsnew": [90, 122],
+        "channelsnew": [90, 700000002],
     }
 
     form = build_create_article_form(article, {"backend_tab_id": 284}, config)
 
     assert ("channels", "700000001,189") in form
-    assert ("channelsnew", "122") in form
+    assert ("channelsnew", "700000002") in form
 
 
 def test_create_article_form_omits_channels_when_all_are_blacklisted(app):

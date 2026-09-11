@@ -4,8 +4,11 @@ from app.services.channel_filter import BLOCKED_CHANNEL_IDS, filter_blocked_chan
 
 
 def test_filter_blocked_channels_matches_exact_ids_and_preserves_order():
-    # 700000001 is an arbitrary ID absent from every blacklist (team/backend/player).
-    assert filter_blocked_channels([89, "700000001", 93, 122, 189, 122]) == [700000001, 122, 189]
+    # 700000001/700000002 are arbitrary IDs absent from every blacklist
+    # (team/backend/player); 89、93 are blacklisted national-team tags.
+    assert filter_blocked_channels(
+        [89, "700000001", 93, 700000002, 189, 700000002]
+    ) == [700000001, 700000002, 189]
 
 
 def test_filter_blocked_channels_removes_player_tag_ids():
