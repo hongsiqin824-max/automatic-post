@@ -94,7 +94,7 @@ _ARTIFACT_TEXT_BLOCK = re.compile(
 _MEDIA_ARTIFACT_PROBE = re.compile(
     r"【\s*(?:图片|写真|视频|集锦|实战|直播|积分榜|赛程)"
     r"|\[\s*(?:图片|写真|photo|video|视频|集锦|直播|积分榜|赛程)"
-    r"|(?:编写|撰文|编辑|记者|文|著者)\s*[●•・·:：]",
+    r"|(?:编写|撰文|编辑|记者|编排|整理|构成|供稿|文|著者)\s*[●•・·:：]",
     re.IGNORECASE,
 )
 # The Chinese full stop is excluded on purpose: a caption glued to a following
@@ -108,6 +108,20 @@ _MEDIA_CAPTION_LINE = re.compile(
 )
 _EDITORIAL_BYLINE_LINE = re.compile(
     r"[ \t\u3000]*(?:编写|撰文|编辑|记者|文|著者)\s*[●•・·:：]\s*[^<>\r\n。]{1,80}[ \t\u3000]*",
+    re.IGNORECASE,
+)
+# Some feeds glue the editorial byline to the end of a real reporting line,
+# separated only by a space rather than a ``<br>``/newline (for example
+# ``……榜首意大利队。 编排●Soccer Digest Web编辑部``).  ``_EDITORIAL_BYLINE_LINE``
+# only removes a whole line, so the trailing signature survives.  This matcher
+# strips just the signature tail while keeping the sentence that precedes it.
+# It is deliberately narrow: the tail must follow a sentence-ending punctuation
+# mark, start with an explicit byline lead-in token and a ``●``-style marker,
+# and stay short so a normal sentence is never truncated.
+_EDITORIAL_BYLINE_TAIL = re.compile(
+    r"(?<=[。！？!?])[ \t\u3000]*"
+    r"(?:编写|撰文|编辑|记者|编排|整理|构成|供稿|文|著者)\s*[●•・·]\s*"
+    r"[^<>\r\n。！？!?]{1,40}[ \t\u3000]*$",
     re.IGNORECASE,
 )
 _MARKDOWN_DESTINATION = (
@@ -296,6 +310,28 @@ def _artifact_line_rule(line: str) -> str | None:
     return None
 
 
+def _strip_editorial_byline_tail(line: str) -> tuple[str, str | None]:
+    """Strip a byline glued to the tail of a reporting line.
+
+    Returns ``(line, None)`` when nothing is removed. Otherwise returns the
+    line with only the trailing signature removed and the removed tail text.
+    The reporting sentence (including its ending punctuation) is preserved.
+    """
+
+    original = str(line or "")
+    if len(original) > 200:
+        return original, None
+    match = _EDITORIAL_BYLINE_TAIL.search(original)
+    if match is None:
+        return original, None
+    stripped = original[: match.start()]
+    tail = original[match.start():].strip().strip("\u3000").strip()
+    # The remaining text must still be a real sentence, not whitespace only.
+    if not stripped.strip().strip("\u3000").strip():
+        return original, None
+    return stripped, tail or None
+
+
 def _media_artifact_block_replacements(body: str) -> list[tuple[int, int, str, list[dict[str, str]]]]:
     """Locate caption/byline lines and return their block-level replacements."""
 
@@ -306,9 +342,17 @@ def _media_artifact_block_replacements(body: str) -> list[tuple[int, int, str, l
         separators = tokens[1::2]
         removed: list[dict[str, str]] = []
         kept: list[int] = []
+        edited_lines: dict[int, str] = {}
         for index, line in enumerate(lines):
             rule = _artifact_line_rule(line)
             if rule is None:
+                # The whole line is legitimate, but a byline may be glued to
+                # its tail after a sentence-ending mark.  Strip only that tail
+                # while keeping the reporting sentence intact.
+                stripped, tail = _strip_editorial_byline_tail(line)
+                if tail is not None:
+                    removed.append({"rule": "editorial_byline_tail", "text": tail[:180]})
+                    edited_lines[index] = stripped
                 kept.append(index)
                 continue
             removed.append({"rule": rule, "text": line.strip()[:180]})
@@ -319,7 +363,7 @@ def _media_artifact_block_replacements(body: str) -> list[tuple[int, int, str, l
             continue
         parts: list[str] = []
         for position, index in enumerate(kept):
-            parts.append(lines[index])
+            parts.append(edited_lines.get(index, lines[index]))
             if position < len(kept) - 1 and index < len(separators):
                 parts.append(separators[index])
         content_start = match.start("content") - match.start()

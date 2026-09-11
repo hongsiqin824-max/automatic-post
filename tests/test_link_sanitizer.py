@@ -266,3 +266,32 @@ def test_media_artifact_helpers_report_rules_and_are_idempotent():
     assert remove_media_artifact_lines(body) == ""
     assert remove_media_artifact_lines("") == ""
     assert find_media_artifact_lines("<p>正文内容足够完整。</p>") == []
+
+
+def test_quality_preprocess_strips_byline_glued_to_sentence_tail():
+    # Real feed shape: the byline is glued to the end of a reporting sentence
+    # with only a space (no <br>/newline) after the full stop.
+    body = (
+        "<p>日本队在小组赛两场过后1胜1平积4分，暂列第二。"
+        "末轮她们将对阵已经提前锁定淘汰赛席位的榜首意大利队。 "
+        "编排●Soccer Digest Web编辑部</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == (
+        "<p>日本队在小组赛两场过后1胜1平积4分，暂列第二。"
+        "末轮她们将对阵已经提前锁定淘汰赛席位的榜首意大利队。</p>"
+    )
+    assert preprocess_quality_body(cleaned) == cleaned
+    assert [item["rule"] for item in find_media_artifact_lines(body)] == [
+        "editorial_byline_tail",
+    ]
+
+
+def test_quality_preprocess_keeps_sentence_that_merely_mentions_editor():
+    # A normal sentence containing "编辑" without a ●-style byline marker after
+    # a full stop must never be truncated.
+    body = "<p>这名记者曾长期担任报社编辑，负责国际足球报道多年。</p>"
+
+    assert preprocess_quality_body(body) == body
