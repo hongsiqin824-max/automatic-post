@@ -106,6 +106,29 @@ _MEDIA_CAPTION_LINE = re.compile(
     r")[^<>\r\n。]{0,120}[ \t\u3000]*",
     re.IGNORECASE,
 )
+# ``_MEDIA_CAPTION_LINE`` only removes a caption that occupies a whole line
+# (``fullmatch``).  Some feeds instead glue a "related video" promo *sentence*
+# into a reporting paragraph with no ``<br>``/newline separator, either at the
+# block start (``<p>【视频】谷口彰悟制胜球！正文……``) or wedged between two
+# reporting sentences (``……又有一名新援离队。 【视频】横滨FM…处子球！ 这名右后卫……``).
+# Such a sentence can never occupy a whole line, so the line-level pass cannot
+# reach it.  This matcher removes the standalone media-caption *sentence* while
+# keeping the reporting around it.  Per the agreed policy a bracket media marker
+# (``【视频】``/``【图片】``/``[video]``/…) that OPENS a sentence — i.e. it sits at the
+# block start or right after a sentence-ending mark — is a standalone caption and
+# is dropped whole.  The one保留 case is a marker used INSIDE a sentence as a
+# grammatical part of it (``官方账号发布了【图片】…的照片``): there the marker is
+# preceded by ordinary text (not whitespace/block-start nor a sentence mark), so
+# the guard below does not match and the sentence is kept.  The boundary class
+# excludes ``。！？!?`` so a following reporting sentence is never swallowed, and
+# the caption sentence is length-capped.
+_INLINE_MEDIA_CAPTION = re.compile(
+    r"(?:(?<=[。！？!?])|(?<![^ \t\u3000>]))[ \t\u3000]*(?:"
+    r"【\s*(?:图片|写真|视频|集锦|实战|直播|进球|录像|回放|锦集)[^】\r\n]{0,20}】"
+    r"|\[\s*(?:图片|写真|photo|video|视频|集锦|直播|进球|录像|回放)[^\]\r\n]{0,20}\]"
+    r")[^<>\r\n。！？!?]{0,80}[。！？!?]?[ \t\u3000]*",
+    re.IGNORECASE,
+)
 _EDITORIAL_BYLINE_LINE = re.compile(
     r"[ \t\u3000]*(?:编写|撰文|编辑|记者|文|著者)\s*[●•・·:：]\s*[^<>\r\n。]{1,80}[ \t\u3000]*",
     re.IGNORECASE,
@@ -134,6 +157,88 @@ _EDITORIAL_BYLINE_TAIL = re.compile(
 _TEMPLATE_RESIDUE_PROBE = re.compile(r"\{\{|\}\}|\{[^{}\r\n]*\||\{|\}")
 _TEMPLATE_RESIDUE_PIPE = re.compile(r"\{{1,2}[^{}|\r\n]*\|([^{}\r\n]*?)\}?")
 _TEMPLATE_RESIDUE_BRACE = re.compile(r"\{{1,2}|\}{1,2}")
+# Upstream Globo/ge feeds glue live-stream promotion into ordinary article
+# sentences, e.g. ``…光明球场打响。ge 将实时跟进本场比赛（点击这里）。`` or a
+# broadcast line ``转播：ESPN、Disney+（流媒体）和ge实时直播（点击这里）。``.  The
+# structural repair layer can only drop whole blocks/lines, so a promo glued
+# mid-paragraph survives and forces manual review.  This deterministic pass
+# removes only the offending *sentence* while keeping the surrounding report.
+#
+# A sentence is removed only when it carries BOTH a platform/channel marker
+# AND an explicit call-to-action (dual-factor guard), so ordinary sentences
+# that merely mention "关注"/"观看" or a brand name are never truncated.
+# ``_INLINE_PROMO_PLATFORM`` deliberately includes concrete brand names per the
+# agreed policy (口径 A), and a broadcast ``转播：…`` sentence is dropped whole.
+_INLINE_PROMO_PLATFORM = (
+    r"(?:ge|直播平台|转播|播出|流媒体|频道|客户端|"
+    r"disney\+?|espn|hulu|paramount\+?|dazn|amazon|prime\s*video|youtube|twitch|"
+    r"premiere|sportv|globoplay|globo|cazetv|"
+    r"咪咕|优酷|腾讯体育|爱奇艺|抖音|快手|b站|哔哩哔哩|微博|视频号|公众号|app)"
+)
+_INLINE_PROMO_ACTION = (
+    r"(?:点击(?:这里|查看|进入|观看|了解)?|扫码|扫描二维码|关注|订阅|下载|"
+    r"访问|前往|登录|实时(?:跟进|直播|文字直播|更新)|跟进本场|观看直播|收看|"
+    r"抢先看|尽在|敬请关注|更多(?:内容|资讯|新闻))"
+)
+# A single sentence: text up to (and including) a sentence-ending mark.  Kept
+# short (<=80 visible chars) so a long ordinary sentence is never swallowed.
+_INLINE_PROMO_SENTENCE = re.compile(
+    r"[^。！？!?\r\n]*?"
+    r"(?:" + _INLINE_PROMO_PLATFORM + r"[^。！？!?\r\n]*?" + _INLINE_PROMO_ACTION
+    + r"|" + _INLINE_PROMO_ACTION + r"[^。！？!?\r\n]*?" + _INLINE_PROMO_PLATFORM + r")"
+    r"[^。！？!?\r\n]*?[。！？!?]",
+    re.IGNORECASE,
+)
+_INLINE_PROMO_MAX_SENTENCE_CHARS = 80
+# Broadcast/schedule lines glue the promo onto the tail of a long info sentence
+# that also carries useful date/venue text, e.g.
+# ``日期：… 地点：… 转播：ESPN、Disney+（流媒体）和ge实时直播（点击这里）。``.
+# Removing the whole sentence would drop the date/venue, so only the broadcast
+# tail (from the ``转播/直播平台/播出`` label to the sentence end) is cut when it
+# carries a call-to-action.  Per 口径 A the broadcast enumeration itself is
+# considered promotion and removed together with the tail.
+_INLINE_PROMO_BROADCAST_TAIL = re.compile(
+    r"(?:转播|直播平台|播出平台|播出|观看方式|收看方式)\s*[:：][^。！？!?\r\n]*?"
+    + _INLINE_PROMO_ACTION
+    + r"[^。！？!?\r\n]*?(?=[。！？!?]|$)",
+    re.IGNORECASE,
+)
+# Per 口径 A a *pure broadcast/schedule sentence* — one that only announces where
+# a match is shown, with no call-to-action — is still promotion and removed
+# whole.  This intentionally relaxes the dual-factor guard, but only for
+# sentences that either open with an explicit broadcast label
+# (``转播：/直播：/播出：/收看：/观看方式：``) or state ``<平台> … 直播/转播/播出`` as
+# their entire content.  A short-sentence cap and a negative guard for factual
+# keywords (date/venue/lineup/referee/…) prevent an ordinary report sentence
+# that merely mentions a broadcaster from being truncated.
+_BROADCAST_LABEL = r"(?:转播|直播|播出|收看|观看方式|收看方式|观看)"
+_BROADCAST_VERB = r"(?:现场直播|直播|转播|播出|放送|带来.{0,6}(?:直播|转播)|独家(?:直播|转播))"
+# Factual markers that make a sentence carry real news value; if present the
+# sentence is protected from the broadcast-sentence rule (it may still lose only
+# its promo tail via ``_INLINE_PROMO_BROADCAST_TAIL``).
+_BROADCAST_PROTECT = re.compile(
+    r"(?:日期|时间|地点|球场|开球|预计首发|首发|缺阵|停赛|伤病|黄牌|红牌|裁判|"
+    r"主裁|助理裁判|第四官员|var|积分|排名|名单|回归)",
+    re.IGNORECASE,
+)
+_INLINE_PROMO_BROADCAST_LABEL = re.compile(
+    r"[^。！？!?\r\n]*?" + _BROADCAST_LABEL + r"\s*[:：][^。！？!?\r\n]*?[。！？!?]",
+    re.IGNORECASE,
+)
+_INLINE_PROMO_BROADCAST_SENTENCE = re.compile(
+    # Clause boundary: start right after a clause separator (，,、；;) or the
+    # block start, so a preceding factual clause (e.g. ``这场比赛属于巴甲第27轮``)
+    # is never swallowed.  The broadcast clause and its leading separator are
+    # removed together; a trailing sentence mark left dangling is cleaned later.
+    r"[，,、；;]?"
+    r"[^。！？!?，,、；;\r\n]*?"
+    + _INLINE_PROMO_PLATFORM
+    + r"[^。！？!?，,、；;\r\n]{0,12}?"
+    + _BROADCAST_VERB
+    + r"[^。！？!?，,、；;\r\n]*?"
+    r"(?=[。！？!?]|$)",
+    re.IGNORECASE,
+)
 _MARKDOWN_DESTINATION = (
     r"(?:https?://|//|/|#|\.\.?/|mailto:|tel:|javascript:|data:)"
     r"[^)\s>]+"
@@ -176,6 +281,138 @@ def _strip_template_residue(body_html: str | None) -> str:
         return body
     body = _TEMPLATE_RESIDUE_PIPE.sub(lambda m: m.group(1), body)
     return _TEMPLATE_RESIDUE_BRACE.sub("", body)
+
+
+# Only inspect text-only p/div/li blocks; any block carrying markup such as
+# ``img`` is left byte-for-byte unchanged so images are never touched.  ``<br>``
+# is allowed inside the block so broadcast/schedule lines are still reachable.
+_INLINE_PROMO_TEXT_BLOCK = re.compile(
+    r"<(?P<tag>p|div|li)\b[^>]*>"
+    r"(?P<content>(?:<br\s*/?>|(?!</?(?:p|div|li|img|a)\b)[^<])*)"
+    r"</(?P=tag)>",
+    re.IGNORECASE,
+)
+
+
+def _strip_inline_promotion_from_text(text: str) -> str:
+    """Drop promo sentences glued inside a plain-text block.
+
+    Two passes: first cut a broadcast tail (``转播：…点击这里``) glued to a long
+    info sentence while keeping its date/venue text; then remove any remaining
+    short sentence that carries both a platform marker and a call-to-action.
+    Surrounding reporting sentences (and their punctuation) are preserved.
+    """
+
+    def _drop_short_sentence(match: "re.Match[str]") -> str:
+        sentence = match.group(0)
+        if len(sentence) > _INLINE_PROMO_MAX_SENTENCE_CHARS:
+            return sentence
+        return ""
+
+    def _drop_broadcast_sentence(match: "re.Match[str]") -> str:
+        sentence = match.group(0)
+        if len(sentence) > _INLINE_PROMO_MAX_SENTENCE_CHARS:
+            return sentence
+        # A sentence that also carries factual news value (date/venue/lineup/
+        # referee/…) is protected; only its promo tail may be trimmed elsewhere.
+        if _BROADCAST_PROTECT.search(sentence):
+            return sentence
+        return ""
+
+    cleaned = _INLINE_PROMO_BROADCAST_TAIL.sub("", text)
+    # 口径 A: drop pure broadcast/schedule sentences (label-led or ``<平台>…直播``)
+    # even without a call-to-action, guarding factual info sentences.
+    cleaned = _INLINE_PROMO_BROADCAST_LABEL.sub(_drop_broadcast_sentence, cleaned)
+    cleaned = _INLINE_PROMO_BROADCAST_SENTENCE.sub(_drop_broadcast_sentence, cleaned)
+    cleaned = _INLINE_PROMO_SENTENCE.sub(_drop_short_sentence, cleaned)
+    # A ``转播：…`` label left dangling with nothing after it (its tail was cut)
+    # is a bare fragment; drop the empty label up to the next boundary.
+    cleaned = re.sub(
+        r"(?:转播|直播平台|播出平台|播出|观看方式|收看方式)\s*[:：]\s*(?=[。！？!?]|$)",
+        "",
+        cleaned,
+    )
+    # A trailing ``<br>`` left dangling before a now-orphaned sentence mark (the
+    # promo line after it was removed) is cosmetic noise; drop the separator and
+    # the bare punctuation so the info block ends cleanly.
+    cleaned = re.sub(r"(?:<br\s*/?>\s*)+[。！？!?]?\s*$", "", cleaned)
+    return cleaned
+
+
+def _strip_inline_promotion(body_html: str | None) -> str:
+    """Remove live-stream promotion sentences glued into article text.
+
+    Runs before quality checks so a promo embedded mid-paragraph never has to
+    reach the structural repair layer (which can only drop whole blocks/lines).
+    Idempotent: a cleaned body no longer matches the promo probe.  A block that
+    becomes blank after removal is emptied so ``remove_empty_content_blocks``
+    can drop it.
+    """
+
+    body = str(body_html or "")
+    if (
+        _INLINE_PROMO_SENTENCE.search(body) is None
+        and _INLINE_PROMO_BROADCAST_TAIL.search(body) is None
+        and _INLINE_PROMO_BROADCAST_LABEL.search(body) is None
+        and _INLINE_PROMO_BROADCAST_SENTENCE.search(body) is None
+    ):
+        return body
+
+    def _replace_block(match: "re.Match[str]") -> str:
+        content = match.group("content")
+        cleaned = _strip_inline_promotion_from_text(content)
+        if cleaned == content:
+            return match.group(0)
+        tag = match.group("tag")
+        if not cleaned.strip():
+            # Whole block was promotion; leave an empty shell for the
+            # downstream empty-block sweeper to remove.
+            return f"<{tag}></{tag}>"
+        return match.group(0).replace(content, cleaned, 1)
+
+    return _INLINE_PROMO_TEXT_BLOCK.sub(_replace_block, body)
+
+
+def _strip_inline_media_caption_from_text(text: str) -> str:
+    """Drop a "related video" caption sentence glued inside a plain-text block.
+
+    Removes only the sentence that opens with a bracket media marker
+    (``【视频】``/``[video]``/…) up to its sentence-ending mark, then collapses a
+    doubled separator space left behind so the surrounding report reads cleanly.
+    """
+
+    cleaned = _INLINE_MEDIA_CAPTION.sub("", text)
+    if cleaned == text:
+        return text
+    # Removing a mid-paragraph caption can leave two spaces where the caption
+    # used to sit between two reporting sentences; collapse them to one.
+    cleaned = re.sub(r"(?<=\S)[ \u3000]{2,}(?=\S)", " ", cleaned)
+    return cleaned
+
+
+def _strip_inline_media_caption(body_html: str | None) -> str:
+    """Remove related-video caption sentences glued into article text.
+
+    Complements the line-level :func:`remove_media_artifact_lines`, which can
+    only drop a caption that occupies a whole line.  Block-scoped so images and
+    markup blocks are left untouched; idempotent.
+    """
+
+    body = str(body_html or "")
+    if _INLINE_MEDIA_CAPTION.search(body) is None:
+        return body
+
+    def _replace_block(match: "re.Match[str]") -> str:
+        content = match.group("content")
+        cleaned = _strip_inline_media_caption_from_text(content)
+        if cleaned == content:
+            return match.group(0)
+        tag = match.group("tag")
+        if not cleaned.strip():
+            return f"<{tag}></{tag}>"
+        return match.group(0).replace(content, cleaned, 1)
+
+    return _INLINE_PROMO_TEXT_BLOCK.sub(_replace_block, body)
 
 
 def _normalise_markdown_label(value: str) -> str:
@@ -471,6 +708,10 @@ def preprocess_quality_body(body_html: str | None, *, source: str | None = None)
         or has_source_template_marker
         or _MEDIA_ARTIFACT_PROBE.search(body) is not None
         or _TEMPLATE_RESIDUE_PROBE.search(body) is not None
+        or _INLINE_PROMO_SENTENCE.search(body) is not None
+        or _INLINE_PROMO_BROADCAST_TAIL.search(body) is not None
+        or _INLINE_PROMO_BROADCAST_LABEL.search(body) is not None
+        or _INLINE_PROMO_BROADCAST_SENTENCE.search(body) is not None
         or re.search(r"(?:brightcove|video-js|jwplayer|vjs-player|player-container)", body, re.IGNORECASE)
         or re.search(r"<\s*(?:area|embed|iframe|math|noscript|object|script|style|svg|template|video|audio)\b", body, re.IGNORECASE)
     ):
@@ -482,7 +723,9 @@ def preprocess_quality_body(body_html: str | None, *, source: str | None = None)
     body = _QUALITY_MARKER_TEXT_BLOCK.sub("", body)
     body = _QUALITY_EMPTY_MARKER_BLOCK.sub("", body)
     body = remove_media_artifact_lines(body)
+    body = _strip_inline_media_caption(body)
     body = _strip_template_residue(body)
+    body = _strip_inline_promotion(body)
     if source_code == "sponichi":
         body = _SPONICHI_TEMPLATE_MARKER.sub("", body)
         body = _SPONICHI_TEMPLATE_LABEL.sub("", body)

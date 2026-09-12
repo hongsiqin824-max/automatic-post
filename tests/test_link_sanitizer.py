@@ -232,19 +232,62 @@ def test_quality_preprocess_removes_byline_variants():
     assert cleaned == "<p>正文内容足够完整，包含比赛过程和赛后采访。</p>"
 
 
-def test_quality_preprocess_keeps_caption_glued_to_reporting_sentence():
+def test_quality_preprocess_strips_caption_at_block_start():
+    # 口径 A：段首的独立媒体标记句（【视频】…！）整句删除，
+    # 保留其后的正文句子。
     body = (
         "<p>【视频】谷口彰悟打进戏剧性制胜球！圣图尔登首发4名日本球员。"
         "下半场双方迟迟未能破门，比赛以0-0进入补时。</p>"
     )
 
-    assert preprocess_quality_body(body) == body
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == (
+        "<p>圣图尔登首发4名日本球员。"
+        "下半场双方迟迟未能破门，比赛以0-0进入补时。</p>"
+    )
+    assert "【视频】" not in cleaned
+    assert preprocess_quality_body(cleaned) == cleaned
 
 
 def test_quality_preprocess_keeps_caption_marker_inside_a_sentence():
     body = "<p>官方账号发布了【图片】维尼修斯与恋人拥抱的照片，引发热议。</p>"
 
     assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_strips_related_video_wedged_between_sentences():
+    # #17225：相关视频导流句夹在两句正文之间（前有句号、后有正文），
+    # 只删这一句，前后正文无缝衔接、无双空格。
+    body = (
+        "<p>继中场喜田阳之后，又有一名新援离队。"
+        " 【视频】横滨FM16岁球员三井寺，震撼的联赛首轮处子球！ "
+        "这名右后卫在本赛季开打前已有178场J联赛出场经历。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == (
+        "<p>继中场喜田阳之后，又有一名新援离队。"
+        "这名右后卫在本赛季开打前已有178场J联赛出场经历。</p>"
+    )
+    assert "【视频】" not in cleaned
+    assert "  " not in cleaned
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_keeps_image_when_stripping_wedged_caption():
+    # 夹在句间的视频导流句删除时，同块/相邻的图片块不受影响。
+    body = (
+        "<p>又有一名新援离队。 【视频】横滨FM球员的处子球！ 这名右后卫经验丰富。</p>"
+        '<p><img src="/fastdfs8/M00/one.jpg"/></p>'
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert "【视频】" not in cleaned
+    assert '<img src="/fastdfs8/M00/one.jpg"/>' in cleaned
+    assert "这名右后卫经验丰富。" in cleaned
 
 
 def test_quality_preprocess_keeps_block_that_carries_an_image():
@@ -316,6 +359,121 @@ def test_quality_preprocess_keeps_sentence_that_merely_mentions_editor():
     body = "<p>这名记者曾长期担任报社编辑，负责国际足球报道多年。</p>"
 
     assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_strips_inline_promo_mid_paragraph():
+    # 引流句夹在正常段落中间（平台词 ge + 行动号召 点击这里/跟进），
+    # 只删这句，前后正文保留。
+    body = (
+        "<p>本周六将客场对阵桑德兰，比赛北京时间16点在光明球场打响。"
+        "ge 将实时跟进本场比赛（点击这里）。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == "<p>本周六将客场对阵桑德兰，比赛北京时间16点在光明球场打响。</p>"
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_strips_standalone_promo_block():
+    # 整段就是引流，删空后由空块清理移除；周边正文块不受影响。
+    body = (
+        "<p>利物浦和富勒姆将于本周六交锋。</p>"
+        "<p>你可以通过ge的实时文字直播关注这场比赛。</p>"
+        "<p>客场2比0取胜后，利物浦升至第六位。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert "你可以通过ge" not in cleaned
+    assert "利物浦和富勒姆将于本周六交锋。" in cleaned
+    assert "利物浦升至第六位。" in cleaned
+
+
+def test_quality_preprocess_cuts_broadcast_tail_but_keeps_schedule():
+    # 长信息句尾部挂引流：只删"转播：…点击这里"尾巴，保留日期/地点。
+    body = (
+        "<p>日期：2026年9月12日 地点：安菲尔德球场 "
+        "转播：ESPN、Disney+（流媒体）和ge实时直播（点击这里）。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert "日期：2026年9月12日" in cleaned
+    assert "安菲尔德球场" in cleaned
+    assert "转播：ESPN" not in cleaned
+    assert "点击这里" not in cleaned
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_strips_broadcast_promo_across_br_lines():
+    # 引流在 <br> 分隔的信息块最后一行，前面的时间/地点行保留，尾随 <br> 清理干净。
+    body = (
+        "<p>比赛时间：2026年9月12日 北京时间16点<br/>"
+        "比赛地点：英格兰桑德兰，光明球场<br/>"
+        "直播平台：Disney+（流媒体）和ge实时跟进（点击这里）。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == (
+        "<p>比赛时间：2026年9月12日 北京时间16点<br/>"
+        "比赛地点：英格兰桑德兰，光明球场</p>"
+    )
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_keeps_sentence_with_only_one_promo_factor():
+    # 双要素约束：只出现"关注/观看"或只出现平台名，不构成引流，不能删。
+    body = (
+        "<p>球迷们持续关注这场比赛的走势。ESPN 曾多次报道过这支球队的历史。</p>"
+    )
+
+    assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_strips_pure_broadcast_label_sentence():
+    # 口径 A：以"转播："标签开头、无行动号召的纯播出句整块删除，
+    # 前后正文块不受影响。
+    body = (
+        "<p>如果再输球，两队差距可能扩大到6分。</p>"
+        "<p>转播：Premiere面向全巴西直播。实时：ge将带来全部比赛进程和独家视频（点击这里）。</p>"
+        "<p>路易斯将无法使用左后卫马龙。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert "转播：Premiere" not in cleaned
+    assert "点击这里" not in cleaned
+    assert "两队差距可能扩大到6分。" in cleaned
+    assert "路易斯将无法使用左后卫马龙。" in cleaned
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_cuts_broadcast_clause_keeps_leading_fact():
+    # 口径 A：句中以逗号接的"<平台>将现场直播"播出子句删除，
+    # 保留前面的实义子句（轮次信息），且不留悬空逗号。
+    body = (
+        "<p>这场比赛属于巴甲第27轮，Premiere将现场直播。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == "<p>这场比赛属于巴甲第27轮。</p>"
+    assert "现场直播" not in cleaned
+    assert "，。" not in cleaned
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_protects_broadcast_sentence_with_facts():
+    # 保护约束：含日期/地点/首发等实义信息的句子不因播出词被整句删。
+    body = (
+        "<p>预计首发：韦弗顿、卡伊托、瓦拉斯，Premiere将现场直播预热节目。</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert "预计首发：韦弗顿、卡伊托、瓦拉斯" in cleaned
 
 
 def test_quality_preprocess_strips_leaked_highlight_tag_braces():
