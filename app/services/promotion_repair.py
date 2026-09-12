@@ -881,6 +881,107 @@ def _plan_list(plan: Any) -> tuple[list[dict[str, Any]], str | None]:
     return list(plan), None
 
 
+def _merge_consecutive_removal_operations(
+    operations: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """合并首尾相接或重叠的连续删除操作。
+
+    当 AI 标记删除连续的多行推广内容时，每行可能都会吞掉自己的分隔符，
+    导致操作区间首尾相接或轻微重叠。这不是真正的"意图重叠"，而是同一
+    删除意图的多个表达。合并成单一操作可以：
+    1. 避免触发"操作范围重叠"误报
+    2. 统一校验删除字数上限
+    3. 保持安全检查的完整性
+
+    重要约束：
+    - 只合并 issue_type 非 duplicate_content 的删除操作
+    - duplicate_content 涉及"删一份保留一份"，合并会导致保留目标丢失
+    - 只合并同一个块内的多行删除（remove_text_line），不合并不同块的删除
+    - 不同块的删除应保持独立记录，以便审计和追踪
+    """
+
+    # 分离删除操作和其他操作
+    removal_ops = []
+    other_ops = []
+
+    for op in operations:
+        if op.get("action") in {"remove_block", "remove_text_line", "remove_link"}:
+            removal_ops.append(op)
+        else:
+            other_ops.append(op)
+
+    # 如果删除操作少于 2 个，无需合并
+    if len(removal_ops) <= 1:
+        return operations
+
+    # 按 start 位置排序
+    removal_ops.sort(key=lambda x: int(x["start"]))
+
+    # 合并首尾相接或重叠的删除操作（仅限同一块内的行级删除）
+    merged = []
+    current = removal_ops[0]
+
+    for next_op in removal_ops[1:]:
+        current_start = int(current["start"])
+        current_end = int(current["end"])
+        next_start = int(next_op["start"])
+        next_end = int(next_op["end"])
+
+        # 获取 issue_type
+        current_issue_type = _normalized_issue_type(current.get("item", {}))
+        next_issue_type = _normalized_issue_type(next_op.get("item", {}))
+
+        # 获取 block_id 和 action
+        current_block_id = current.get("block_id")
+        next_block_id = next_op.get("block_id")
+        current_action = current.get("action")
+        next_action = next_op.get("action")
+
+        # 只有在以下条件全部满足时才合并：
+        # 1. 操作区间相接或重叠
+        # 2. 两个操作都不是 duplicate_content 类型
+        # 3. 两个操作都是行级删除（remove_text_line）
+        # 4. 两个操作在同一个块内（block_id 相同）
+        can_merge = (
+            next_start <= current_end
+            and current_issue_type != "duplicate_content"
+            and next_issue_type != "duplicate_content"
+            and current_action == "remove_text_line"
+            and next_action == "remove_text_line"
+            and current_block_id == next_block_id
+        )
+
+        if can_merge:
+            # 合并区间：start 取最小，end 取最大
+            merged_start = min(current_start, next_start)
+            merged_end = max(current_end, next_end)
+
+            # 合并 evidence（用于字数统计）
+            current_evidence = str(current.get("evidence") or "")
+            next_evidence = str(next_op.get("evidence") or "")
+            merged_evidence = current_evidence + next_evidence
+
+            # 创建合并后的操作
+            current = {
+                **current,  # 保留第一个操作的大部分字段
+                "start": merged_start,
+                "end": merged_end,
+                "evidence": merged_evidence,
+                # 保持 replacement 为空（删除操作）
+                "replacement": "",
+            }
+        else:
+            # 不能合并，保存当前操作
+            merged.append(current)
+            current = next_op
+
+    # 添加最后一个操作
+    merged.append(current)
+
+    # 返回合并后的删除操作 + 其他操作
+    return merged + other_ops
+
+
 def apply_repair_plan(
     body_html: str | None,
     plan: Any,
@@ -1077,12 +1178,28 @@ def apply_repair_plan(
             if issue_type == "duplicate_content":
                 keep_id = str(item.get("keep_segment_id") or "").strip().lower()
                 keep_pair = segments_by_id.get(keep_id)
-                if (
-                    keep_pair is None
-                    or keep_id == target_id
-                    or str(keep_pair[1].get("text") or "") != evidence
-                ):
-                    return body, [], "重复内容修复缺少有效的保留正文行"
+
+                # 区分两种情况：
+                # 1. keep_id 不存在或等于目标 ID：自动寻找有效的保留目标
+                # 2. keep_id 存在但文本不匹配：报错（AI 判断可能有误）
+                if keep_pair is None or keep_id == target_id:
+                    # 情况 1：AI 定位错误，自动寻找有效的保留目标
+                    alternative_keep_id = None
+                    for candidate_id, (candidate_block, candidate_segment) in segments_by_id.items():
+                        if (
+                            candidate_id != target_id
+                            and str(candidate_segment.get("text") or "") == evidence
+                        ):
+                            alternative_keep_id = candidate_id
+                            break
+                    if alternative_keep_id is None:
+                        return body, [], "重复内容修复缺少有效的保留正文行（目标文本在文档中唯一，疑似AI误判）"
+                    keep_id = alternative_keep_id
+                    keep_pair = segments_by_id[keep_id]
+                elif str(keep_pair[1].get("text") or "") != evidence:
+                    # 情况 2：keep_id 存在但文本不匹配，报错
+                    return body, [], "重复内容修复缺少有效的保留正文行（指定的保留目标文本不匹配）"
+
                 keep_target_id = keep_id
             remove_start = int(segment["start"])
             remove_end = int(segment["end"])
@@ -1124,12 +1241,28 @@ def apply_repair_plan(
             if issue_type == "duplicate_content":
                 keep_id = str(item.get("keep_block_id") or "").strip().lower()
                 keep_block = by_id.get(keep_id)
-                if (
-                    keep_block is None
-                    or keep_id == block_id
-                    or str(keep_block.get("text") or "") != evidence
-                ):
-                    return body, [], "重复内容修复缺少有效的保留正文块"
+
+                # 区分两种情况：
+                # 1. keep_id 不存在或等于目标 ID：自动寻找有效的保留目标
+                # 2. keep_id 存在但文本不匹配：报错（AI 判断可能有误）
+                if keep_block is None or keep_id == block_id:
+                    # 情况 1：AI 定位错误，自动寻找有效的保留目标
+                    alternative_keep_id = None
+                    for candidate_id, candidate_block in by_id.items():
+                        if (
+                            candidate_id != block_id
+                            and str(candidate_block.get("text") or "") == evidence
+                        ):
+                            alternative_keep_id = candidate_id
+                            break
+                    if alternative_keep_id is None:
+                        return body, [], "重复内容修复缺少有效的保留正文块（目标文本在文档中唯一，疑似AI误判）"
+                    keep_id = alternative_keep_id
+                    keep_block = by_id[keep_id]
+                elif str(keep_block.get("text") or "") != evidence:
+                    # 情况 2：keep_id 存在但文本不匹配，报错
+                    return body, [], "重复内容修复缺少有效的保留正文块（指定的保留目标文本不匹配）"
+
                 keep_target_id = keep_id
             replacement = ""
         else:
@@ -1183,6 +1316,9 @@ def apply_repair_plan(
                 )
             ),
         })
+
+    # 合并首尾相接或重叠的连续删除操作，避免误判为操作范围重叠
+    operations = _merge_consecutive_removal_operations(operations)
 
     spans = {(int(operation["start"]), int(operation["end"])) for operation in operations}
     if len(spans) != len(operations):
