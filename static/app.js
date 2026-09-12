@@ -198,6 +198,8 @@
       form.elements.name.value = values.name || "";
       form.elements.backend_tab_id.value = values.backendId || "";
       form.elements.fallback_litpic.value = values.fallbackLitpic || "";
+      form.elements.ai_league_guard_enabled.checked = Boolean(values.aiGuardEnabled);
+      form.elements.ai_league_guard_definition.value = values.aiGuardDefinition || "";
       $('[data-tab-dialog-title]', dialog).textContent = values.id ? "编辑栏目" : "新增栏目";
       dialog.showModal();
       form.elements.name.focus();
@@ -210,6 +212,8 @@
         name: button.dataset.name,
         backendId: button.dataset.backendId,
         fallbackLitpic: button.dataset.fallbackLitpic || "",
+        aiGuardEnabled: button.dataset.aiGuardEnabled === "true",
+        aiGuardDefinition: button.dataset.aiGuardDefinition || "",
       }));
     });
 
@@ -224,6 +228,8 @@
           name: form.elements.name.value.trim(),
           backend_tab_id: backendId || null,
           fallback_litpic: form.elements.fallback_litpic.value.trim(),
+          ai_league_guard_enabled: form.elements.ai_league_guard_enabled.checked,
+          ai_league_guard_definition: form.elements.ai_league_guard_definition.value.trim(),
         };
         try {
           const result = await postJSON(id ? `/api/tabs/${id}` : "/api/tabs", payload);
@@ -315,7 +321,7 @@
         backend_tab_id: rule.backend_tab_id ?? tab.backend_tab_id ?? null,
         source_code: String(rule.source_code || ""),
         source_display_name: String(rule.source_display_name || rule.source_name || ""),
-        publish_mode_override: rawPublishMode === 0 || rawPublishMode === 1 ? rawPublishMode : null,
+        publish_mode_override: rawPublishMode === 0 || rawPublishMode === 1 || rawPublishMode === 2 ? rawPublishMode : null,
         sample_source: rule.sample_source || "",
         enabled: Boolean(rule.enabled),
       };
@@ -324,6 +330,7 @@
     function publishActionLabel(value) {
       if (value === 1) return "直接发布";
       if (value === 0) return "创建草稿";
+      if (value === 2) return "放弃";
       return "跟随原配置";
     }
 
@@ -533,6 +540,8 @@
           };
           if (payload.publish_mode_override === 1
               && !window.confirm("确认将这条规则设置为直接发布吗？匹配文章在首次提交后会立即上线。")) return;
+          if (payload.publish_mode_override === 2
+              && !window.confirm("确认将这条规则设置为放弃吗？之后命中该规则的新文章会被直接放弃，既不创建草稿也不发布。")) return;
           const result = await postJSON(id ? `/api/event-tab-rules/${id}` : "/api/event-tab-rules", payload);
           dialog.close();
           if (result.event_tab_rule) replaceRuleRow(result.event_tab_rule);

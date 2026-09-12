@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS tabs (
     enabled         INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     publish_mode    INTEGER NOT NULL DEFAULT 0 CHECK (publish_mode IN (0, 1)),
     fallback_litpic TEXT NOT NULL DEFAULT '',
+    ai_league_guard_enabled INTEGER NOT NULL DEFAULT 0 CHECK (ai_league_guard_enabled IN (0, 1)),
+    ai_league_guard_definition TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -44,7 +46,7 @@ CREATE TABLE IF NOT EXISTS event_tab_rules (
     marker_type     TEXT NOT NULL CHECK (marker_type IN ('league', 'team')),
     marker_code     TEXT NOT NULL CHECK (length(trim(marker_code)) > 0),
     tab_id          INTEGER REFERENCES tabs(id) ON DELETE SET NULL,
-    publish_mode_override INTEGER CHECK (publish_mode_override IN (0, 1)),
+    publish_mode_override INTEGER CHECK (publish_mode_override IN (0, 1, 2)),
     enabled         INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     first_seen_at   TEXT,
     last_seen_at    TEXT,
@@ -118,7 +120,7 @@ CREATE TABLE IF NOT EXISTS articles (
     litpic               TEXT NOT NULL DEFAULT '',
     channels_json        TEXT NOT NULL DEFAULT '[]',
     tab_id               INTEGER REFERENCES tabs(id) ON DELETE SET NULL,
-    publish_mode         INTEGER CHECK (publish_mode IN (0, 1)),
+    publish_mode         INTEGER CHECK (publish_mode IN (0, 1, 2)),
     publish_mode_decided_at TEXT,
     material_user_name   TEXT NOT NULL DEFAULT '',
     route_league         TEXT NOT NULL DEFAULT '',
@@ -305,7 +307,9 @@ def init_db(database: Optional[PathLike] = None) -> None:
         _migrate_tab_and_article_publish_mode(connection)
         _migrate_article_published_tabs(connection)
         _migrate_tab_fallback_litpic(connection)
+        _migrate_tab_ai_league_guard(connection)
         _migrate_event_tab_routing(connection)
+        _migrate_abandon_publish_mode(connection)
         seed_event_tab_rules(connection)
         # Preserve the old single-tab fields as the first item in the new
         # relations. INSERT OR IGNORE makes this safe on every application
@@ -679,6 +683,32 @@ def _migrate_tab_fallback_litpic(connection: sqlite3.Connection) -> None:
             )
 
 
+def _migrate_tab_ai_league_guard(connection: sqlite3.Connection) -> None:
+    """Add per-tab AI league-membership guard settings.
+
+    ``ai_league_guard_enabled`` toggles the pre-publish check; when on, an
+    article that reached this fallback tab with an empty league and a direct
+    publish mode is verified by the model before publishing.  The optional
+    ``ai_league_guard_definition`` describes what the tab actually covers so
+    the prompt can be specific.
+    """
+
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(tabs)").fetchall()
+    }
+    with connection:
+        if "ai_league_guard_enabled" not in columns:
+            connection.execute(
+                "ALTER TABLE tabs ADD COLUMN ai_league_guard_enabled "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (ai_league_guard_enabled IN (0, 1))"
+            )
+        if "ai_league_guard_definition" not in columns:
+            connection.execute(
+                "ALTER TABLE tabs ADD COLUMN ai_league_guard_definition TEXT NOT NULL DEFAULT ''"
+            )
+
+
 def _migrate_event_tab_rule_scope(connection: sqlite3.Connection) -> None:
     """Upgrade legacy global rules to source-aware rules without changing IDs."""
 
@@ -718,7 +748,7 @@ def _migrate_event_tab_rule_scope(connection: sqlite3.Connection) -> None:
                 marker_type     TEXT NOT NULL CHECK (marker_type IN ('league', 'team')),
                 marker_code     TEXT NOT NULL CHECK (length(trim(marker_code)) > 0),
                 tab_id          INTEGER REFERENCES tabs(id) ON DELETE SET NULL,
-                publish_mode_override INTEGER CHECK (publish_mode_override IN (0, 1)),
+                publish_mode_override INTEGER CHECK (publish_mode_override IN (0, 1, 2)),
                 enabled         INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
                 first_seen_at   TEXT,
                 last_seen_at    TEXT,
@@ -798,6 +828,92 @@ def _migrate_event_tab_routing(connection: sqlite3.Connection) -> None:
                 connection.execute(
                     f"ALTER TABLE articles ADD COLUMN {name} {declaration}"
                 )
+
+
+def _migrate_abandon_publish_mode(connection: sqlite3.Connection) -> None:
+    """Relax the publish-mode CHECK constraints so ``2`` (abandon) is allowed.
+
+    Only event-tab-rule overrides and the resulting article snapshot may use the
+    abandon mode; tabs/sources keep their ``IN (0, 1)`` constraint.  SQLite
+    cannot ALTER a CHECK constraint, so rebuild the affected tables in place for
+    existing databases.  Fresh databases already carry the relaxed definition.
+    """
+
+    targets = {
+        "event_tab_rules": (
+            "CHECK (publish_mode_override IN (0, 1))",
+            "CHECK (publish_mode_override IN (0, 1, 2))",
+        ),
+        "articles": (
+            "CHECK (publish_mode IN (0, 1))",
+            "CHECK (publish_mode IN (0, 1, 2))",
+        ),
+    }
+    for name, (old_clause, new_clause) in targets.items():
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        if row is None or not row["sql"] or old_clause not in str(row["sql"]):
+            continue
+        new_table_sql = str(row["sql"]).replace(old_clause, new_clause)
+        _rebuild_table_with_new_schema(connection, name, new_table_sql)
+
+
+def _rebuild_table_with_new_schema(
+    connection: sqlite3.Connection, name: str, new_table_sql: str
+) -> None:
+    """Recreate ``name`` from ``new_table_sql`` preserving rows and indexes.
+
+    Follows the SQLite-recommended table rebuild: copy into a temp table, drop
+    the original, recreate it and copy the data back by matching column names so
+    the primary key and existing IDs stay stable.
+    """
+
+    columns = [
+        str(col_row["name"])
+        for col_row in connection.execute(f"PRAGMA table_info({name})").fetchall()
+    ]
+    column_list = ", ".join(columns)
+    index_sql = [
+        str(idx_row["sql"])
+        for idx_row in connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? "
+            "AND sql IS NOT NULL",
+            (name,),
+        ).fetchall()
+    ]
+    temp_name = f"{name}_abandon_rebuild"
+    # 表名可能带引号或不带引号，都要尝试替换
+    new_table_sql = new_table_sql.replace(f'TABLE "{name}"', f'TABLE "{temp_name}"', 1)
+    new_table_sql = new_table_sql.replace(f"TABLE {name}", f"TABLE {temp_name}", 1)
+
+    connection.commit()
+    foreign_keys_enabled = bool(
+        connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    )
+    if foreign_keys_enabled:
+        connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        # 清理可能残留的临时表（之前失败的迁移）
+        connection.execute(f"DROP TABLE IF EXISTS {temp_name}")
+        connection.execute(new_table_sql)
+        connection.execute(
+            f"INSERT INTO {temp_name} ({column_list}) "
+            f"SELECT {column_list} FROM {name}"
+        )
+        connection.execute(f"DROP TABLE {name}")
+        connection.execute(f"ALTER TABLE {temp_name} RENAME TO {name}")
+        for statement in index_sql:
+            connection.execute(statement)
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        if foreign_keys_enabled:
+            connection.execute("PRAGMA foreign_keys = ON")
 
 
 _DEFAULT_EVENT_TAB_RULES = (

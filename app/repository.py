@@ -31,6 +31,7 @@ VALID_STATUSES = {
     "MAPPING_BLOCKED",
     "SOURCE_DUPLICATE",
     "TITLE_DUPLICATE",
+    "ABANDONED",
     "ERROR",
 }
 VALID_LEVELS = {"S", "A", "B", "C"}
@@ -117,21 +118,31 @@ def _enabled_int(value: Any) -> int:
     raise ValueError("enabled must be a boolean")
 
 
-def _publish_mode_int(value: Any, field_name: str = "publish_mode") -> int:
-    """Normalize the two supported backend submission modes.
+def _publish_mode_int(value: Any, field_name: str = "publish_mode",
+                      allow_abandon: bool = False) -> int:
+    """Normalize the supported backend submission modes.
 
-    ``0`` creates a DQD draft and ``1`` publishes immediately.  Keep this
-    validation in the repository so web/API callers cannot persist an
-    unsupported value and so SQLite CHECK errors become a useful message.
+    ``0`` creates a DQD draft and ``1`` publishes immediately.  Event-tab-rule
+    overrides may additionally use ``2`` (abandon the article) when
+    ``allow_abandon`` is set; every other caller (tabs/sources) keeps rejecting
+    it.  Keep this validation in the repository so web/API callers cannot
+    persist an unsupported value and so SQLite CHECK errors become a useful
+    message.
     """
 
+    allowed = {0, 1, 2} if allow_abandon else {0, 1}
+    message = (
+        f"{field_name} must be 0 (draft), 1 (publish) or 2 (abandon)"
+        if allow_abandon
+        else f"{field_name} must be 0 (draft) or 1 (publish)"
+    )
     if isinstance(value, bool):
-        raise ValueError(f"{field_name} must be 0 (draft) or 1 (publish)")
-    if isinstance(value, int) and value in {0, 1}:
+        raise ValueError(message)
+    if isinstance(value, int) and value in allowed:
         return value
-    if isinstance(value, str) and value.strip() in {"0", "1"}:
+    if isinstance(value, str) and value.strip() in {str(mode) for mode in allowed}:
         return int(value.strip())
-    raise ValueError(f"{field_name} must be 0 (draft) or 1 (publish)")
+    raise ValueError(message)
 
 
 def _fallback_litpic(value: Any) -> str:
@@ -141,6 +152,16 @@ def _fallback_litpic(value: Any) -> str:
         return ""
     if len(text) > 2000 or _usable_image_src(text) is None:
         raise ValueError("fallback_litpic 必须是有效的 CDN 图片地址或图片路径")
+    return text
+
+
+def _ai_league_guard_definition(value: Any) -> str:
+    """Validate a tab's optional AI league-guard definition text."""
+    text = str(value or "").strip()
+    if len(text) > 2000:
+        raise ValueError("ai_league_guard_definition 不能超过 2000 个字符")
+    if any(ord(char) < 32 and char not in "\n\r\t" for char in text):
+        raise ValueError("ai_league_guard_definition 含有非法控制字符")
     return text
 
 
@@ -195,7 +216,7 @@ def _event_rule_source_code(value: Any, conn) -> Optional[str]:
 def _event_rule_publish_mode(value: Any) -> Optional[int]:
     if value in (None, ""):
         return None
-    return _publish_mode_int(value, "publish_mode_override")
+    return _publish_mode_int(value, "publish_mode_override", allow_abandon=True)
 
 
 def _optional_event_marker_code(value: Any) -> str:
@@ -562,18 +583,22 @@ def get_tab_by_backend_id(backend_tab_id: int, connection=None) -> Optional[dict
 
 def create_tab(name: str, backend_tab_id: int, enabled: bool = True,
                connection=None, *, publish_mode: int = 0,
-               fallback_litpic: str = "") -> dict:
+               fallback_litpic: str = "",
+               ai_league_guard_enabled: bool = False,
+               ai_league_guard_definition: str = "") -> dict:
     name = str(name or "").strip()
     if not name:
         raise ValueError("tab name is required")
     conn = _conn(connection)
     mode = _publish_mode_int(publish_mode)
     fallback = _fallback_litpic(fallback_litpic)
+    guard_definition = _ai_league_guard_definition(ai_league_guard_definition)
     now = _now()
     with conn:
         cursor = conn.execute(
-            "INSERT INTO tabs (backend_tab_id, name, enabled, publish_mode, fallback_litpic, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-            (int(backend_tab_id), name, int(bool(enabled)), mode, fallback, now, now),
+            "INSERT INTO tabs (backend_tab_id, name, enabled, publish_mode, fallback_litpic, ai_league_guard_enabled, ai_league_guard_definition, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (int(backend_tab_id), name, int(bool(enabled)), mode, fallback,
+             int(bool(ai_league_guard_enabled)), guard_definition, now, now),
         )
     return get_tab(cursor.lastrowid, conn)
 
@@ -581,7 +606,9 @@ def create_tab(name: str, backend_tab_id: int, enabled: bool = True,
 def update_tab(tab_id: int, connection=None, *, name: Optional[str] = None,
                backend_tab_id: Optional[int] = None, enabled: Optional[bool] = None,
                publish_mode: Optional[int] = None,
-               fallback_litpic: Optional[str] = None) -> dict:
+               fallback_litpic: Optional[str] = None,
+               ai_league_guard_enabled: Optional[bool] = None,
+               ai_league_guard_definition: Optional[str] = None) -> dict:
     conn = _conn(connection)
     current = get_tab(tab_id, conn)
     if current is None:
@@ -600,6 +627,16 @@ def update_tab(tab_id: int, connection=None, *, name: Optional[str] = None,
             if fallback_litpic is None
             else _fallback_litpic(fallback_litpic)
         ),
+        "ai_league_guard_enabled": (
+            current.get("ai_league_guard_enabled", 0)
+            if ai_league_guard_enabled is None
+            else int(bool(ai_league_guard_enabled))
+        ),
+        "ai_league_guard_definition": (
+            current.get("ai_league_guard_definition", "")
+            if ai_league_guard_definition is None
+            else _ai_league_guard_definition(ai_league_guard_definition)
+        ),
         "updated_at": _now(),
     }
     if not values["name"]:
@@ -608,9 +645,11 @@ def update_tab(tab_id: int, connection=None, *, name: Optional[str] = None,
         _assert_tab_can_disable(tab_id, conn)
     with conn:
         conn.execute(
-            "UPDATE tabs SET name=?, backend_tab_id=?, enabled=?, publish_mode=?, fallback_litpic=?, updated_at=? WHERE id=?",
+            "UPDATE tabs SET name=?, backend_tab_id=?, enabled=?, publish_mode=?, fallback_litpic=?, ai_league_guard_enabled=?, ai_league_guard_definition=?, updated_at=? WHERE id=?",
             (values["name"], values["backend_tab_id"], values["enabled"],
-             values["publish_mode"], values["fallback_litpic"], values["updated_at"], tab_id),
+             values["publish_mode"], values["fallback_litpic"],
+             values["ai_league_guard_enabled"], values["ai_league_guard_definition"],
+             values["updated_at"], tab_id),
         )
     return get_tab(tab_id, conn)
 
@@ -1075,10 +1114,11 @@ def _find_event_tab_rule(marker_type: str, marker_code: str,
         SELECT r.*, t.name AS tab_name, t.backend_tab_id,
                t.enabled AS tab_enabled, s.display_name AS source_display_name
         FROM event_tab_rules r
-        JOIN tabs t ON t.id=r.tab_id AND t.enabled=1
+        LEFT JOIN tabs t ON t.id=r.tab_id AND t.enabled=1
         LEFT JOIN sources s ON s.code=r.source_code
         WHERE r.marker_type=? AND r.marker_code=? AND r.enabled=1
           AND (r.source_code=? OR r.source_code IS NULL)
+          AND (t.id IS NOT NULL OR r.publish_mode_override=2)
         ORDER BY CASE WHEN r.source_code=? THEN 0 ELSE 1 END, r.id
         LIMIT 1
         """,
@@ -1112,6 +1152,11 @@ def _resolve_material_tabs(parsed: Mapping[str, Any], source: str,
     if matched_rule is None:
         selected_tab_ids = source_tab_ids
         match_type = "source"
+    elif matched_rule["publish_mode_override"] == 2:
+        # Abandon rules take effect even without a bound tab: the article is
+        # abandoned on ingest, so no column routing is needed.
+        selected_tab_ids = source_tab_ids
+        match_type = str(matched_rule["marker_type"])
     else:
         # Backend tab 58 is the only generic source column. Keep it only when
         # the source already has it; replace every source event column.
@@ -1129,6 +1174,9 @@ def _resolve_material_tabs(parsed: Mapping[str, Any], source: str,
         "source_tab_ids": source_tab_ids,
         "match_type": match_type,
         "rule_id": None if matched_rule is None else int(matched_rule["id"]),
+        "rule_publish_mode_override": (
+            None if matched_rule is None else matched_rule["publish_mode_override"]
+        ),
     }
 
 
@@ -1240,6 +1288,11 @@ def upsert_material(material: Mapping[str, Any], connection=None) -> dict:
         )
         selected_tab_ids = routing["selected_tab_ids"]
         selected_tab_id = selected_tab_ids[0] if selected_tab_ids else None
+        # A rule with publish_mode_override==2 abandons the article on ingest:
+        # it never becomes a draft nor gets published and lands in a terminal
+        # ABANDONED state immediately.
+        abandoned = routing.get("rule_publish_mode_override") == 2
+        initial_status = "ABANDONED" if abandoned else "RECEIVED"
         # Keep one idempotency key for the article for its entire lifecycle.
         # It is generated before the insert and never replaced on re-ingest.
         client_request_id = uuid.uuid4().hex
@@ -1262,11 +1315,18 @@ def upsert_material(material: Mapping[str, Any], connection=None) -> dict:
                      item["title_original"], item["title_final"], item["body_html"],
                      item["litpic"], _json(item["channels"], []), selected_tab_id,
                      item["material_user_name"], item["route_league"], item["route_team"],
-                     routing["match_type"], routing["rule_id"], "B", "RECEIVED",
+                     routing["match_type"], routing["rule_id"], "B", initial_status,
                      "{}", _json(item["raw"], {}), now, now, now),
                 )
                 article_id = cursor.lastrowid
                 _replace_article_tabs(article_id, selected_tab_ids, conn)
+                if abandoned:
+                    # Snapshot the abandon mode so downstream resolve logic is
+                    # consistent and never re-derives a draft/publish mode.
+                    conn.execute(
+                        "UPDATE articles SET publish_mode=2, publish_mode_decided_at=? WHERE id=?",
+                        (now, article_id),
+                    )
                 conn.execute(
                     """
                     INSERT INTO article_events
@@ -1276,9 +1336,10 @@ def upsert_material(material: Mapping[str, Any], connection=None) -> dict:
                     (
                         article_id,
                         None,
-                        "RECEIVED",
-                        "MATERIAL_RECEIVED",
-                        "素材接口返回并已入库",
+                        initial_status,
+                        "ARTICLE_ABANDONED" if abandoned else "MATERIAL_RECEIVED",
+                        "命中赛事栏目规则，按配置放弃本篇（不创建草稿也不发布）"
+                        if abandoned else "素材接口返回并已入库",
                         _json({
                             "source": item["source"],
                             "source_url": item["source_url"],
@@ -1442,7 +1503,8 @@ def resolve_article_publish_mode(article_id: int, connection=None) -> dict:
         ).fetchone()
         if route_rule is not None and route_rule["publish_mode_override"] is not None:
             rule_override = _publish_mode_int(
-                route_rule["publish_mode_override"], "publish_mode_override"
+                route_rule["publish_mode_override"], "publish_mode_override",
+                allow_abandon=True,
             )
 
     tabs = _tabs_for_article_id(numeric_article_id, conn)

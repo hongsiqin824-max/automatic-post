@@ -17,7 +17,7 @@
             <span class="tab-publish-mode" data-tab-publish-mode><span class="status-badge {{ 'status-enabled' if tab.publish_mode|default(0) == 1 else 'status-disabled' }}" data-tab-publish-mode-badge><span></span>{{ '直接发布' if tab.publish_mode|default(0) == 1 else '创建草稿' }}</span></span>
             <button class="icon-button subtle" type="button" data-toggle-tab-publish-mode data-id="{{ tab.id }}" data-current-mode="{{ tab.publish_mode|default(0) }}" title="切换发布模式" aria-label="切换 {{ tab.name|e }} 的发布模式"><i data-lucide="repeat"></i></button>
             <span class="status-badge {{ 'status-enabled' if tab.enabled else 'status-disabled' }}"><span></span>{{ '启用' if tab.enabled else '停用' }}</span>
-            <button class="icon-button subtle" type="button" data-edit-tab data-id="{{ tab.id }}" data-name="{{ tab.name|e }}" data-backend-id="{{ tab.backend_tab_id|default('', true) }}" data-fallback-litpic="{{ tab.fallback_litpic|default('', true)|e }}" title="编辑栏目" aria-label="编辑栏目"><i data-lucide="pencil"></i></button>
+            <button class="icon-button subtle" type="button" data-edit-tab data-id="{{ tab.id }}" data-name="{{ tab.name|e }}" data-backend-id="{{ tab.backend_tab_id|default('', true) }}" data-fallback-litpic="{{ tab.fallback_litpic|default('', true)|e }}" data-ai-guard-enabled="{{ 'true' if tab.ai_league_guard_enabled else 'false' }}" data-ai-guard-definition="{{ tab.ai_league_guard_definition|default('', true)|e }}" title="编辑栏目" aria-label="编辑栏目"><i data-lucide="pencil"></i></button>
             <button class="icon-button subtle" type="button" data-toggle-tab data-id="{{ tab.id }}" data-enabled="{{ 'true' if tab.enabled else 'false' }}" title="{{ '停用栏目' if tab.enabled else '启用栏目' }}" aria-label="{{ '停用栏目' if tab.enabled else '启用栏目' }}"><i data-lucide="{{ 'pause' if tab.enabled else 'play' }}"></i></button>
           </div>
         </div>
@@ -73,10 +73,10 @@
         <div class="competition-rule-target" data-competition-rule-target>
           {% if rule.tab_id %}
           <strong>{{ rule.tab_name|default('栏目已删除', true) }}</strong>
-          <small>后台栏目 ID：{{ rule.backend_tab_id|default('未知', true) }} · {{ '直接发布' if rule_publish_mode == 1 else ('创建草稿' if rule_publish_mode == 0 else '跟随原配置') }}</small>
+          <small>后台栏目 ID：{{ rule.backend_tab_id|default('未知', true) }} · {{ '放弃' if rule_publish_mode == 2 else ('直接发布' if rule_publish_mode == 1 else ('创建草稿' if rule_publish_mode == 0 else '跟随原配置')) }}</small>
           {% else %}
           <strong class="pending-text">待配置</strong>
-          <small>沿用来源原栏目 · {{ '直接发布' if rule_publish_mode == 1 else ('创建草稿' if rule_publish_mode == 0 else '跟随原配置') }}</small>
+          <small>沿用来源原栏目 · {{ '放弃' if rule_publish_mode == 2 else ('直接发布' if rule_publish_mode == 1 else ('创建草稿' if rule_publish_mode == 0 else '跟随原配置')) }}</small>
           {% endif %}
         </div>
         <div class="competition-rule-seen">
@@ -155,6 +155,8 @@
     <label class="field"><span>栏目名称</span><input name="name" required maxlength="80" placeholder="例如：国际足球"></label>
     <label class="field"><span>后台栏目 ID</span><input name="backend_tab_id" type="number" inputmode="numeric" required placeholder="发布时用于映射后台栏目"></label>
     <label class="field"><span>栏目兜底图片（可选）</span><input name="fallback_litpic" type="text" maxlength="2000" placeholder="CDN 地址或图片路径，例如 https://img.example.com/league.jpg"><small class="field-hint">正文和素材没有有效图片时使用；留空则使用系统绿色公共图。精选栏目不使用栏目兜底图。</small></label>
+    <label class="account-enabled-field"><span><strong>AI 归属校验</strong><small>开启后，league 短码为空、靠本栏目兜底进来、且本要直接发布的文章，会先让 AI 判断是否真属于本栏目；判为不属于或 AI 不可用时自动降级为创建草稿。</small></span><span class="switch"><input type="checkbox" name="ai_league_guard_enabled" aria-label="启用 AI 归属校验"><span></span></span></label>
+    <label class="field"><span>栏目判定说明（可选）</span><textarea name="ai_league_guard_definition" rows="3" maxlength="2000" placeholder="例如：日本职业足球联赛（J.League）的 J1、J2、J3 正式比赛及相关新闻；不包含高中、大学、青少年、业余、地区预选赛等非职业赛事。"></textarea><small class="field-hint">用于告诉 AI 本栏目到底覆盖哪些内容；留空则仅用栏目名称判断。仅在开启 AI 归属校验时生效。</small></label>
     <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="save"></i>保存栏目</button></div>
   </form>
 </dialog>
@@ -207,7 +209,7 @@
     </div>
     <label class="field"><span>目标栏目</span><select name="tab_id"><option value="">待配置（沿用来源原栏目）</option>{% for tab in tabs %}<option value="{{ tab.id }}" {% if not tab.enabled %}disabled{% endif %}>{{ tab.name }} · 后台 ID {{ tab.backend_tab_id }}{% if not tab.enabled %}（已停用）{% endif %}</option>{% endfor %}</select><small class="field-hint">清空或暂不选择栏目时，这类文章继续使用来源原栏目。</small></label>
     <label class="field"><span>适用来源</span><select name="source_code"><option value="">全部来源</option>{% for source in sources %}<option value="{{ source.code|e }}">{{ source.name|default(source.code) }} · {{ source.code }}</option>{% endfor %}</select><small class="field-hint">指定来源后只匹配该 source；选择全部来源时保持现有全局规则行为。</small></label>
-    <label class="field"><span>发布动作</span><select name="publish_mode_override"><option value="">跟随原配置</option><option value="0">创建草稿</option><option value="1">直接发布</option></select><small class="field-hint">跟随原配置时，继续按来源覆盖和栏目模式决定；直接发布会在文章首次提交后立即上线。</small></label>
+    <label class="field"><span>发布动作</span><select name="publish_mode_override"><option value="">跟随原配置</option><option value="0">创建草稿</option><option value="1">直接发布</option><option value="2">放弃</option></select><small class="field-hint">跟随原配置时，继续按来源覆盖和栏目模式决定；直接发布会在文章首次提交后立即上线；放弃会让命中的新文章直接作废，不创建草稿也不发布。</small></label>
     <label class="account-enabled-field"><span><strong>启用规则</strong><small>停用后视为未命中，文章继续沿用后续规则或来源原栏目。</small></span><span class="switch"><input type="checkbox" name="enabled" checked aria-label="启用赛事栏目规则"><span></span></span></label>
     <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="save"></i>保存规则</button></div>
   </form>

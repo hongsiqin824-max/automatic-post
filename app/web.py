@@ -1140,11 +1140,24 @@ def create_app(test_config: dict | None = None) -> Flask:
             publish_mode = payload.get("publish_mode", 0)
             if isinstance(publish_mode, bool) or not isinstance(publish_mode, int) or publish_mode not in {0, 1}:
                 raise ValueError("publish_mode 必须是 0（草稿）或 1（直接发布）")
+            create_kwargs: dict[str, Any] = {
+                "publish_mode": publish_mode,
+                "fallback_litpic": payload.get("fallback_litpic", ""),
+            }
+            if "ai_league_guard_enabled" in payload:
+                guard_enabled = payload.get("ai_league_guard_enabled")
+                if not isinstance(guard_enabled, bool):
+                    raise ValueError("ai_league_guard_enabled 必须是 JSON boolean")
+                create_kwargs["ai_league_guard_enabled"] = guard_enabled
+            if "ai_league_guard_definition" in payload:
+                guard_definition = payload.get("ai_league_guard_definition")
+                if not isinstance(guard_definition, str):
+                    raise ValueError("ai_league_guard_definition 必须是字符串")
+                create_kwargs["ai_league_guard_definition"] = guard_definition
             tab = repo.create_tab(
                 str(payload.get("name") or ""),
                 int(backend_id),
-                publish_mode=publish_mode,
-                fallback_litpic=payload.get("fallback_litpic", ""),
+                **create_kwargs,
             )
             return jsonify({"success": True, "message": "栏目已新增", "tab": tab})
         except (ValueError, TypeError, sqlite3.IntegrityError) as exc:
@@ -1177,6 +1190,16 @@ def create_app(test_config: dict | None = None) -> Flask:
                 if not isinstance(fallback_litpic, str):
                     raise ValueError("fallback_litpic 必须是字符串")
                 update_args["fallback_litpic"] = fallback_litpic
+            if "ai_league_guard_enabled" in payload:
+                guard_enabled = payload.get("ai_league_guard_enabled")
+                if not isinstance(guard_enabled, bool):
+                    raise ValueError("ai_league_guard_enabled 必须是 JSON boolean")
+                update_args["ai_league_guard_enabled"] = guard_enabled
+            if "ai_league_guard_definition" in payload:
+                guard_definition = payload.get("ai_league_guard_definition")
+                if not isinstance(guard_definition, str):
+                    raise ValueError("ai_league_guard_definition 必须是字符串")
+                update_args["ai_league_guard_definition"] = guard_definition
             tab = repo.update_tab(tab_id, **update_args)
             affected_sources = [
                 _source_view(source)
@@ -1314,10 +1337,10 @@ def create_app(test_config: dict | None = None) -> Flask:
                 and (
                     isinstance(publish_mode_override, bool)
                     or not isinstance(publish_mode_override, int)
-                    or publish_mode_override not in {0, 1}
+                    or publish_mode_override not in {0, 1, 2}
                 )
             ):
-                raise ValueError("publish_mode_override 必须是 null、0（草稿）或 1（直接发布）")
+                raise ValueError("publish_mode_override 必须是 null、0（草稿）、1（直接发布）或 2（放弃）")
             rule = repo.create_event_tab_rule(
                 payload.get("marker_type"),
                 payload.get("marker_code"),
@@ -1366,10 +1389,10 @@ def create_app(test_config: dict | None = None) -> Flask:
                     and (
                         isinstance(publish_mode_override, bool)
                         or not isinstance(publish_mode_override, int)
-                        or publish_mode_override not in {0, 1}
+                        or publish_mode_override not in {0, 1, 2}
                     )
                 ):
-                    raise ValueError("publish_mode_override 必须是 null、0（草稿）或 1（直接发布）")
+                    raise ValueError("publish_mode_override 必须是 null、0（草稿）、1（直接发布）或 2（放弃）")
             rule = repo.update_event_tab_rule(
                 rule_id,
                 get_db(),
