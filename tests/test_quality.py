@@ -820,7 +820,7 @@ def test_plan_is_blocked_when_ai_marks_body_incomplete():
         llm=_IncompleteBodyWithPlanLLM(),
     )
 
-    assert result["repair_plan_error"] == "AI 修复计划与标题或正文完整性结论矛盾"
+    assert result["repair_plan_error"] == "AI 修复计划与正文完整性结论矛盾"
     assert result["needs_review"] is True
 
 
