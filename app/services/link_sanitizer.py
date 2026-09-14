@@ -91,10 +91,14 @@ _ARTIFACT_TEXT_BLOCK = re.compile(
     r"</(?P=tag)\s*>",
     re.IGNORECASE,
 )
+# Editorial byline lead-in tokens shared by every byline matcher below.  Keeping
+# them in one place avoids the recurring "missing word" bug where a new lead-in
+# (e.g. ``编译``) is added to one regex but not the others.
+_BYLINE_LEAD_IN = r"编写|编译|撰文|编撰|编辑|记者|编排|整理|构成|供稿|文|著者"
 _MEDIA_ARTIFACT_PROBE = re.compile(
     r"【\s*(?:图片|写真|视频|集锦|实战|直播|积分榜|赛程)"
     r"|\[\s*(?:图片|写真|photo|video|视频|集锦|直播|积分榜|赛程)"
-    r"|(?:编写|撰文|编撰|编辑|记者|编排|整理|构成|供稿|文|著者)\s*[●•・·:：]",
+    r"|(?:" + _BYLINE_LEAD_IN + r")\s*[●•・·:：]",
     re.IGNORECASE,
 )
 # The Chinese full stop is excluded on purpose: a caption glued to a following
@@ -130,7 +134,7 @@ _INLINE_MEDIA_CAPTION = re.compile(
     re.IGNORECASE,
 )
 _EDITORIAL_BYLINE_LINE = re.compile(
-    r"[ \t\u3000]*(?:编写|撰文|编辑|记者|文|著者)\s*[●•・·:：]\s*[^<>\r\n。]{1,80}[ \t\u3000]*",
+    r"[ \t\u3000]*(?:" + _BYLINE_LEAD_IN + r")\s*[●•・·:：]\s*[^<>\r\n。]{1,80}[ \t\u3000]*",
     re.IGNORECASE,
 )
 # Some feeds glue the editorial byline to the end of a real reporting line,
@@ -143,7 +147,7 @@ _EDITORIAL_BYLINE_LINE = re.compile(
 # and stay short so a normal sentence is never truncated.
 _EDITORIAL_BYLINE_TAIL = re.compile(
     r"(?<=[。！？!?])[ \t\u3000]*"
-    r"(?:编写|撰文|编撰|编辑|记者|编排|整理|构成|供稿|文|著者)\s*[●•・·]\s*"
+    r"(?:" + _BYLINE_LEAD_IN + r")\s*[●•・·]\s*"
     r"[^<>\r\n。！？!?]{1,40}[ \t\u3000]*$",
     re.IGNORECASE,
 )
@@ -180,13 +184,14 @@ _INLINE_PROMO_ACTION = (
     r"访问|前往|登录|实时(?:跟进|直播|文字直播|更新)|跟进本场|观看直播|收看|"
     r"抢先看|尽在|敬请关注|更多(?:内容|资讯|新闻))"
 )
-# A single sentence: text up to (and including) a sentence-ending mark.  Kept
-# short (<=80 visible chars) so a long ordinary sentence is never swallowed.
+# A single sentence: text up to (and including) a sentence-ending mark, or up
+# to block end if no sentence mark is present (some feeds omit the final period).
+# Kept short (<=80 visible chars) so a long ordinary sentence is never swallowed.
 _INLINE_PROMO_SENTENCE = re.compile(
     r"[^。！？!?\r\n]*?"
     r"(?:" + _INLINE_PROMO_PLATFORM + r"[^。！？!?\r\n]*?" + _INLINE_PROMO_ACTION
     + r"|" + _INLINE_PROMO_ACTION + r"[^。！？!?\r\n]*?" + _INLINE_PROMO_PLATFORM + r")"
-    r"[^。！？!?\r\n]*?[。！？!?]",
+    r"[^。！？!?\r\n]*?(?:[。！？!?]|$)",
     re.IGNORECASE,
 )
 _INLINE_PROMO_MAX_SENTENCE_CHARS = 80

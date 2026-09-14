@@ -353,6 +353,26 @@ def test_quality_preprocess_strips_byline_lead_in_bianzhuan():
     ]
 
 
+def test_quality_preprocess_strips_byline_lead_in_bianyi():
+    # #17236：日媒译稿常用的署名引导词 ``编译`` 此前不在词表，导致句尾署名残留。
+    body = (
+        "<p>外界普遍认为，他在脚法上甚至比转会切尔西的阿根廷门将"
+        "埃米利亚诺-马丁内斯更出色。 编译●足球文摘Web编辑部</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == (
+        "<p>外界普遍认为，他在脚法上甚至比转会切尔西的阿根廷门将"
+        "埃米利亚诺-马丁内斯更出色。</p>"
+    )
+    assert "编译●" not in cleaned
+    assert preprocess_quality_body(cleaned) == cleaned
+    assert [item["rule"] for item in find_media_artifact_lines(body)] == [
+        "editorial_byline_tail",
+    ]
+
+
 def test_quality_preprocess_keeps_sentence_that_merely_mentions_editor():
     # A normal sentence containing "编辑" without a ●-style byline marker after
     # a full stop must never be truncated.
@@ -504,3 +524,29 @@ def test_quality_preprocess_drops_stray_braces_and_keeps_names():
     assert "吉田真信连入两球" in cleaned
     assert "驹野友春" in cleaned
     assert "望月亨利海辉紧急替补登场" in cleaned
+
+
+def test_quality_preprocess_strips_broadcast_promo_without_period():
+    # #17255：ge来源的直播/实时跟进推广句有时不带句号结尾，
+    # 之前的正则要求必须有句号，导致这类推广内容无法被预处理删除。
+    body = (
+        "<p>弗拉门戈和圣保罗将于本周六北京时间16时30分进行巴西女子锦标赛半决赛首回合。"
+        "比赛将在里约热内卢的卢索-巴西莱罗球场进行，TV Globo、sportv和getv将进行直播。"
+        "ge将实时跟进本场比赛的所有细节（点击这里查看）。</p>"
+        "<p>次回合定于9月19日下周六同一时间进行，比赛地点待定。</p>"
+        "<p>直播：TV Globo、sportv和getv 实时跟进：ge全程关注——点击这里</p>"
+        "<p>主裁判：伊丽莎白（塞阿拉）</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    # 第1段中的推广句（有句号）应被删除
+    assert "ge将实时跟进本场比赛的所有细节（点击这里查看）" not in cleaned
+    # 第3段整个推广块（无句号）应被删除
+    assert "直播：TV Globo、sportv和getv 实时跟进：ge全程关注——点击这里" not in cleaned
+    # 正常内容应保留
+    assert "弗拉门戈和圣保罗将于本周六北京时间16时30分进行巴西女子锦标赛半决赛首回合" in cleaned
+    assert "次回合定于9月19日下周六同一时间进行" in cleaned
+    assert "主裁判：伊丽莎白" in cleaned
+    # 幂等性检查
+    assert preprocess_quality_body(cleaned) == cleaned
