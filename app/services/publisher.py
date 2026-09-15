@@ -307,15 +307,16 @@ def _apply_ai_league_guard(
     connection,
     config: AppConfig,
 ) -> tuple[int, dict[str, Any]]:
-    """Downgrade a fallback-column article to draft unless AI confirms it fits.
+    """Upgrade a fallback-column draft to direct publish when AI confirms it fits.
 
-    Only runs when the article would be published directly (mode 1), reached a
-    fallback column with an empty league marker, and that column has the guard
-    enabled.  Any negative or low-confidence verdict — or any model failure —
-    keeps the article as a draft (fail closed).
+    Only runs when the article would otherwise be a draft (mode 0), has an empty
+    league marker, and reached a column with the guard enabled. A source set to
+    direct publish (mode 1) is trusted as-is and never triggers the AI check.
+    Only a positive, high-confidence verdict upgrades the article to publish; any
+    negative, low-confidence, or model failure keeps it as a draft (fail closed).
     """
 
-    if int(configured_mode) != 1:
+    if int(configured_mode) != 0:
         return int(configured_mode), article
     if str(article.get("route_league") or "").strip():
         return int(configured_mode), article
@@ -328,11 +329,12 @@ def _apply_ai_league_guard(
 
     tab_name = str(guard_tab.get("name") or "")
     definition = str(guard_tab.get("ai_league_guard_definition") or "")
-    downgrade_reason: str | None = None
+    upgrade_reason: str | None = None
+    keep_reason: str | None = None
     verdict: dict[str, Any] | None = None
     llm = _make_league_guard_llm(config)
     if llm is None:
-        downgrade_reason = "AI 归属校验未配置模型，已保守降级为创建草稿"
+        keep_reason = "AI 归属校验未配置模型，维持创建草稿"
     else:
         try:
             verdict = check_league_membership(
@@ -343,28 +345,34 @@ def _apply_ai_league_guard(
                 llm,
             )
         except LLMCallError as exc:
-            downgrade_reason = f"AI 归属校验调用失败，已保守降级为创建草稿：{exc}"
+            keep_reason = f"AI 归属校验调用失败，维持创建草稿：{exc}"
         else:
-            if not (
+            if (
                 verdict["belongs"] is True
                 and verdict["confidence"] >= LEAGUE_GUARD_MIN_CONFIDENCE
             ):
-                downgrade_reason = (
+                upgrade_reason = (
+                    f"AI 判断本篇属于「{tab_name or '兜底栏目'}」"
+                    f"（confidence={verdict['confidence']:.2f}），"
+                    f"已升级为直接发布：{verdict['reason']}"
+                )
+            else:
+                keep_reason = (
                     f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」"
                     f"（belongs={verdict['belongs']}, confidence={verdict['confidence']:.2f}），"
-                    f"已降级为创建草稿：{verdict['reason']}"
+                    f"维持创建草稿：{verdict['reason']}"
                 )
 
-    effective_mode = 0 if downgrade_reason else int(configured_mode)
+    effective_mode = 1 if upgrade_reason else int(configured_mode)
     guard_record = {
         "tab_id": guard_tab.get("id"),
         "tab_name": tab_name,
         "configured_publish_mode": int(configured_mode),
         "effective_publish_mode": effective_mode,
-        "downgraded_to_draft": effective_mode != int(configured_mode),
+        "upgraded_to_publish": effective_mode != int(configured_mode),
         "min_confidence": LEAGUE_GUARD_MIN_CONFIDENCE,
         "verdict": verdict,
-        "reason": downgrade_reason,
+        "reason": upgrade_reason or keep_reason,
     }
     quality = article.get("quality")
     quality_result = dict(quality) if isinstance(quality, dict) else {}
@@ -376,12 +384,12 @@ def _apply_ai_league_guard(
             connection,
             status=str(article.get("status") or "READY_TO_PUBLISH"),
         )
-    if downgrade_reason:
+    if upgrade_reason:
         repo.add_article_event(
             int(article["id"]),
-            "LEAGUE_GUARD_DOWNGRADED",
+            "LEAGUE_GUARD_UPGRADED",
             connection,
-            message=downgrade_reason,
+            message=upgrade_reason,
             payload=guard_record,
             from_status=str(article.get("status") or "READY_TO_PUBLISH"),
             to_status=str(article.get("status") or "READY_TO_PUBLISH"),
@@ -432,11 +440,11 @@ def _resolve_publish_mode(
                 )
             mode = _as_publish_mode(resolved.get("publish_mode"))
             if mode is not None:
-                effective_mode, article = _apply_language_publish_guard(
-                    article, mode, connection
-                )
                 effective_mode, article = _apply_ai_league_guard(
-                    article, effective_mode, tabs, connection, config
+                    article, mode, tabs, connection, config
+                )
+                effective_mode, article = _apply_language_publish_guard(
+                    article, effective_mode, connection
                 )
                 if effective_mode != mode:
                     return effective_mode, _save_publish_mode_snapshot(
@@ -468,11 +476,11 @@ def _resolve_publish_mode(
         source.get("publish_mode_override") if source else None
     )
     if source_override is not None:
-        effective_mode, article = _apply_language_publish_guard(
-            article, source_override, connection
-        )
         effective_mode, article = _apply_ai_league_guard(
-            article, effective_mode, tabs, connection, config
+            article, source_override, tabs, connection, config
+        )
+        effective_mode, article = _apply_language_publish_guard(
+            article, effective_mode, connection
         )
         return effective_mode, _save_publish_mode_snapshot(
             int(article["id"]), effective_mode, connection, article
@@ -505,9 +513,11 @@ def _resolve_publish_mode(
             "文章绑定的多个栏目发布模式不一致，无法提交：" + "、".join(names)
         )
     mode = next(iter(configured_modes), _as_publish_mode(config.dqd_open_status, 0) or 0)
-    effective_mode, article = _apply_language_publish_guard(article, mode, connection)
     effective_mode, article = _apply_ai_league_guard(
-        article, effective_mode, tabs, connection, config
+        article, mode, tabs, connection, config
+    )
+    effective_mode, article = _apply_language_publish_guard(
+        article, effective_mode, connection
     )
     return effective_mode, _save_publish_mode_snapshot(
         int(article["id"]), effective_mode, connection, article

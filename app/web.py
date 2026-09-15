@@ -227,6 +227,29 @@ def _article_view(article: dict | None) -> dict | None:
     item["has_ad"] = any("广告" in str(v) or "购买" in str(v) for v in dirty)
     item["has_dirty"] = bool(dirty)
     item["needs_review"] = bool(quality.get("needs_review")) if isinstance(quality, dict) else None
+    # Surface the AI column-membership guard verdict so the list can show that a
+    # draft was checked and deliberately kept (or upgraded), instead of looking
+    # as if no AI decision happened.
+    guard = quality.get("league_guard") if isinstance(quality, dict) else None
+    guard = guard if isinstance(guard, dict) else None
+    item["league_guard"] = guard
+    if guard:
+        verdict = guard.get("verdict") if isinstance(guard.get("verdict"), dict) else {}
+        guard_tab_name = str(guard.get("tab_name") or "")
+        if guard.get("upgraded_to_publish"):
+            item["league_guard_state"] = "upgraded"
+            item["league_guard_label"] = f"AI：属于「{guard_tab_name}」已升级直发"
+        elif verdict.get("belongs") is False:
+            item["league_guard_state"] = "kept"
+            item["league_guard_label"] = f"AI：不属于「{guard_tab_name}」维持草稿"
+        else:
+            item["league_guard_state"] = "kept"
+            item["league_guard_label"] = f"AI 归属存疑「{guard_tab_name}」维持草稿"
+        item["league_guard_reason"] = str(verdict.get("reason") or guard.get("reason") or "")
+    else:
+        item["league_guard_state"] = ""
+        item["league_guard_label"] = ""
+        item["league_guard_reason"] = ""
     item["body_excerpt"] = html_to_text(item.get("body_html", ""))[:360]
     item["cover_url"] = cdn_url(item.get("litpic"))
     # Keep the stored material cover for list/quality views, but show the

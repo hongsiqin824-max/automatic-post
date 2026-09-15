@@ -1432,3 +1432,317 @@ def test_does_not_remove_branded_watch_sentence_from_middle_of_article() -> None
     )
 
     assert remove_promotional_blocks(body) == (body, [])
+
+
+def test_edge_fragment_removal_strips_leading_google_ad_token() -> None:
+    body = "<p>google广告分区开始(name=s1) 明天开赛，主队将全力争胜，力争拿下三分。</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "google广告分区开始(name=s1) 明天开赛，主队将全力争胜，力争拿下三分。",
+        "after": "明天开赛，主队将全力争胜，力争拿下三分。",
+        "issue_type": "template_artifact",
+        "reason": "段首谷歌广告分区模板残留，与新闻事实无关",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "google广告分区" not in cleaned
+    assert "明天开赛，主队将全力争胜，力争拿下三分。" in cleaned
+    assert matches and matches[0]["validation"] == "ai_edge_fragment_removal"
+
+
+def test_edge_fragment_removal_strips_trailing_cta() -> None:
+    body = "<p>球队已经抵达日本，全队备战就绪，士气高涨。 点击这里查看更多精彩内容</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "球队已经抵达日本，全队备战就绪，士气高涨。 点击这里查看更多精彩内容",
+        "after": "球队已经抵达日本，全队备战就绪，士气高涨。",
+        "issue_type": "promotion",
+        "reason": "段尾引流号召，与新闻事实无关",
+        "confidence": 0.97,
+    }
+    cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "点击" not in cleaned
+    assert "球队已经抵达日本" in cleaned
+
+
+def test_edge_fragment_removal_rejects_middle_deletion() -> None:
+    body = "<p>上半场比分一比零，google广告分区开始(name=s1)下半场再进两球，最终三比零获胜。</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "上半场比分一比零，google广告分区开始(name=s1)下半场再进两球，最终三比零获胜。",
+        "after": "上半场比分一比零，下半场再进两球，最终三比零获胜。",
+        "issue_type": "template_artifact",
+        "reason": "中间广告残留",
+        "confidence": 0.98,
+    }
+    _cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is not None
+
+
+def test_edge_fragment_removal_strips_both_ends() -> None:
+    body = (
+        "<p>前文 神户14日通过俱乐部官网宣布，18岁的中场濑口大翔将租借加盟斯洛伐克的"
+        "FC科希策。 前文リンク</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": (
+            "前文 神户14日通过俱乐部官网宣布，18岁的中场濑口大翔将租借加盟斯洛伐克的"
+            "FC科希策。 前文リンク"
+        ),
+        "after": "神户14日通过俱乐部官网宣布，18岁的中场濑口大翔将租借加盟斯洛伐克的FC科希策。",
+        "issue_type": "template_artifact",
+        "reason": "段首'前文'与段尾'前文リンク'是模板残留，删除后新闻事实完整",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "前文" not in cleaned
+    assert "リンク" not in cleaned
+    assert "神户14日通过俱乐部官网宣布" in cleaned
+    assert matches and matches[0]["validation"] == "ai_edge_fragment_removal"
+
+
+def test_edge_fragment_removal_both_ends_rejects_number_tampering() -> None:
+    body = "<p>前文 最终比分三比零，主队大胜。 前文リンク</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "前文 最终比分三比零，主队大胜。 前文リンク",
+        "after": "最终比分五比零，主队大胜。",
+        "issue_type": "template_artifact",
+        "reason": "段首段尾模板残留",
+        "confidence": 0.98,
+    }
+    _cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is not None
+
+
+def test_edge_fragment_removal_rejects_plain_news_sentence() -> None:
+    body = "<p>主帅表示球队状态良好，希望能带着积分回去。 阮庭北说现场气氛非常好。</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "主帅表示球队状态良好，希望能带着积分回去。 阮庭北说现场气氛非常好。",
+        "after": "主帅表示球队状态良好，希望能带着积分回去。",
+        "issue_type": "promotion",
+        "reason": "多余内容",
+        "confidence": 0.98,
+    }
+    _cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is not None
+
+
+def test_edge_fragment_removal_rejects_number_tampering() -> None:
+    body = "<p>最终比分三比零，主队大胜。 google广告分区结束(name=s1)</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "最终比分三比零，主队大胜。 google广告分区结束(name=s1)",
+        "after": "最终比分五比零，主队大胜。",
+        "issue_type": "template_artifact",
+        "reason": "段尾广告残留",
+        "confidence": 0.98,
+    }
+    _cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is not None
+
+
+def test_edge_fragment_removal_strips_trailing_editor_byline() -> None:
+    body = (
+        "<p>进攻办法不多的里昂最终与对手0-0战平，连续两轮没能进球。 编制●足球文摘Web编辑部</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "进攻办法不多的里昂最终与对手0-0战平，连续两轮没能进球。 编制●足球文摘Web编辑部",
+        "after": "进攻办法不多的里昂最终与对手0-0战平，连续两轮没能进球。",
+        "issue_type": "template_artifact",
+        "reason": "段尾编辑部署名属于模板残留，与新闻事实无关",
+        "confidence": 0.99,
+    }
+    cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "编制●" not in cleaned
+    assert "0-0战平" in cleaned
+
+
+def test_edge_fragment_removal_strips_trailing_copyright_byline() -> None:
+    # (C) 版权署名现在优先由图片署名规范化规则处理：AI 的 after 必须与
+    # 规范化结果一致，直接删除会保持原文不变（fail-closed）。
+    body = "<p>阿隆索主帅正切身感受到防守松散的问题。(C)TOSHI TAKEYA（SOCCER DIGEST）</p>"
+    delete_plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "阿隆索主帅正切身感受到防守松散的问题。(C)TOSHI TAKEYA（SOCCER DIGEST）",
+        "after": "阿隆索主帅正切身感受到防守松散的问题。",
+        "issue_type": "template_artifact",
+        "reason": "段尾版权署名属于模板残留，与新闻事实无关",
+        "confidence": 0.98,
+    }
+    _cleaned, _matches, error = apply_repair_plan(body, delete_plan)
+    assert error is not None
+
+    normalize_plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "阿隆索主帅正切身感受到防守松散的问题。(C)TOSHI TAKEYA（SOCCER DIGEST）",
+        "after": "阿隆索主帅正切身感受到防守松散的问题。（图片来源：TOSHI TAKEYA（SOCCER DIGEST））",
+        "issue_type": "minor_text_defect",
+        "reason": "版权署名规范化为图片来源标注",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, normalize_plan)
+    assert error is None
+    assert "（图片来源：TOSHI TAKEYA（SOCCER DIGEST））" in cleaned
+    assert matches and matches[0]["validation"] == "photo_credit_rule"
+
+
+def test_edge_fragment_removal_strips_trailing_lead_link_marker() -> None:
+    body = "<p>新潟队13日将在主场迎战山形队，主帅确认主力阵容齐整。 导语链接</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "新潟队13日将在主场迎战山形队，主帅确认主力阵容齐整。 导语链接",
+        "after": "新潟队13日将在主场迎战山形队，主帅确认主力阵容齐整。",
+        "issue_type": "template_artifact",
+        "reason": "段尾'导语链接'是模板残留，与新闻事实无关",
+        "confidence": 0.99,
+    }
+    cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "导语链接" not in cleaned
+    assert "新潟队" in cleaned
+
+
+def test_whole_sentence_removal_strips_mid_paragraph_promotion() -> None:
+    # 推广句在段落中间（前后都有新闻句），只能走整句删除路径。
+    body = (
+        "<p>此外，在节目介绍京都不死鸟对阵柏太阳神的画面后，演播室还围绕替补球员的用法"
+        "展开了热烈讨论。直播结束后还会提供回放，只要注册就能随时免费观看。节目最后还"
+        "预告了下一期的特别嘉宾阵容。</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": (
+            "此外，在节目介绍京都不死鸟对阵柏太阳神的画面后，演播室还围绕替补球员的用法"
+            "展开了热烈讨论。直播结束后还会提供回放，只要注册就能随时免费观看。节目最后还"
+            "预告了下一期的特别嘉宾阵容。"
+        ),
+        "after": (
+            "此外，在节目介绍京都不死鸟对阵柏太阳神的画面后，演播室还围绕替补球员的用法"
+            "展开了热烈讨论。节目最后还预告了下一期的特别嘉宾阵容。"
+        ),
+        "issue_type": "promotion",
+        "reason": "该段中间'直播结束后还会提供回放，只要注册就能随时免费观看。'是独立推广引流句，与新闻事实无关",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "回放" not in cleaned
+    assert "展开了热烈讨论" in cleaned
+    assert "特别嘉宾阵容" in cleaned
+    assert matches and matches[0]["validation"] == "ai_whole_sentence_removal"
+
+
+def test_whole_sentence_removal_rejects_factual_sentence() -> None:
+    body = (
+        "<p>球队上一轮在主场2比3不敌桑托斯，积分停留在25分。想观看这场关键战的球迷"
+        "可以通过多个平台收看直播。比赛将由Record电视台在开放频道播出。</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": (
+            "球队上一轮在主场2比3不敌桑托斯，积分停留在25分。想观看这场关键战的球迷"
+            "可以通过多个平台收看直播。比赛将由Record电视台在开放频道播出。"
+        ),
+        "after": "球队上一轮在主场2比3不敌桑托斯，积分停留在25分。比赛将由Record电视台在开放频道播出。",
+        "issue_type": "promotion",
+        "reason": "中间句子是转播信息，与新闻事实无关",
+        "confidence": 0.98,
+    }
+    _cleaned, _matches, error = apply_repair_plan(body, plan)
+    # 转播平台信息是新闻事实，不得按推广删除。
+    assert error is not None
+
+
+def test_whole_sentence_removal_rejects_partial_sentence_splice() -> None:
+    body = "<p>上半场比赛非常胶着。中场休息后节奏明显加快。最终主队一球小胜。</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "上半场比赛非常胶着。中场休息后节奏明显加快。最终主队一球小胜。",
+        "after": "上半场比赛非常胶着。最终主队一球小胜。",
+        "issue_type": "promotion",
+        "reason": "中间句子是推广内容",
+        "confidence": 0.98,
+    }
+    _cleaned, _matches, error = apply_repair_plan(body, plan)
+    # 普通新闻句不可删除；after 重写事实更不允许。
+    assert error is not None
+
+
+def test_replace_text_null_after_falls_back_to_block_removal() -> None:
+    body = "<p>球队在训练场备战周末联赛，主力全员合练。</p><p>点击这里查看更多详情</p>"
+    plan = [{
+        "block_id": "b2",
+        "action": "replace_text",
+        "evidence": "点击这里查看更多详情",
+        "after": None,
+        "issue_type": "promotion",
+        "reason": "独立引流行，与新闻事实无关",
+        "confidence": 0.98,
+    }]
+    cleaned, applied, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "点击这里" not in cleaned
+    assert "备战周末联赛" in cleaned
+    assert applied and applied[0]["action"] == "remove_block"
+
+
+def test_photo_credit_marker_bracket_source_normalized() -> None:
+    body = "<p>鈴木彩艶【照片：Getty Images】</p><p>正文介绍了比赛内容和赛后采访。</p>"
+    normalized, matches = normalize_photo_credits(body)
+    assert matches and matches[0]["rule"] == "photographer_credit_marker"
+    assert matches[0]["source"] == "Getty Images"
+    assert "（图片来源：Getty Images）" in normalized
+
+
+def test_multi_plan_relocates_drifted_block_ids() -> None:
+    # 模拟质检预处理先行删除了一段推广后块编号漂移的场景。
+    body = (
+        "<p>澳超官方公布了新赛季安排，揭幕战将在十月进行，各支球队正在按计划完成季前备战。</p>"
+        "<img src=\"/fastdfs8/promotion-test.jpg\" alt=\"澳超赛场\">"
+        "<p>观看 ge、Globo 和 sportv 上的全部内容</p>"
+    )
+    plan = [
+        {
+            "block_id": "b2",
+            "action": "remove_block",
+            "evidence": "点击这里关注 WhatsApp 频道，获取最新消息",
+            "confidence": 0.98,
+        },
+        {
+            "block_id": "b3",
+            "action": "remove_block",
+            "evidence": "观看 ge、Globo 和 sportv 上的全部内容",
+            "confidence": 0.96,
+        },
+    ]
+    cleaned, applied, error = apply_repair_plan(body, plan)
+    # WhatsApp 计划的目标已不存在（已被预处理清理），跳过；
+    # watch 计划的 b3 编号漂移为 b2，按证据重新定位后仍应执行。
+    assert error is None
+    assert "观看" not in cleaned
+    assert "季前备战" in cleaned
+    assert applied and len(applied) == 1
+    assert applied[0]["text"] == "观看 ge、Globo 和 sportv 上的全部内容"
+

@@ -14,6 +14,74 @@ from html.parser import HTMLParser
 
 _ANCHOR_START = re.compile(r"<\s*a(?:\s|/?>)", re.IGNORECASE)
 _RESIDUAL_ANCHOR = re.compile(r"<\s*/?\s*a\b[^>]*(?:>|$)", re.IGNORECASE)
+# Upstream feeds emit the Google ad-section boundary either in its original
+# ``google_ad_section_start/end`` form or, after machine translation, as the
+# Chinese ``google广告分区开始/结束``.  Both are non-article template residue,
+# so every matcher below shares this sub-pattern to avoid the recurring bug of
+# only covering the English spelling.
+_GOOGLE_AD_SECTION_TOKEN = (
+    r"google(?:_ad_section_(?:start|end)|\s*广告分区\s*(?:开始|结束|開始|結束))"
+)
+# The Google ad-section boundary is unambiguous template residue for every
+# source (not just sponichi): it never appears in genuine reporting.  This
+# matcher strips the token — with its optional ``(name=s1)`` argument — even
+# when it is glued to the start or end of a reporting paragraph, so the news
+# text around it is preserved instead of routing the article to manual review.
+_GOOGLE_AD_SECTION_INLINE = re.compile(
+    r"(?:^|(?<=\s)|(?<=>))" + _GOOGLE_AD_SECTION_TOKEN + r"(?:\s*\([^\r\n)]*\))?(?=\s|<|$)",
+    re.IGNORECASE,
+)
+# Japanese feed template residue that is machine-translated into the body as
+# ordinary text.  ``前文リンク`` / ``前文链接`` (a "link to the previous article"
+# label) never appears in genuine reporting, so it is stripped inline wherever
+# it occurs.  The bare ``前文`` lead-in is only stripped when glued to the very
+# start of a paragraph (right after ``>`` or the buffer start), because it marks
+# the "previous article" preamble there; a mid-sentence ``前文`` is left alone.
+# Applied to every source, mirroring ``_GOOGLE_AD_SECTION_INLINE``.
+_JP_PREAMBLE_RESIDUE_INLINE = re.compile(
+    r"(?:^|(?<=\s)|(?<=>))前文\s*(?:リンク|链接|連結|リンク)(?=\s|<|$)"
+    r"|(?:^|(?<=>))\s*前文(?=\s|<)",
+    re.IGNORECASE,
+)
+# Some feeds (e.g. sport1) append a "related news" list to the tail of the body
+# as a run of heading blocks: an anchor heading such as ``<h2>更多新闻</h2>``
+# followed by several recommendation headings.  Everything from the anchor to
+# the end of the body is traffic-generation residue, not reporting.  Only
+# headings *after* the anchor are removed, so genuine in-article subheadings
+# before it are preserved.  The anchor wording is intentionally narrow.
+_RECOMMENDATION_ANCHOR = (
+    r"更多新闻|更多精彩|相关新闻|相关推荐|相关阅读|延伸阅读|推荐阅读|热门推荐|猜你喜欢"
+)
+_RECOMMENDATION_TAIL_BLOCK = re.compile(
+    r"<(?P<tag>h[1-6])(?:\s[^>]*)?>\s*(?:" + _RECOMMENDATION_ANCHOR + r")\s*</(?P=tag)\s*>"
+    # Consume the run of heading blocks that immediately follows the anchor (the
+    # recommended links) plus whitespace/comments between them.  Stopping at the
+    # first non-heading block keeps any genuine trailing paragraph intact.
+    r"(?:\s*(?:<!--.*?-->\s*)?<(?P<h>h[1-6])(?:\s[^>]*)?>.*?</(?P=h)\s*>)*",
+    re.IGNORECASE | re.DOTALL,
+)
+# Standalone subscription / newsletter / paywall promo paragraphs.  ``订阅`` on
+# its own is usually legitimate reporting ("需订阅某平台观看直播"), so this only
+# matches high-specificity promo shapes: a newsletter-subscription call
+# (``订阅…简报/新闻邮件/资讯提醒``) or a paywall prompt (``继续阅读需订阅`` /
+# ``订阅后继续阅读`` / ``选择适合你的订阅…解锁…内容`` / ``你已经订阅了吗？登录…阅读``).
+# The whole ``<p>/<div>/<li>`` block is dropped only when its entire text is such
+# a prompt, so a reporting sentence that merely mentions a subscription stays.
+_SUBSCRIPTION_PROMO_TEXT = (
+    r"(?:继续阅读|阅读全文|阅读更多)[^<>\r\n]{0,8}需?订阅"
+    r"|订阅后[^<>\r\n]{0,4}(?:继续|即可)?阅读"
+    r"|(?:你)?已经?订阅(?:了)?(?:吗|\?|？)?[^<>\r\n]{0,8}登录[^<>\r\n]{0,6}阅读"
+    r"|选择[^<>\r\n]{0,8}订阅[^<>\r\n]{0,20}(?:解锁|畅享|畅快|无限|无间断)[^<>\r\n]{0,20}(?:内容|阅读)"
+    r"|订阅[^<>\r\n]{0,12}(?:新闻)?(?:简报|快报|邮件|资讯提醒|时事通讯|newsletter)"
+)
+_SUBSCRIPTION_PROMO_BLOCK = re.compile(
+    r"<(?P<tag>p|div|li)(?:\s[^>]*)?>\s*"
+    r"(?:<(?:strong|b|span|em|i)\b[^>]*>\s*)*"
+    r"[^<>]{0,20}(?:" + _SUBSCRIPTION_PROMO_TEXT + r")[^<>]{0,60}"
+    r"(?:</(?:strong|b|span|em|i)\s*>\s*)*"
+    r"</(?P=tag)\s*>",
+    re.IGNORECASE,
+)
 _QUALITY_ARTIFACT_COMMENT = re.compile(
     r"<!--\s*(?:#(?:include|set|exec|echo)\b.*?|google_ad_section_(?:start|end)\b[^-]*|(?:brightcove|video-js|jwplayer)\b[^-]*|(?:start|end)\s+of\s+(?:brightcove|video-js|jwplayer)\s+player[^-]*)-->"
     r"|<\s*google_ad_section_(?:start|end)\b[^>]*>",
@@ -45,12 +113,12 @@ _QUALITY_EMPTY_MARKER_BLOCK = re.compile(
     re.IGNORECASE,
 )
 _QUALITY_PLAIN_MARKER_LINE = re.compile(
-    r"(?m)^[ \t]*(?:google_ad_section_(?:start|end)(?:\([^\r\n)]*\))?|前文(?:链接)?|正文|相关SSI(?:（正文中）)?)[ \t]*$",
+    r"(?m)^[ \t]*(?:" + _GOOGLE_AD_SECTION_TOKEN + r"(?:\([^\r\n)]*\))?|前文(?:链接)?|正文|相关SSI(?:（正文中）)?)[ \t]*$",
     re.IGNORECASE,
 )
 _QUALITY_MARKER_TEXT_BLOCK = re.compile(
     r"<(?P<tag>p|div|li)(?P<attrs>\s[^>]*)?>\s*"
-    r"(?:google_ad_section_(?:start|end)(?:\([^)]*\))?|前文(?:链接)?|正文|相关SSI(?:（正文中）?))\s*"
+    r"(?:" + _GOOGLE_AD_SECTION_TOKEN + r"(?:\([^)]*\))?|前文(?:链接)?|正文|相关SSI(?:（正文中）?))\s*"
     r"</(?P=tag)\s*>",
     re.IGNORECASE,
 )
@@ -71,7 +139,7 @@ _EMPTY_CONTENT_BLOCK = re.compile(
 # left byte-for-byte unchanged.
 _SPONICHI_TEMPLATE_MARKER = re.compile(
     r"(?:^|(?<=\s)|(?<=>))(?:"
-    r"google_ad_section_(?:start|end)(?:\([^\r\n)]*\))?"
+    + _GOOGLE_AD_SECTION_TOKEN + r"(?:\([^\r\n)]*\))?"
     r"|前文链接|相关(?:文章)?SSI\s*[（(](?:正文|本文)中[）)]"
     r")(?=\s|<|$)",
     re.IGNORECASE,
@@ -709,6 +777,10 @@ def preprocess_quality_body(body_html: str | None, *, source: str | None = None)
         or _QUALITY_PLAIN_MARKER_LINE.search(body)
         or _QUALITY_MARKER_TEXT_BLOCK.search(body)
         or _QUALITY_EMPTY_MARKER_BLOCK.search(body)
+        or _GOOGLE_AD_SECTION_INLINE.search(body) is not None
+        or _JP_PREAMBLE_RESIDUE_INLINE.search(body) is not None
+        or _RECOMMENDATION_TAIL_BLOCK.search(body) is not None
+        or _SUBSCRIPTION_PROMO_BLOCK.search(body) is not None
         or _CLICKABLE_ATTRIBUTE.search(body)
         or has_source_template_marker
         or _MEDIA_ARTIFACT_PROBE.search(body) is not None
@@ -726,6 +798,10 @@ def preprocess_quality_body(body_html: str | None, *, source: str | None = None)
     body = _QUALITY_ARTIFACT_COMMENT.sub("", body)
     body = _QUALITY_PLAIN_MARKER_LINE.sub("", body)
     body = _QUALITY_MARKER_TEXT_BLOCK.sub("", body)
+    body = _GOOGLE_AD_SECTION_INLINE.sub("", body)
+    body = _JP_PREAMBLE_RESIDUE_INLINE.sub("", body)
+    body = _RECOMMENDATION_TAIL_BLOCK.sub("", body)
+    body = _SUBSCRIPTION_PROMO_BLOCK.sub("", body)
     body = _QUALITY_EMPTY_MARKER_BLOCK.sub("", body)
     body = remove_media_artifact_lines(body)
     body = _strip_inline_media_caption(body)

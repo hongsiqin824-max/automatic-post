@@ -187,6 +187,23 @@ class AppConfig:
     # Concurrent quality workers per ingestion run; 1 keeps serial behavior.
     quality_workers: int = max(1, min(8, _env_int("AUTOMATIC_POST_QUALITY_WORKERS", 4)))
 
+    # Transient LLM outages (timeout / connection / rate-limit / invalid JSON)
+    # must not permanently park an article in manual review.  Each ingestion
+    # pass re-checks a bounded number of such articles once enough delay has
+    # passed, up to N automatic attempts per article.
+    transient_recheck_enabled: bool = _env_bool(
+        "AUTOMATIC_POST_TRANSIENT_RECHECK_ENABLED", True
+    )
+    transient_recheck_delay_seconds: int = max(
+        60, _env_int("AUTOMATIC_POST_TRANSIENT_RECHECK_DELAY_SECONDS", 600)
+    )
+    transient_recheck_max_attempts: int = max(
+        1, min(10, _env_int("AUTOMATIC_POST_TRANSIENT_RECHECK_MAX_ATTEMPTS", 2))
+    )
+    transient_recheck_batch_limit: int = max(
+        1, min(100, _env_int("AUTOMATIC_POST_TRANSIENT_RECHECK_BATCH_LIMIT", 20))
+    )
+
     @property
     def material_configured(self) -> bool:
         return bool(self.material_api_key and self.material_caller)

@@ -161,6 +161,10 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .result-label svg { width: 14px; height: 14px; }
 .result-ok { color: var(--green); }
 .result-warn { color: var(--amber); }
+.league-guard-badge { display: inline-block; margin-top: 4px; padding: 1px 6px; border-radius: 4px; font-size: 10px; line-height: 1.5; white-space: nowrap; }
+.league-guard-reason { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.league-guard-kept { background: rgba(217, 119, 6, .12); color: var(--amber); }
+.league-guard-upgraded { background: rgba(22, 163, 74, .12); color: var(--green); }
 
 .filter-bar { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 9px; margin-bottom: 17px; }
 .filter-bar label:not(.search-field), .field { display: grid; gap: 5px; }

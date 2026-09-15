@@ -80,6 +80,18 @@ def _config(database: str) -> AppConfig:
     )
 
 
+def _llm_config(database: str) -> AppConfig:
+    """Config with a configured LLM for transient-retry scheduling tests."""
+    return AppConfig(
+        database_path=database,
+        material_api_key="test-key",
+        material_caller="test-caller",
+        llm_api_key="test-llm-key",
+        publisher_enabled=False,
+        scheduler_enabled=False,
+    )
+
+
 def _enable_source(database: str) -> None:
     conn = _connect(database)
     try:
@@ -967,6 +979,11 @@ def test_pipeline_applies_validated_ai_plan_for_two_tail_promotions(
             "repairable": True,
             "needs_review": False,
         },
+        # The AI plans reference the pre-preprocessing block numbering. The
+        # deterministic quality preprocessing removes the WhatsApp CTA line
+        # first, which shifts the watch block from b3 to b2 before the plan
+        # is applied; the evidence-based relocation is expected to recover
+        # the watch plan while the already-cleaned WhatsApp plan is skipped.
         "repair_plans": [
             {
                 "block_id": "b2",
@@ -995,7 +1012,9 @@ def test_pipeline_applies_validated_ai_plan_for_two_tail_promotions(
     run_once(_config(database))
 
     assert len(calls) == 2
-    assert whatsapp in calls[0]["body"] and watch in calls[0]["body"]
+    # The WhatsApp CTA is removed by quality preprocessing before the first
+    # quality pass, so only the watch line reaches the AI quality check.
+    assert whatsapp not in calls[0]["body"] and watch in calls[0]["body"]
     assert whatsapp not in calls[1]["body"] and watch not in calls[1]["body"]
     assert IMAGE in calls[0]["body"] and IMAGE in calls[1]["body"]
     conn = _connect(database)
@@ -1004,7 +1023,7 @@ def test_pipeline_applies_validated_ai_plan_for_two_tail_promotions(
         assert article["status"] == "READY_TO_PUBLISH"
         assert article["body_html"] == f"<p>{ARTICLE_TEXT}</p>{IMAGE}"
         repair = article["quality"]["promotion_repair"]
-        assert repair["removed_count"] == 2
+        assert repair["removed_count"] == 1
         assert repair["outcome"] == "passed"
     finally:
         conn.close()
@@ -1878,3 +1897,86 @@ def test_pipeline_strips_caption_and_byline_before_first_quality(
         ]
     finally:
         conn.close()
+
+
+def test_schedule_transient_rechecks_requeues_llm_outage_articles(app) -> None:
+    from app.services import pipeline as pipeline_module
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    conn = _connect(database)
+    try:
+        saved = repo.upsert_material(_item("transient-outage"), conn)
+        article_id = int(saved["article"]["id"])
+        quality = {
+            "pass": False,
+            "needs_review": True,
+            "score": 50,
+            "level": "B",
+            "issues": {
+                "title_problems": [],
+                "dirty_content": [],
+                "completeness_problems": [],
+                "channel_problems": [],
+                "semantic_problems": [
+                    "AI 服务暂时不可用，已重试仍未返回，需要人工确认"
+                ],
+            },
+            "reason": "AI 服务暂时不可用，已重试仍未返回，需要人工确认",
+        }
+        conn.execute(
+            "UPDATE articles SET status='NEEDS_REVIEW', quality_json=?, "
+            "updated_at='2020-01-01T00:00:00.000Z' WHERE id=?",
+            (json.dumps(quality, ensure_ascii=False), article_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    scheduled = pipeline_module.schedule_transient_rechecks(
+        _llm_config(database), _connect(database)
+    )
+    assert article_id in scheduled
+    conn = _connect(database)
+    try:
+        moved = repo.get_article(article_id, conn)
+        assert moved["status"] == "RECEIVED"
+    finally:
+        conn.close()
+
+
+def test_schedule_transient_rechecks_skips_content_failures(app) -> None:
+    from app.services import pipeline as pipeline_module
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    conn = _connect(database)
+    try:
+        saved = repo.upsert_material(_item("content-failure"), conn)
+        article_id = int(saved["article"]["id"])
+        quality = {
+            "pass": False,
+            "needs_review": True,
+            "score": 50,
+            "issues": {
+                "title_problems": [],
+                "dirty_content": ["疑似广告或脏内容：摄影[：:]"],
+                "completeness_problems": [],
+                "channel_problems": [],
+                "semantic_problems": [],
+            },
+            "reason": "疑似广告或脏内容：摄影[：:]",
+        }
+        conn.execute(
+            "UPDATE articles SET status='NEEDS_REVIEW', quality_json=?, "
+            "updated_at='2020-01-01T00:00:00.000Z' WHERE id=?",
+            (json.dumps(quality, ensure_ascii=False), article_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    scheduled = pipeline_module.schedule_transient_rechecks(
+        _llm_config(database), _connect(database)
+    )
+    assert article_id not in scheduled

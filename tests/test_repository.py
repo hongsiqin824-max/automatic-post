@@ -919,3 +919,101 @@ def test_draft_confirmation_pending_releases_claim_and_reschedules(app):
         assert pending["draft_confirm_claimed_at"] is None
         assert pending["draft_confirm_attempts"] == 1
         assert repo.list_due_draft_confirmations(now="2020-01-02T00:00:00.000Z") == []
+
+
+def _park_transient_failure(article_id, reason):
+    """Move a fresh article into NEEDS_REVIEW with a transient LLM reason."""
+    quality = {
+        "pass": False,
+        "needs_review": True,
+        "score": 50,
+        "level": "B",
+        "issues": {
+            "title_problems": [],
+            "dirty_content": [],
+            "completeness_problems": [],
+            "channel_problems": [],
+            "semantic_problems": [reason],
+        },
+        "reason": reason,
+    }
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE articles SET status='NEEDS_REVIEW', quality_json=?, "
+            "updated_at='2020-01-01T00:00:00.000Z' WHERE id=?",
+            (repo._json(quality, {}), article_id),
+        )
+
+
+def test_transient_recheck_candidates_and_attempt_limit(app):
+    with app.app_context():
+        article = repo.upsert_material(_material())["article"]
+        _park_transient_failure(
+            article["id"],
+            "AI 服务暂时不可用，已重试仍未返回，需要人工确认",
+        )
+        candidates = repo.list_transient_recheck_candidates(
+            retryable_reasons=[
+                "AI 服务暂时不可用，已重试仍未返回，需要人工确认"
+            ],
+            updated_before="2020-01-02T00:00:00.000Z",
+            limit=10,
+            max_attempts=2,
+        )
+        assert candidates == [article["id"]]
+        assert repo.request_transient_recheck(article["id"]) is True
+        moved = repo.get_article(article["id"])
+        assert moved["status"] == "RECEIVED"
+
+        # First retry exhausted: one TRANSIENT_RECHECK_REQUESTED event exists.
+        _park_transient_failure(
+            article["id"],
+            "AI 服务暂时不可用，已重试仍未返回，需要人工确认",
+        )
+        assert repo.list_transient_recheck_candidates(
+            retryable_reasons=[
+                "AI 服务暂时不可用，已重试仍未返回，需要人工确认"
+            ],
+            updated_before="2020-01-02T00:00:00.000Z",
+            limit=10,
+            max_attempts=1,
+        ) == []
+        assert repo.list_transient_recheck_candidates(
+            retryable_reasons=[
+                "AI 服务暂时不可用，已重试仍未返回，需要人工确认"
+            ],
+            updated_before="2020-01-02T00:00:00.000Z",
+            limit=10,
+            max_attempts=2,
+        ) == [article["id"]]
+
+
+def test_transient_recheck_ignores_content_failures(app):
+    with app.app_context():
+        article = repo.upsert_material(_material())["article"]
+        _park_transient_failure(article["id"], "正文为空或少于30字")
+        assert repo.list_transient_recheck_candidates(
+            retryable_reasons=[
+                "AI 服务暂时不可用，已重试仍未返回，需要人工确认"
+            ],
+            updated_before="2020-01-02T00:00:00.000Z",
+            limit=10,
+            max_attempts=2,
+        ) == []
+
+
+def test_transient_recheck_requires_delay_window(app):
+    with app.app_context():
+        article = repo.upsert_material(_material())["article"]
+        _park_transient_failure(
+            article["id"],
+            "AI 语义质检失败，需要人工确认",
+        )
+        # The article was updated 2020-01-01T00:00:00Z; a cutoff before that
+        # keeps it out, after that lets it in.
+        assert repo.list_transient_recheck_candidates(
+            retryable_reasons=["AI 语义质检失败，需要人工确认"],
+            updated_before="2019-12-31T00:00:00.000Z",
+            limit=10,
+            max_attempts=2,
+        ) == []

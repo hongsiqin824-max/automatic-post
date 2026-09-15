@@ -2649,6 +2649,105 @@ def claim_quality_recheck(article_id: int, connection=None) -> dict | None:
     return get_article(article_id, conn)
 
 
+def list_transient_recheck_candidates(
+    *,
+    retryable_reasons: list[str],
+    updated_before: str,
+    limit: int,
+    max_attempts: int,
+    connection=None,
+) -> list[int]:
+    """Return NEEDS_REVIEW article ids whose failure looks transient.
+
+    ``retryable_reasons`` are full ``quality.reason`` values produced by an LLM
+    outage (timeout / connection / rate limit / invalid response).  The article
+    must not have been re-checked more than ``max_attempts`` times already;
+    the counter lives in ``article_events`` as TRANSIENT_RECHECK_REQUESTED so
+    no schema change is needed.
+    """
+
+    if not retryable_reasons:
+        return []
+    conn = _conn(connection)
+    placeholders = ",".join("?" for _ in retryable_reasons)
+    limit = max(1, min(int(limit), 100))
+    rows = conn.execute(
+        f"""
+        SELECT a.id
+        FROM articles a
+        WHERE a.status='NEEDS_REVIEW'
+          AND a.updated_at < ?
+          AND a.error IS NULL
+          AND json_extract(a.quality_json, '$.reason') IN ({placeholders})
+          AND (
+            SELECT COUNT(*)
+            FROM article_events e
+            WHERE e.article_id = a.id
+              AND e.event_type='TRANSIENT_RECHECK_REQUESTED'
+          ) < ?
+        ORDER BY a.updated_at ASC
+        LIMIT ?
+        """,
+        (
+            str(updated_before),
+            *retryable_reasons,
+            max(1, int(max_attempts)),
+            limit,
+        ),
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def request_transient_recheck(article_id: int, connection=None) -> bool:
+    """Return one transiently-failed article to the automatic quality stage.
+
+    Same lease semantics as the manual recheck: the stored quality keeps its
+    history minus the previous repair marker, the status returns to RECEIVED,
+    and an event records the attempt so retries stay bounded.
+    """
+
+    numeric_article_id = _positive_int(article_id, "article id")
+    conn = _conn(connection)
+    current = get_article(numeric_article_id, conn)
+    if current is None:
+        raise ValueError("article not found")
+    if current["status"] != "NEEDS_REVIEW":
+        return False
+    stored_quality = current.get("quality")
+    quality = dict(stored_quality) if isinstance(stored_quality, Mapping) else {}
+    quality.pop("promotion_repair", None)
+    now = _now()
+    with conn:
+        cursor = conn.execute(
+            """
+            UPDATE articles
+            SET status='RECEIVED', quality_json=?, error=NULL,
+                quality_claimed_at=NULL, quality_claim_token=NULL, updated_at=?
+            WHERE id=? AND status='NEEDS_REVIEW'
+            """,
+            (_json(quality, {}), now, numeric_article_id),
+        )
+        if cursor.rowcount != 1:
+            return False
+        conn.execute(
+            """
+            INSERT INTO article_events
+            (article_id, from_status, to_status, event_type, message, payload_json, created_at)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                numeric_article_id,
+                "NEEDS_REVIEW",
+                "RECEIVED",
+                "TRANSIENT_RECHECK_REQUESTED",
+                "LLM 瞬时失败自动重试：重新进入完整质检",
+                _json({"previous_quality_reason": current.get("quality_reason") or ""}, {}),
+                now,
+            ),
+        )
+    return True
+
+
 def manual_review_update(article_id: int, action: str, connection=None, *,
                          title: Optional[str] = None, body_html: Optional[str] = None,
                          litpic: Optional[str] = None, channels: Optional[Iterable[int]] = None,

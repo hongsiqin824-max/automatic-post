@@ -155,7 +155,7 @@
     <label class="field"><span>栏目名称</span><input name="name" required maxlength="80" placeholder="例如：国际足球"></label>
     <label class="field"><span>后台栏目 ID</span><input name="backend_tab_id" type="number" inputmode="numeric" required placeholder="发布时用于映射后台栏目"></label>
     <label class="field"><span>栏目兜底图片（可选）</span><input name="fallback_litpic" type="text" maxlength="2000" placeholder="CDN 地址或图片路径，例如 https://img.example.com/league.jpg"><small class="field-hint">正文和素材没有有效图片时使用；留空则使用系统绿色公共图。精选栏目不使用栏目兜底图。</small></label>
-    <label class="account-enabled-field"><span><strong>AI 归属校验</strong><small>开启后，league 短码为空、靠本栏目兜底进来、且本要直接发布的文章，会先让 AI 判断是否真属于本栏目；判为不属于或 AI 不可用时自动降级为创建草稿。</small></span><span class="switch"><input type="checkbox" name="ai_league_guard_enabled" aria-label="启用 AI 归属校验"><span></span></span></label>
+    <label class="account-enabled-field"><span><strong>AI 归属校验</strong><small>开启后，league 短码为空、靠本栏目兜底进来、且本要创建草稿的文章，会先让 AI 判断是否真属于本栏目；判为属于且置信度达标时自动升级为直接发布，判为不属于或 AI 不可用时维持创建草稿。来源设为直接发布的文章直接发布，不做 AI 判断。</small></span><span class="switch"><input type="checkbox" name="ai_league_guard_enabled" aria-label="启用 AI 归属校验"><span></span></span></label>
     <label class="field"><span>栏目判定说明（可选）</span><textarea name="ai_league_guard_definition" rows="3" maxlength="2000" placeholder="例如：日本职业足球联赛（J.League）的 J1、J2、J3 正式比赛及相关新闻；不包含高中、大学、青少年、业余、地区预选赛等非职业赛事。"></textarea><small class="field-hint">用于告诉 AI 本栏目到底覆盖哪些内容；留空则仅用栏目名称判断。仅在开启 AI 归属校验时生效。</small></label>
     <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="save"></i>保存栏目</button></div>
   </form>

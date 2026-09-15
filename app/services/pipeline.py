@@ -8,7 +8,7 @@ import fcntl
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .. import repository as repo
@@ -316,7 +316,14 @@ def _quality_allows_body_repair_planning(quality: dict[str, Any]) -> bool:
 
 
 def _plan_error_allows_dedicated_planner(error: Any) -> bool:
-    """Allow the planner to replace only malformed or empty plan payloads."""
+    """Allow the planner to replace only malformed or empty plan payloads.
+
+    The planner runs *before* any body mutation, so a malformed payload
+    (including the "dirty content detected but no plan offered" shape) is
+    exactly the situation a dedicated planning call is designed to fix.
+    Safety rejections produced by ``apply_repair_plan`` are handled by the
+    separate, narrower replan whitelist instead.
+    """
 
     if not error:
         return True
@@ -324,13 +331,25 @@ def _plan_error_allows_dedicated_planner(error: Any) -> bool:
         "AI 修复计划项目为空",
         "AI 修复计划包含无效项目",
         "AI 修复计划必须是对象或数组",
+        "AI 质检返回字段格式错误：repairable",
+        "AI 修复计划与质检结论矛盾",
+        "AI 修复计划与标题完整性结论矛盾",
+        "AI 修复计划与正文完整性结论矛盾",
     }
 
 
 def _repair_validation_error_allows_replan(error: Any) -> bool:
-    """Re-plan locators only; never let the model retry a safety rejection."""
+    """Re-plan locators and formats; never let the model retry a safety rejection.
+
+    Locator misses, empty/malformed replacement payloads, and category/reason
+    formatting failures are all *positional* mistakes a re-plan can correct.
+    Hard safety verdicts (overlaps, budget overruns, unmet promotion shapes,
+    integrity contradictions) stay excluded: retrying them would only invite
+    the model to widen its edit.
+    """
 
     return str(error or "") in {
+        # 定位类错误：重新选择目标即可修复
         "AI 修复目标正文块不存在",
         "AI 修复目标正文行不存在",
         "AI 修复目标链接不存在",
@@ -342,6 +361,18 @@ def _repair_validation_error_allows_replan(error: Any) -> bool:
         "行级修复目标缺少明确边界",
         "重复内容修复缺少有效的保留正文行",
         "重复内容修复缺少有效的保留正文块",
+        "重复内容修复缺少有效的保留正文行（指定的保留目标文本不匹配）",
+        "重复内容修复缺少有效的保留正文块（指定的保留目标文本不匹配）",
+        # 格式/载荷类错误：模型返回了意图但载荷不合格
+        "AI 文本替换内容为空或包含 HTML",
+        "AI 文本替换不是可验证的轻微局部修复",
+        "AI 段首段尾片段删除不是可验证的局部修复",
+        "AI 段中整句删除不是可验证的局部修复",
+        "AI 修复推广类别或原因无效",
+        "AI 修复目标未命中高置信推广或图片署名规则",
+        "AI 修复目标未命中高置信独立推广行",
+        "AI 修复目标未命中可处理的局部问题类型",
+        "AI 修复目标未命中高置信固定规则，也未提供可验证的推广类别和原因",
     }
 
 
@@ -1615,6 +1646,20 @@ def _run_once_locked(config: AppConfig, *, database_path: str | None = None) -> 
                     "source_url": str(raw.get("source_url") or "") if isinstance(raw, dict) else "",
                     "error": str(exc)[:300],
                 })
+        # Transiently-failed articles (LLM outage) scheduled by this or an
+        # earlier pass are eligible again now that they are back in RECEIVED.
+        try:
+            scheduled_ids = schedule_transient_rechecks(config, conn)
+        except Exception:  # noqa: BLE001 - retries are best-effort
+            logger.exception("瞬时失败自动重试调度失败")
+            scheduled_ids = []
+        if scheduled_ids:
+            seen_ids = {int(article["id"]) for article in pending if article.get("id")}
+            for retry_article in repo.list_articles(
+                conn, status="RECEIVED", limit=config.transient_recheck_batch_limit
+            ):
+                if int(retry_article["id"]) in scheduled_ids and int(retry_article["id"]) not in seen_ids:
+                    pending.append(retry_article)
         for _article_id, state, failed in _process_articles(
             pending, config, database_path, conn, workers=config.quality_workers
         ):
@@ -1767,6 +1812,123 @@ class RunController:
             return False
         thread.join(timeout)
         return not thread.is_alive()
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "running": self._running,
+                "last_result": self._last_result,
+            }
+
+
+# The exact `quality.reason` strings produced when the primary *and* fallback
+# LLM both fail transiently.  An article parked in manual review with one of
+# these reasons failed because of an outage, not because of its content, so a
+# later pass should retry it automatically (bounded attempts).
+TRANSIENT_FAILURE_REASONS = (
+    "AI 服务暂时不可用，已重试仍未返回，需要人工确认",
+    "AI 语义质检失败，需要人工确认",
+    "AI 服务调用失败，需要人工确认",
+    "AI 返回格式无效，需要人工确认",
+)
+
+
+def schedule_transient_rechecks(config: AppConfig, connection) -> list[int]:
+    """Move due transiently-failed articles back into the quality pipeline.
+
+    Returns the ids actually scheduled.  The function is cheap and safe to
+    call on every ingestion pass: candidates are bounded by config, need a
+    minimum delay, and every article carries its own attempt counter.
+    """
+
+    if not config.transient_recheck_enabled or not config.llm_configured:
+        return []
+    retryable_reasons = [
+        reason for reason in TRANSIENT_FAILURE_REASONS if reason
+    ]
+    if not retryable_reasons:
+        return []
+    delay = max(60, int(config.transient_recheck_delay_seconds))
+    updated_before = (
+        datetime.now(timezone.utc) - timedelta(seconds=delay)
+    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    candidates = repo.list_transient_recheck_candidates(
+        retryable_reasons=retryable_reasons,
+        updated_before=updated_before,
+        limit=config.transient_recheck_batch_limit,
+        max_attempts=config.transient_recheck_max_attempts,
+        connection=connection,
+    )
+    scheduled: list[int] = []
+    for article_id in candidates:
+        try:
+            if repo.request_transient_recheck(article_id, connection):
+                scheduled.append(article_id)
+        except Exception:  # noqa: BLE001 - one bad row must not stop the batch
+            logger.exception("瞬时失败自动重试入队失败 article_id=%s", article_id)
+    if scheduled:
+        logger.info(
+            "LLM 瞬时失败自动重试：已重新入队 %d 篇（上限 %d）",
+            len(scheduled), config.transient_recheck_batch_limit,
+        )
+    return scheduled
+
+
+class TransientRecheckController:
+    """Single-flight controller for the transient-failure retry pass."""
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self._lock = threading.Lock()
+        self._running = False
+        self._last_result: dict[str, Any] | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> bool:
+        with self._lock:
+            if self._running:
+                return False
+            self._running = True
+            self._thread = threading.Thread(
+                target=self._run, name="transient-recheck", daemon=True
+            )
+            try:
+                self._thread.start()
+            except Exception:
+                self._thread = None
+                self._running = False
+                raise
+            return True
+
+    def _run(self) -> None:
+        result: dict[str, Any] = {"scheduled": 0, "message": "没有需要重试的瞬时失败文章"}
+        try:
+            result = self._run_pass()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("瞬时失败重试任务意外退出")
+            result = {"scheduled": 0, "message": str(exc)[:300]}
+        finally:
+            with self._lock:
+                self._last_result = result
+                self._running = False
+
+    def _run_pass(self) -> dict[str, Any]:
+        """Queue due candidates; a scheduled article is picked up by the next
+        ingestion pass (or the current one when it runs afterwards)."""
+
+        conn = _connect(self.config.database_path)
+        try:
+            scheduled = schedule_transient_rechecks(self.config, conn)
+            return {
+                "scheduled": len(scheduled),
+                "article_ids": scheduled,
+                "message": (
+                    f"已重新入队 {len(scheduled)} 篇瞬时失败文章"
+                    if scheduled else "没有需要重试的瞬时失败文章"
+                ),
+            }
+        finally:
+            conn.close()
 
     def status(self) -> dict[str, Any]:
         with self._lock:

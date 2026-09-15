@@ -164,9 +164,144 @@ def test_sponichi_template_markers_are_removed_without_dropping_news_text():
 
 
 def test_sponichi_template_cleanup_does_not_apply_to_other_sources():
+    # The sponichi-specific labels (``正文`` line marker, ``前文链接`` …) stay
+    # byte-for-byte for other sources, but the Google ad-section token is
+    # unambiguous template residue and is stripped for every source while the
+    # surrounding reporting is preserved.
     body = "<p>正文\n主帅介绍了球队状态。 google_ad_section_end(name=s1)</p>"
 
-    assert preprocess_quality_body(body, source="foxsprt") == body
+    cleaned = preprocess_quality_body(body, source="foxsprt")
+
+    assert "google_ad_section" not in cleaned
+    assert "主帅介绍了球队状态。" in cleaned
+    assert "<p>正文\n主帅介绍了球队状态。" in cleaned
+    assert preprocess_quality_body(cleaned, source="foxsprt") == cleaned
+
+
+def test_google_ad_section_chinese_variant_removed_for_any_source():
+    # After machine translation the boundary appears as ``google广告分区开始/结束``
+    # glued to the start and end of a reporting paragraph.  It must be removed
+    # for every source without dropping the news text or the image node.
+    body = (
+        "<p>google广告分区开始(name=s1) \n\n 明天开赛，主队将全力争胜。"
+        " google广告分区结束(name=s1)</p>"
+        "<p><img src=\"/match.jpg\"></p>"
+    )
+
+    cleaned = preprocess_quality_body(body, source="sponichi")
+
+    assert "google广告分区" not in cleaned
+    assert "明天开赛，主队将全力争胜。" in cleaned
+    assert '<img src="/match.jpg">' in cleaned
+    assert preprocess_quality_body(cleaned, source="sponichi") == cleaned
+
+    other = preprocess_quality_body(body, source="foxsprt")
+    assert "google广告分区" not in other
+    assert "明天开赛，主队将全力争胜。" in other
+
+
+def test_jp_preamble_residue_removed_for_any_source():
+    # ``前文`` glued to the paragraph start and ``前文リンク`` glued to its end are
+    # machine-translated Japanese feed template residue; both must be stripped
+    # while the news sentence and image node stay intact, for every source.
+    body = (
+        "<p>前文 神户14日通过俱乐部官网宣布，18岁的中场濑口大翔将租借加盟"
+        "斯洛伐克的FC科希策。 前文リンク</p>"
+        "<p><img src=\"/loan.jpg\"></p>"
+    )
+
+    cleaned = preprocess_quality_body(body, source="sponichi")
+
+    assert "前文" not in cleaned
+    assert "リンク" not in cleaned
+    assert "神户14日通过俱乐部官网宣布" in cleaned
+    assert '<img src="/loan.jpg">' in cleaned
+    assert preprocess_quality_body(cleaned, source="sponichi") == cleaned
+
+    other = preprocess_quality_body(body, source="yahoojp")
+    assert "前文" not in other
+    assert "神户14日通过俱乐部官网宣布" in other
+
+
+def test_jp_preamble_residue_keeps_mid_sentence_word():
+    # A genuine ``前文`` appearing mid-sentence (e.g. 正如前文所述) must never be
+    # stripped: it is ordinary reporting, not a template marker.
+    body = "<p>神户宣布，正如前文所述，濑口大翔将租借加盟科希策。</p>"
+    assert preprocess_quality_body(body, source="sponichi") == body
+
+
+def test_recommendation_tail_headings_removed_after_anchor():
+    # ``<h2>更多新闻</h2>`` anchors a trailing run of recommendation headings;
+    # the anchor and every heading after it are stripped, while the real article
+    # paragraphs before it stay intact.
+    body = (
+        "<p>德国足协表彰了这两位天才球员，肯定他们出色的表现。</p>"
+        "<p>德国足协表示，这些获奖者赢得了广泛认可。</p>"
+        "<h2>更多新闻</h2>"
+        "<h2>拜仁发布啤酒节球衣</h2>"
+        "<h2>奥蓬达伤情令人担忧</h2>"
+    )
+    cleaned = preprocess_quality_body(body, source="sport1")
+    assert "更多新闻" not in cleaned
+    assert "啤酒节" not in cleaned
+    assert "奥蓬达" not in cleaned
+    assert "德国足协表彰了这两位天才球员" in cleaned
+    assert "赢得了广泛认可" in cleaned
+
+
+def test_recommendation_headings_stop_at_trailing_paragraph():
+    # Only the consecutive headings after the anchor are removed; a genuine
+    # paragraph that follows the recommendation list is preserved.
+    body = (
+        "<p>汉堡主帅表示球队非常团结，会继续努力。</p>"
+        "<h2>更多新闻</h2>"
+        "<h2>汉堡正处在绝对危机氛围中</h2>"
+        "<p>下个周末，汉堡将在主场迎战科隆。</p>"
+    )
+    cleaned = preprocess_quality_body(body, source="sport1")
+    assert "更多新闻" not in cleaned
+    assert "绝对危机氛围" not in cleaned
+    assert "汉堡主帅表示球队非常团结" in cleaned
+    assert "下个周末，汉堡将在主场迎战科隆。" in cleaned
+
+
+def test_recommendation_keeps_real_subheading_before_anchor():
+    # A genuine in-article ``<h2>`` subheading before the anchor must survive.
+    body = (
+        "<h2>汉堡主帅态度强硬：“我们非常团结”</h2>"
+        "<p>主帅在发布会上强调了球队的凝聚力。</p>"
+        "<h2>更多新闻</h2>"
+        "<h2>拜仁对这位老熟人感到惊讶</h2>"
+    )
+    cleaned = preprocess_quality_body(body, source="sport1")
+    assert "汉堡主帅态度强硬" in cleaned
+    assert "更多新闻" not in cleaned
+    assert "老熟人" not in cleaned
+
+
+def test_subscription_and_paywall_promo_blocks_removed():
+    # Newsletter-subscription and paywall prompt paragraphs are dropped whole.
+    for promo in (
+        "<p>订阅足球简报，随时掌握动态！所有进球和新闻直达你的邮箱</p>",
+        "<p>继续阅读需订阅</p>",
+        "<p>订阅后继续阅读</p>",
+        "<p>选择适合你的订阅，解锁独家内容，畅享无间断阅读体验。</p>",
+        "<p>你已经订阅了吗？登录并阅读</p>",
+    ):
+        body = "<p>正文段落，包含完整比赛信息与赛后采访内容。</p>" + promo
+        cleaned = preprocess_quality_body(body, source="sport1")
+        assert "订阅" not in cleaned, promo
+        assert "正文段落，包含完整比赛信息与赛后采访内容。" in cleaned
+
+
+def test_subscription_promo_keeps_factual_watch_sentence():
+    # A reporting sentence that merely mentions a paid platform to watch a match
+    # is legitimate content and must never be removed.
+    body = (
+        "<p>巴萨球迷可通过Barça Play观看这场比赛。需要订阅Culers Premium "
+        "Membership，会员和球迷组织成员可免费使用，其他用户年费为39.99欧元。</p>"
+    )
+    assert preprocess_quality_body(body, source="marca") == body
 
 
 def test_quality_preprocess_removes_standalone_caption_and_byline_blocks():

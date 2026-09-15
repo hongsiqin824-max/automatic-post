@@ -253,7 +253,11 @@ _AI_BRACKETED_ARTIFACT_RE = re.compile(
 _AI_ARTIFACT_EVIDENCE_CTA_RE = re.compile(
     r"^(?:(?:请|立即|现在|欢迎)\s*)?"
     r"(?:点击|查看|查看更多|查看全部|观看|收看|进入|前往|打开|访问|扫码|"
-    r"关注|订阅|下载|收听)|^(?:更多|完整).{0,30}(?:内容|资讯|新闻|赛程|视频|节目|回放)",
+    r"关注|订阅|下载|收听)"
+    r"|^(?:更多|完整).{0,30}(?:内容|资讯|新闻|赛程|视频|节目|回放)"
+    r"|(?:直播(?:结束后)?还?(?:会|将)?提供?回放|提供回放)"
+    r"|(?:只要|仅需|注册(?:即|后)?即?可|登录后即可).{0,20}(?:免费)?(?:观看|收看|回看)"
+    r"|(?:免费观看|免费收看|随时回看|随时观看)",
     re.IGNORECASE,
 )
 _NUMERIC_EXPRESSION_RE = re.compile(
@@ -539,6 +543,37 @@ def _substantive_text(value: str) -> str:
     return "".join(character for character in normalized if character.isalnum())
 
 
+# The shortest removable-duplicate fragment. A prefix shorter than this is too
+# ambiguous to treat as a duplicate (for example a single stray character), so
+# the plan must stay fail-closed and route to review instead.
+_MIN_DUPLICATE_PREFIX_CHARS = 4
+
+
+def _is_duplicate_keep_target(removed_text: str, keep_text: str) -> bool:
+    """Return whether *keep_text* is a valid duplicate-keep for *removed_text*.
+
+    The material feed frequently leaks a standalone fragment that repeats the
+    opening of a fuller paragraph (for example ``仙台俱乐部吉祥物“贝伽太”``
+    duplicated ahead of ``仙台俱乐部吉祥物“贝伽太”的举动引发争议……``). The two
+    blocks are not byte-identical, so requiring exact equality wrongly rejects a
+    safe deletion.
+
+    The deletion is only safe when the kept block is at least as complete as the
+    removed one: either the two substantive texts are identical, or the removed
+    fragment is a prefix of the kept text.  Deleting a *longer* block while
+    keeping a shorter prefix would drop the extra content the removed block
+    carries, so that direction stays fail-closed.
+    """
+
+    removed = _substantive_text(removed_text)
+    keep = _substantive_text(keep_text)
+    if not removed or not keep:
+        return False
+    if removed == keep:
+        return True
+    return len(removed) >= _MIN_DUPLICATE_PREFIX_CHARS and keep.startswith(removed)
+
+
 def _is_template_residue_cleanup(evidence: str, replacement: str) -> bool:
     """Return ``True`` when the edit only strips leaked highlight-tag braces.
 
@@ -553,6 +588,165 @@ def _is_template_residue_cleanup(evidence: str, replacement: str) -> bool:
         return False
     cleaned = _strip_template_residue(evidence)
     return cleaned != evidence and _plain_text(replacement) == _plain_text(cleaned)
+
+
+# Phase-1 edge-fragment removal (plan B). The AI may strip a dirty fragment
+# glued to the *start* or *end* of a reporting paragraph via ``replace_text``.
+# The mid-sentence case stays fail-closed: only a leading or trailing fragment
+# is accepted so the deletion can never split a sentence into two disjoint
+# halves.  The shortest news text that must remain after the strip.
+_MIN_EDGE_REMOVAL_REMAINDER_CHARS = 15
+# A removed edge fragment must itself look like template/ad residue — never an
+# ordinary reporting clause. This probe recognises the Google ad-section token
+# (English or translated), a ``name=s1`` style argument, a bracketed template
+# tag, or a standalone call-to-action / promotion shape.
+_EDGE_ARTIFACT_FRAGMENT_RE = re.compile(
+    r"google(?:_ad_section_(?:start|end)|\s*广告分区\s*(?:开始|结束|開始|結束))"
+    r"|\bname\s*=\s*s\d+\b"
+    r"|^【[^】\r\n]{1,24}】|^\[[^\]\r\n]{1,24}\]"
+    # Japanese feed template residue such as 前文 / 前文リンク / 関連記事 /
+    # 続きを読む that is glued to the head or tail of a paragraph.
+    r"|^前文(?:\s*リンク)?$|^前文リンク$"
+    r"|関連記事|関連リンク|続きを読む|元記事|外部リンク"
+    # Chinese-source editor/byline templates glued to paragraph tails, e.g.
+    # 编制●足球文摘Web编辑部 / 编成●…编辑部 / 导语链接 / 文末链接.
+    r"|[编編]制●.*[编編]辑部$|[编編]成●.*[编編]辑部$|[编編]辑部$"
+    r"|^导语链接$|^导语$|^正文链接$|^文末链接$"
+    # Copyright / agency markers such as (C)TOSHI TAKEYA（SOCCER DIGEST）.
+    r"|^\([Cc]\)[^<>。！？!?]{1,80}$",
+    re.IGNORECASE,
+)
+
+
+def _is_edge_artifact_fragment(fragment: str) -> bool:
+    """Return whether a removed leading/trailing fragment is dirt, not news."""
+
+    text = _normalise_promotion_text(fragment)
+    if not text:
+        return False
+    return bool(
+        _EDGE_ARTIFACT_FRAGMENT_RE.search(text)
+        or _AI_ARTIFACT_EVIDENCE_CTA_RE.search(text)
+        or _AI_STRUCTURAL_ARTIFACT_RE.search(text)
+        or _is_ai_promotional_evidence(fragment)
+    )
+
+
+def _edge_fragment_removal(evidence: str, replacement: str) -> str | None:
+    """Return the removed edge fragment(s) when *replacement* strips dirty ends.
+
+    The kept text (``replacement``) must equal ``evidence`` with a leading
+    fragment, a trailing fragment, or both removed — i.e. it is a contiguous
+    prefix, suffix, or infix of the evidence.  Every non-empty removed side must
+    look like template/ad residue and the remaining news text must stay
+    substantial.  Returns the removed fragment text on success (both sides joined
+    by a space when two ends are stripped) or ``None`` when the edit is not a safe
+    edge removal.
+    """
+
+    original = _plain_text(evidence)
+    kept = _plain_text(replacement)
+    if not original or not kept or kept == original or len(kept) >= len(original):
+        return None
+    # ``kept`` must be a contiguous prefix, suffix, or infix of ``original`` so
+    # the remaining sentence is never spliced from two non-adjacent parts and
+    # every kept character (score/date digits included) comes verbatim from the
+    # original.
+    index = original.find(kept)
+    if index < 0:
+        return None
+    leading = original[:index]
+    trailing = original[index + len(kept):]
+    if not leading.strip() and not trailing.strip():
+        return None
+    if len(kept.strip()) < _MIN_EDGE_REMOVAL_REMAINDER_CHARS:
+        return None
+    removed_parts: list[str] = []
+    for side in (leading, trailing):
+        core = side.strip()
+        if not core:
+            continue
+        if not _is_edge_artifact_fragment(core):
+            return None
+        removed_parts.append(core)
+    if not removed_parts:
+        return None
+    return " ".join(removed_parts)
+
+
+# Sentence terminators used to split a paragraph into complete sentences for
+# the mid-paragraph whole-sentence removal below.  Whitespace is not a
+# terminator: a Chinese news sentence ends with 。！？ etc., so a
+# whitespace-only split would allow half a sentence to be deleted.
+_SENTENCE_SEPARATOR_RE = re.compile(r"([。！？!?])")
+# A removed mid-paragraph sentence must be at least this long to be considered
+# a self-contained promotional sentence rather than a stray punctuation mark.
+_MIN_WHOLE_SENTENCE_CHARS = 6
+
+
+def _whole_sentence_removal(evidence: str, replacement: str) -> str | None:
+    """Return removed whole sentences when *replacement* strips dirt sentences.
+
+    An AI ``replace_text`` plan may delete one or more *complete* sentences from
+    the middle of a paragraph when every removed sentence is itself an
+    unambiguous promotion / template artefact (checked by the same
+    ``_is_edge_artifact_fragment`` probe).  The remaining sentences must keep
+    their original order and be joined exactly as they appear in the evidence,
+    so no character is rewritten and no sentence is spliced.  Returns the
+    removed sentence text joined by a space, or ``None``.
+    """
+
+    original = _plain_text(evidence)
+    kept = _plain_text(replacement)
+    if not original or not kept or kept == original or len(kept) >= len(original):
+        return None
+
+    # Split into sentences while keeping the terminators attached.
+    parts = _SENTENCE_SEPARATOR_RE.split(original)
+    sentences: list[str] = []
+    for index in range(0, len(parts), 2):
+        sentence = parts[index]
+        terminator = parts[index + 1] if index + 1 < len(parts) else ""
+        if sentence or terminator:
+            sentences.append(sentence + terminator)
+    if len(sentences) < 2:
+        return None
+
+    removed_indices: list[int] = []
+    # Greedy two-pointer walk: match kept text against the sentence sequence
+    # so the kept order is identical to the evidence order.
+    kept_target = kept.strip()
+    cursor = 0
+    for index, sentence in enumerate(sentences):
+        stripped = sentence.strip()
+        if not stripped:
+            continue
+        if kept_target[cursor:cursor + len(stripped)] == stripped:
+            cursor += len(stripped)
+            while cursor < len(kept_target) and kept_target[cursor].isspace():
+                cursor += 1
+        else:
+            removed_indices.append(index)
+    if not removed_indices or cursor != len(kept_target):
+        # Either nothing was removed, or the kept text does not correspond to
+        # the remaining sentences verbatim (a rewrite, not a deletion).
+        return None
+
+    removed_sentences: list[str] = []
+    for index in removed_indices:
+        sentence = sentences[index].strip()
+        if len(sentence) < _MIN_WHOLE_SENTENCE_CHARS:
+            return None
+        if not _is_edge_artifact_fragment(sentence):
+            return None
+        removed_sentences.append(sentence)
+    if not removed_sentences:
+        return None
+    # The kept text must remain substantial so the paragraph never collapses
+    # into a stub.
+    if len(kept_target) < _MIN_EDGE_REMOVAL_REMAINDER_CHARS:
+        return None
+    return " ".join(removed_sentences)
 
 
 def _numeric_expressions(value: str) -> list[str]:
@@ -583,6 +777,8 @@ _PHOTOGRAPHER_CREDIT_RE = re.compile(
     r"（\s*摄影\s*[:：]\s*(?P<source_zh>[^<>\[\]\r\n]{1,80}?)\s*）"
     r"|\(\s*摄影\s*[:：]\s*(?P<source_ascii>[^<>\[\]\r\n]{1,80}?)\s*\)"
     r"|摄影\s*[:：]\s*(?P<source_bare>[^<>\[\]\r\n]{1,80}?)"
+    r"|\(\s*[Cc]\s*\)\s*(?P<source_copyright>[^<>\[\]\r\n]{1,80}?)\s*$"
+    r"|【\s*(?:照片|写真|图片)\s*[:：]\s*(?P<source_bracket>[^<>【】\[\]\r\n]{1,80}?)\s*】"
     r")\s*$",
     re.IGNORECASE,
 )
@@ -982,6 +1178,75 @@ def _merge_consecutive_removal_operations(
     return merged + other_ops
 
 
+def _relocate_plan_by_evidence(
+    body: str,
+    item: dict[str, Any],
+    error: str,
+) -> dict[str, Any] | None:
+    """Re-target a plan whose block ids drifted after a body change.
+
+    The quality preprocessing step can remove a paragraph before the AI plan
+    is applied, which shifts every later ``block_id``/``segment_id``.  When the
+    failure is purely positional (missing target / mismatched evidence), the
+    plan's evidence text is matched against the *current* blocks, lines, links
+    and empty nodes; an exact match yields a corrected copy of the plan.  Only
+    locator errors are recoverable — safety verdicts return ``None``.
+    """
+
+    relocatable_errors = {
+        "AI 修复目标正文块不存在",
+        "AI 修复目标正文行不存在",
+        "AI 修复目标链接不存在",
+        "AI 修复目标空正文块不存在",
+        "AI 修复证据与目标正文块不一致",
+        "AI 修复证据与目标链接文字不一致",
+        "AI 修复证据与目标正文行不一致",
+    }
+    if error not in relocatable_errors:
+        return None
+    raw_action = str(item.get("action") or item.get("operation") or "").strip().lower()
+    if raw_action == "delete_duplicate":
+        # Duplicate plans rely on a keep-target relation; relocating only one
+        # side would break the pairing, so keep them fail-closed.
+        return None
+    evidence = _plain_text(str(item.get("evidence") or item.get("before") or ""))
+    if not evidence:
+        return None
+    if raw_action in {"remove_link", "remove_anchor", "delete_link"}:
+        for link in content_links(body):
+            if _plain_text(str(link.get("text") or "")) == evidence:
+                return {**item, "link_id": str(link["link_id"]), "action": "remove_link"}
+        return None
+    if raw_action in {"remove_empty_block", "delete_empty_block", "remove_empty_node"}:
+        return None  # empty blocks carry no evidence text to relocate by
+    # Block / line removals and text replacements share block matching.
+    for block in content_blocks(body):
+        if str(block.get("text") or "") != evidence:
+            continue
+        relocated = {**item}
+        if ".s" in str(item.get("segment_id") or "") or raw_action in {
+            "remove_text_line", "delete_segment",
+        }:
+            # A whole-block evidence match on a line plan means the line is the
+            # entire block content; the line split would fail anyway, so use
+            # the block action with the same semantics.
+            relocated["action"] = "remove_block"
+            relocated.pop("segment_id", None)
+        relocated["block_id"] = str(block["block_id"])
+        return relocated
+    # Line-level relocation: find the matching segment inside a multi-line block.
+    for block in content_blocks(body):
+        for segment in (block.get("segments") or []):
+            if str(segment.get("text") or "") == evidence:
+                return {
+                    **item,
+                    "action": "remove_text_line",
+                    "segment_id": str(segment["segment_id"]),
+                    "block_id": None,
+                }
+    return None
+
+
 def apply_repair_plan(
     body_html: str | None,
     plan: Any,
@@ -1001,6 +1266,22 @@ def apply_repair_plan(
         return body, [], plan_error
     if not plans:
         return body, [], None
+    # ``after`` can arrive as JSON ``null`` (or the literal strings some
+    # models emit for it) when the model intends "delete this block" but was
+    # forced into a replace action by the schema.  Converting it to
+    # ``remove_block`` keeps the deletion inside the same strict evidence /
+    # promotion-shape checks instead of failing on an empty replacement.
+    for item in plans:
+        if not isinstance(item, dict):
+            continue
+        raw_action = str(item.get("action") or item.get("operation") or "").strip().lower()
+        if raw_action not in {"replace_text", "replace_exact_text", "text_replace"}:
+            continue
+        raw_after = item.get("after")
+        if raw_after is None or str(raw_after).strip().lower() in {"null", "none"}:
+            item["action"] = "remove_block"
+            item.pop("after", None)
+            item.pop("replacement", None)
     if len(plans) > MAX_AI_REPAIR_PLANS:
         return body, [], f"AI 修复计划超过单次最多{MAX_AI_REPAIR_PLANS}个局部操作"
     if len(plans) > 1 and not _allow_partial:
@@ -1016,6 +1297,16 @@ def apply_repair_plan(
                 _allow_partial=True,
             )
             if item_error:
+                relocated = _relocate_plan_by_evidence(body, item, str(item_error))
+                if relocated is not None:
+                    _, _, relocated_error = apply_repair_plan(
+                        body,
+                        relocated,
+                        _allow_partial=True,
+                    )
+                    if relocated_error is None:
+                        valid_plans.append(relocated)
+                        continue
                 rejected_errors.append(str(item_error))
             else:
                 valid_plans.append(item)
@@ -1188,7 +1479,9 @@ def apply_repair_plan(
                     for candidate_id, (candidate_block, candidate_segment) in segments_by_id.items():
                         if (
                             candidate_id != target_id
-                            and str(candidate_segment.get("text") or "") == evidence
+                            and _is_duplicate_keep_target(
+                                evidence, str(candidate_segment.get("text") or "")
+                            )
                         ):
                             alternative_keep_id = candidate_id
                             break
@@ -1196,7 +1489,7 @@ def apply_repair_plan(
                         return body, [], "重复内容修复缺少有效的保留正文行（目标文本在文档中唯一，疑似AI误判）"
                     keep_id = alternative_keep_id
                     keep_pair = segments_by_id[keep_id]
-                elif str(keep_pair[1].get("text") or "") != evidence:
+                elif not _is_duplicate_keep_target(evidence, str(keep_pair[1].get("text") or "")):
                     # 情况 2：keep_id 存在但文本不匹配，报错
                     return body, [], "重复内容修复缺少有效的保留正文行（指定的保留目标文本不匹配）"
 
@@ -1237,6 +1530,8 @@ def apply_repair_plan(
             item, evidence, fixed_marker=known_promotion_block
         )
         ai_general_removal = _is_ai_general_removal_plan(item)
+        edge_removed_fragment: str | None = None
+        validation_mode: str | None = None
         if action == "remove_block":
             if issue_type == "duplicate_content":
                 keep_id = str(item.get("keep_block_id") or "").strip().lower()
@@ -1251,7 +1546,9 @@ def apply_repair_plan(
                     for candidate_id, candidate_block in by_id.items():
                         if (
                             candidate_id != block_id
-                            and str(candidate_block.get("text") or "") == evidence
+                            and _is_duplicate_keep_target(
+                                evidence, str(candidate_block.get("text") or "")
+                            )
                         ):
                             alternative_keep_id = candidate_id
                             break
@@ -1259,7 +1556,7 @@ def apply_repair_plan(
                         return body, [], "重复内容修复缺少有效的保留正文块（目标文本在文档中唯一，疑似AI误判）"
                     keep_id = alternative_keep_id
                     keep_block = by_id[keep_id]
-                elif str(keep_block.get("text") or "") != evidence:
+                elif not _is_duplicate_keep_target(evidence, str(keep_block.get("text") or "")):
                     # 情况 2：keep_id 存在但文本不匹配，报错
                     return body, [], "重复内容修复缺少有效的保留正文块（指定的保留目标文本不匹配）"
 
@@ -1278,6 +1575,31 @@ def apply_repair_plan(
             if photo_match is not None:
                 if _plain_text(replacement) != _plain_text(photo_match["after"]):
                     return body, [], "图片署名替换内容与规范化结果不一致"
+            elif (edge_removed_fragment := _edge_fragment_removal(evidence, replacement)) is not None:
+                # Phase-1 plan B: strip a dirty fragment glued to the start or
+                # end of a reporting paragraph. ``_edge_fragment_removal`` already
+                # guarantees ``after`` is a contiguous prefix/suffix of the
+                # evidence (so every kept character — including any score/date
+                # digit — comes verbatim from the original and cannot be
+                # altered) and that the removed fragment matches the template/ad
+                # residue probe. We only additionally require a removable issue
+                # type and a valid reason so a factual clause is never deleted.
+                if (
+                    issue_type not in (_AI_GENERAL_REMOVAL_ISSUE_TYPES | _AI_PROMOTION_ISSUE_TYPES)
+                    or not _has_valid_ai_reason(item)
+                ):
+                    return body, [], "AI 段首段尾片段删除不是可验证的局部修复"
+            elif (edge_removed_fragment := _whole_sentence_removal(evidence, replacement)) is not None:
+                # Whole-sentence removal: the model deletes one or more complete
+                # promotional/template sentences from inside a paragraph. The
+                # same residue probe plus an explicit removal issue type guards
+                # against deleting a factual sentence.
+                if (
+                    issue_type not in (_AI_GENERAL_REMOVAL_ISSUE_TYPES | _AI_PROMOTION_ISSUE_TYPES)
+                    or not _has_valid_ai_reason(item)
+                ):
+                    return body, [], "AI 段中整句删除不是可验证的局部修复"
+                validation_mode = "ai_whole_sentence_removal"
             elif (
                 issue_type not in _AI_REPLACEMENT_ISSUE_TYPES
                 or not _has_valid_ai_reason(item)
@@ -1300,17 +1622,26 @@ def apply_repair_plan(
             "block_id": block_id,
             "segment_id": None,
             "keep_target_id": keep_target_id,
+            "edge_removed_fragment": edge_removed_fragment,
             "tag": str(block.get("tag") or "p"),
             "validation": (
-                "photo_credit_rule"
-                if block_identity in allowed_photo_credits
+                validation_mode
+                if validation_mode is not None
                 else (
-                    "fixed_promotion_rule"
-                    if known_promotion_block else (
-                        "ai_general_issue"
-                        if ai_general_removal or issue_type in _AI_REPLACEMENT_ISSUE_TYPES
+                    "photo_credit_rule"
+                    if block_identity in allowed_photo_credits
+                    else (
+                        "ai_edge_fragment_removal"
+                        if edge_removed_fragment is not None
                         else (
-                            "ai_promotion_category" if ai_promotion else "ai_exact_target"
+                            "fixed_promotion_rule"
+                            if known_promotion_block else (
+                                "ai_general_issue"
+                                if ai_general_removal or issue_type in _AI_REPLACEMENT_ISSUE_TYPES
+                                else (
+                                    "ai_promotion_category" if ai_promotion else "ai_exact_target"
+                                )
+                            )
                         )
                     )
                 )
@@ -1339,6 +1670,14 @@ def apply_repair_plan(
         len(_plain_text(str(operation.get("evidence") or "")))
         for operation in operations
         if operation.get("action") in {"remove_block", "remove_text_line", "remove_link"}
+    )
+    # An edge-fragment ``replace_text`` also removes visible text; count only the
+    # stripped fragment so it shares the same single-pass deletion budget.
+    removed_visible_chars += sum(
+        len(_plain_text(str(operation.get("edge_removed_fragment") or "")))
+        for operation in operations
+        if operation.get("action") == "replace_text"
+        and operation.get("edge_removed_fragment")
     )
     if removed_visible_chars:
         if removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS:
@@ -1483,7 +1822,10 @@ def normalize_photo_credits(
             if credit is None:
                 return block.group(0)
             raw_source = next(
-                (credit.group(name) for name in ("source_zh", "source_ascii", "source_bare")
+                (credit.group(name) for name in (
+                    "source_zh", "source_ascii", "source_bare",
+                    "source_copyright", "source_bracket",
+                )
                  if credit.group(name) is not None),
                 "",
             )

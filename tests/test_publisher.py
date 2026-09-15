@@ -1088,6 +1088,138 @@ def test_non_chinese_body_keeps_configured_draft_mode(app, monkeypatch):
     assert updated["quality"]["language_check"]["downgraded_to_draft"] is False
 
 
+class _GuardClient:
+    def __init__(self, config):
+        self.config = config
+
+    def create_article(self, article, tabs, **kwargs):
+        _GuardClient.captured.append(kwargs.get("status"))
+        return DqdOpenDraftResult(
+            archive_id=3814100,
+            payload={"code": 0, "data": {"archive_id": 3814100}},
+            request_url="https://platform.dongqiudi.com/open/v1/do",
+            form_fields=[],
+        )
+
+
+def _enable_guard_llm(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.publisher._make_league_guard_llm", lambda config: object()
+    )
+
+
+def test_ai_guard_upgrades_draft_to_publish_when_belongs(app, monkeypatch):
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *args, **kwargs: {"belongs": True, "confidence": 0.95, "reason": "属于"},
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=True,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source(
+            "marca", conn, tab_id=tab["id"], enabled=True,
+            publish_mode_override=None,
+        )
+        material = _ready_article()
+        article = repo.upsert_material(material, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert _GuardClient.captured == [1]
+    assert result["status"] == "PUBLISHED"
+    assert updated["publish_mode"] == 1
+    guard = updated["quality"]["league_guard"]
+    assert guard["upgraded_to_publish"] is True
+    assert guard["effective_publish_mode"] == 1
+
+
+def test_ai_guard_keeps_draft_when_not_belongs(app, monkeypatch):
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *args, **kwargs: {"belongs": False, "confidence": 0.99, "reason": "不属于"},
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=True,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source(
+            "marca", conn, tab_id=tab["id"], enabled=True,
+            publish_mode_override=None,
+        )
+        material = _ready_article()
+        article = repo.upsert_material(material, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert _GuardClient.captured == [0]
+    assert result["status"] == "DRAFT_CREATED"
+    assert updated["publish_mode"] == 0
+    guard = updated["quality"]["league_guard"]
+    assert guard["upgraded_to_publish"] is False
+    assert guard["effective_publish_mode"] == 0
+
+
+def test_ai_guard_skips_check_for_source_direct_publish(app, monkeypatch):
+    _GuardClient.captured = []
+    calls = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+
+    def _spy(*args, **kwargs):
+        calls.append(args)
+        return {"belongs": True, "confidence": 0.99, "reason": "属于"}
+
+    monkeypatch.setattr("app.services.publisher.check_league_membership", _spy)
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=True,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source(
+            "marca", conn, tab_id=tab["id"], enabled=True,
+            publish_mode_override=1,
+        )
+        material = _ready_article()
+        article = repo.upsert_material(material, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert calls == []
+    assert _GuardClient.captured == [1]
+    assert result["status"] == "PUBLISHED"
+    assert updated["publish_mode"] == 1
+
+
 def test_non_chinese_downgrade_stays_draft_during_502_retry(app, monkeypatch):
     captured = []
 
