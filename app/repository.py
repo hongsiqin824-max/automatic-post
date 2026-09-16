@@ -581,6 +581,39 @@ def get_tab_by_backend_id(backend_tab_id: int, connection=None) -> Optional[dict
     ).fetchone())
 
 
+def get_tab_by_name(name: str, connection=None) -> Optional[dict]:
+    """Get a tab by its name."""
+    return _row(_conn(connection).execute(
+        "SELECT * FROM tabs WHERE name=?", (str(name),)
+    ).fetchone())
+
+
+def tab_fallback_tab_ids(tab: Optional[dict]) -> list[int]:
+    """Parse a tab's ordered AI fallback candidate column ids.
+
+    ``tabs.ai_fallback_tab_ids`` holds a JSON array of local tab ids and is
+    operator-editable, so malformed content must never break publishing: bad
+    JSON, a non-array payload and unparsable elements all degrade to skipping
+    the cascade rather than raising. Order is preserved and duplicates dropped
+    because callers try the candidates in sequence.
+    """
+
+    raw = (tab or {}).get("ai_fallback_tab_ids")
+    if isinstance(raw, str):
+        raw = _loads(raw, [])
+    if not isinstance(raw, list):
+        return []
+    result: list[int] = []
+    for value in raw:
+        try:
+            tab_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if tab_id > 0 and tab_id not in result:
+            result.append(tab_id)
+    return result
+
+
 def create_tab(name: str, backend_tab_id: int, enabled: bool = True,
                connection=None, *, publish_mode: int = 0,
                fallback_litpic: str = "",
@@ -603,12 +636,32 @@ def create_tab(name: str, backend_tab_id: int, enabled: bool = True,
     return get_tab(cursor.lastrowid, conn)
 
 
+def _validated_fallback_tab_ids(tab_id: int, values: Any, connection) -> list[int]:
+    """Validate operator-supplied AI fallback candidate ids.
+
+    Unlike :func:`tab_fallback_tab_ids`, which must tolerate anything already
+    stored, this is the write path and rejects bad input outright: a tab may not
+    cascade to itself (which would re-ask the same question forever) and every
+    candidate must exist, so a typo surfaces immediately instead of silently
+    disabling the cascade. Order is preserved because it is the try order.
+    """
+
+    candidates = _tab_ids(values)
+    if int(tab_id) in candidates:
+        raise ValueError("a tab cannot be its own AI fallback candidate")
+    for candidate_id in candidates:
+        if get_tab(candidate_id, connection) is None:
+            raise ValueError(f"unknown AI fallback tab id: {candidate_id}")
+    return candidates
+
+
 def update_tab(tab_id: int, connection=None, *, name: Optional[str] = None,
                backend_tab_id: Optional[int] = None, enabled: Optional[bool] = None,
                publish_mode: Optional[int] = None,
                fallback_litpic: Optional[str] = None,
                ai_league_guard_enabled: Optional[bool] = None,
-               ai_league_guard_definition: Optional[str] = None) -> dict:
+               ai_league_guard_definition: Optional[str] = None,
+               ai_fallback_tab_ids: Optional[Iterable[int]] = None) -> dict:
     conn = _conn(connection)
     current = get_tab(tab_id, conn)
     if current is None:
@@ -637,6 +690,13 @@ def update_tab(tab_id: int, connection=None, *, name: Optional[str] = None,
             if ai_league_guard_definition is None
             else _ai_league_guard_definition(ai_league_guard_definition)
         ),
+        "ai_fallback_tab_ids": (
+            current.get("ai_fallback_tab_ids", "[]")
+            if ai_fallback_tab_ids is None
+            else _json(
+                _validated_fallback_tab_ids(tab_id, ai_fallback_tab_ids, conn), []
+            )
+        ),
         "updated_at": _now(),
     }
     if not values["name"]:
@@ -645,10 +705,11 @@ def update_tab(tab_id: int, connection=None, *, name: Optional[str] = None,
         _assert_tab_can_disable(tab_id, conn)
     with conn:
         conn.execute(
-            "UPDATE tabs SET name=?, backend_tab_id=?, enabled=?, publish_mode=?, fallback_litpic=?, ai_league_guard_enabled=?, ai_league_guard_definition=?, updated_at=? WHERE id=?",
+            "UPDATE tabs SET name=?, backend_tab_id=?, enabled=?, publish_mode=?, fallback_litpic=?, ai_league_guard_enabled=?, ai_league_guard_definition=?, ai_fallback_tab_ids=?, updated_at=? WHERE id=?",
             (values["name"], values["backend_tab_id"], values["enabled"],
              values["publish_mode"], values["fallback_litpic"],
              values["ai_league_guard_enabled"], values["ai_league_guard_definition"],
+             values["ai_fallback_tab_ids"],
              values["updated_at"], tab_id),
         )
     return get_tab(tab_id, conn)
@@ -1457,6 +1518,80 @@ def assign_article_tabs(article_id: int, tab_ids: Iterable[int], connection=None
     return get_article(article_id, conn)
 
 
+# Backend tab 58「精选」is the only generic source column; every other column is
+# event-specific. Shared with the ingest-time routing in _resolve_material_tabs
+# so a later reassignment keeps identical column-set semantics.
+GENERIC_SOURCE_BACKEND_TAB_ID = 58
+
+# Columns that must never reach the publishing backend as a target column.
+# 「精选」(58) is a legacy generic column and 法甲 (12) is configured as an
+# abandon target, so neither should ever be submitted. No source maps them
+# anymore, but articles ingested while they were still routed keep the mapping
+# in article_tabs, so publish-time reads filter them out instead of trusting
+# the stored mapping to be clean.
+NON_PUBLISHABLE_BACKEND_TAB_IDS = frozenset({GENERIC_SOURCE_BACKEND_TAB_ID, 12})
+
+
+def is_publishable_tab(tab: Mapping[str, Any]) -> bool:
+    """Return whether *tab* may be submitted as a publish target column."""
+
+    backend_tab_id = tab.get("backend_tab_id")
+    if backend_tab_id in (None, ""):
+        return False
+    try:
+        return int(backend_tab_id) not in NON_PUBLISHABLE_BACKEND_TAB_IDS
+    except (TypeError, ValueError):
+        return False
+
+
+def _published_tab_names(article: Mapping[str, Any]) -> list[str]:
+    """Return the column names to record for a published article.
+
+    Non-publishable columns are excluded so the daily direct-publish report
+    reflects the columns actually submitted.
+    """
+
+    names = [
+        str(tab.get("name") or "").strip()
+        for tab in (article.get("tabs") or [])
+        if is_publishable_tab(tab) and str(tab.get("name") or "").strip()
+    ]
+    if not names and article.get("tab_name"):
+        legacy = {
+            "backend_tab_id": article.get("backend_tab_id"),
+            "name": article.get("tab_name"),
+        }
+        if is_publishable_tab(legacy):
+            names = [str(article["tab_name"]).strip()]
+    return names
+
+
+def reassign_article_event_tab(
+    article_id: int, target_tab_id: int, connection=None
+) -> dict:
+    """Replace the article's event column with *target_tab_id*.
+
+    Mirrors :func:`_resolve_material_tabs`: the generic「精选」column is kept when
+    the article already has it and every event-specific column is replaced, so a
+    post-ingest reassignment can neither drop the generic column nor leave the
+    article in two competing event columns.
+    """
+
+    conn = _conn(connection)
+    current = get_article(article_id, conn)
+    if current is None:
+        raise ValueError("article not found")
+    target = int(target_tab_id)
+    selected = [
+        int(tab["id"])
+        for tab in (current.get("tabs") or [])
+        if int(tab.get("backend_tab_id") or 0) == GENERIC_SOURCE_BACKEND_TAB_ID
+    ]
+    if target not in selected:
+        selected.append(target)
+    return assign_article_tabs(article_id, selected, conn)
+
+
 def resolve_article_publish_mode(article_id: int, connection=None) -> dict:
     """Resolve the mode to use for an article from its mapped tabs.
 
@@ -1507,7 +1642,11 @@ def resolve_article_publish_mode(article_id: int, connection=None) -> dict:
                 allow_abandon=True,
             )
 
-    tabs = _tabs_for_article_id(numeric_article_id, conn)
+    tabs = [
+        tab
+        for tab in _tabs_for_article_id(numeric_article_id, conn)
+        if is_publishable_tab(tab)
+    ]
     tab_ids = [int(tab["id"]) for tab in tabs]
     tab_modes = [_publish_mode_int(tab.get("publish_mode", 0)) for tab in tabs]
     unique_modes = sorted(set(tab_modes))
@@ -1815,8 +1954,8 @@ def get_article_by_key(source: str, source_url: str, connection=None) -> Optiona
 
 def list_articles(connection=None, *, status: Optional[str] = None,
                   source: Optional[str] = None, tab_id: Optional[int] = None,
-                  query: Optional[str] = None, limit: int = 50,
-                  offset: int = 0) -> list[dict]:
+                  query: Optional[str] = None, filter_type: Optional[str] = None,
+                  limit: int = 50, offset: int = 0) -> list[dict]:
     conn = _conn(connection)
     clauses, params = [], []
     if status:
@@ -1836,6 +1975,9 @@ def list_articles(connection=None, *, status: Optional[str] = None,
             "(a.title_final LIKE ? ESCAPE '\\' OR a.title_original LIKE ? ESCAPE '\\' OR a.source_url LIKE ? ESCAPE '\\')"
         )
         params.extend([pattern, pattern, pattern])
+    # 拦截类型筛选：通过 quality_json 字段过滤
+    if filter_type == "regional_sensitive":
+        clauses.append("json_extract(a.quality_json, '$.regional_sensitive')=1")
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
@@ -1866,12 +2008,36 @@ def count_articles(connection=None, *, status: Optional[str] = None,
     return int(conn.execute("SELECT COUNT(*) FROM articles" + where, params).fetchone()[0])
 
 
+# Columns tracked by the daily direct-publish report. The digest covers the
+# small leagues only, so this is an explicit whitelist: a newly routed column
+# never silently shows up, and every tracked column is reported even with zero
+# articles so a stalled league stays visible. Matching is by name because the
+# per-article snapshot in ``published_tab_names_json`` stores names, which also
+# keeps a later column rename from rewriting history.
+REPORT_TAB_NAMES = (
+    "日职联",
+    "澳超",
+    "巴甲",
+    "瑞典超",
+    "德乙",
+    "友谊赛",
+    "挪超",
+    "美职联",
+    "日职乙",
+    "欧联",
+    "韩K",
+    "亚冠精英",
+)
+
+
 def direct_publish_report(period_start: str, period_end: str, connection=None) -> dict[str, Any]:
     """Return direct-publish counts for one UTC time window.
 
     The query keeps the article-to-tab relation used at publish time.  An
     article mapped to multiple tabs is counted once under each tab, while the
-    total article count remains deduplicated.
+    total article count remains deduplicated.  Only the columns in
+    :data:`REPORT_TAB_NAMES` are reported, and an article without any tracked
+    column is left out of the total as well.
     """
 
     conn = _conn(connection)
@@ -1889,19 +2055,32 @@ def direct_publish_report(period_start: str, period_end: str, connection=None) -
         """,
         (str(period_start), str(period_end)),
     ).fetchall()
-    article_ids = {int(row["article_id"]) for row in rows}
-    counts: dict[str, int] = {}
+    tracked = set(REPORT_TAB_NAMES)
+    article_ids: set[int] = set()
+    counts: dict[str, int] = {name: 0 for name in REPORT_TAB_NAMES}
     for row in rows:
         names = _loads(row["published_tab_names_json"], [])
         if not isinstance(names, list) or not names:
             tabs = _tabs_for_article_id(int(row["article_id"]), conn)
-            names = [tab.get("name") for tab in tabs if tab.get("name")]
+            names = [
+                tab.get("name")
+                for tab in tabs
+                if is_publishable_tab(tab) and tab.get("name")
+            ]
         if not names and row["legacy_tab_name"]:
             names = [row["legacy_tab_name"]]
-        if not names:
-            names = ["未配置栏目"]
-        for tab_name in dict.fromkeys(str(name).strip() for name in names if str(name).strip()):
-            counts[tab_name] = counts.get(tab_name, 0) + 1
+        matched = [
+            name
+            for name in dict.fromkeys(
+                str(value).strip() for value in names if str(value or "").strip()
+            )
+            if name in tracked
+        ]
+        if not matched:
+            continue
+        article_ids.add(int(row["article_id"]))
+        for tab_name in matched:
+            counts[tab_name] += 1
     return {
         "article_count": len(article_ids),
         "tab_counts": [
@@ -1967,13 +2146,7 @@ def transition_status(article_id: int, to_status: str, connection=None, *, messa
     old_status = from_status or current["status"]
     now = _now()
     preserve_error = to_status in {"ERROR", "PUBLISH_FAILED"}
-    published_tab_names = [
-        str(tab.get("name") or "").strip()
-        for tab in (current.get("tabs") or [])
-        if str(tab.get("name") or "").strip()
-    ]
-    if not published_tab_names and current.get("tab_name"):
-        published_tab_names = [str(current["tab_name"]).strip()]
+    published_tab_names = _published_tab_names(current)
     clauses = ["id=?"]
     params: list[Any] = [article_id]
     if quality_claim_token is not None:
@@ -2039,13 +2212,7 @@ def transition_status_if_current(
 
     now = _now()
     preserve_error = to_status in {"ERROR", "PUBLISH_FAILED"}
-    published_tab_names = [
-        str(tab.get("name") or "").strip()
-        for tab in (current.get("tabs") or [])
-        if str(tab.get("name") or "").strip()
-    ]
-    if not published_tab_names and current.get("tab_name"):
-        published_tab_names = [str(current["tab_name"]).strip()]
+    published_tab_names = _published_tab_names(current)
     clauses = ["id=?"]
     params: list[Any] = [article_id]
     if allowed is not None:
@@ -2362,13 +2529,7 @@ def record_draft_confirmation_result(
     if current_claim_token and str(claim_token or "") != current_claim_token:
         return None
     now = _now()
-    published_tab_names = [
-        str(tab.get("name") or "").strip()
-        for tab in (current.get("tabs") or [])
-        if str(tab.get("name") or "").strip()
-    ]
-    if not published_tab_names and current.get("tab_name"):
-        published_tab_names = [str(current["tab_name"]).strip()]
+    published_tab_names = _published_tab_names(current)
     archive_id = 0 if dqd_archive_id in (None, "") else int(dqd_archive_id)
     if outcome_key == "CREATED" and archive_id <= 0:
         raise ValueError("dqd_archive_id is required when outcome is CREATED")
@@ -2669,7 +2830,11 @@ def list_transient_recheck_candidates(
     if not retryable_reasons:
         return []
     conn = _conn(connection)
-    placeholders = ",".join("?" for _ in retryable_reasons)
+    # Use LIKE for fuzzy matching to catch composite failure reasons like
+    # "正文为空或少于30字；AI 语义质检失败，需要人工确认"
+    like_conditions = " OR ".join(
+        "json_extract(a.quality_json, '$.reason') LIKE ?" for _ in retryable_reasons
+    )
     limit = max(1, min(int(limit), 100))
     rows = conn.execute(
         f"""
@@ -2678,7 +2843,7 @@ def list_transient_recheck_candidates(
         WHERE a.status='NEEDS_REVIEW'
           AND a.updated_at < ?
           AND a.error IS NULL
-          AND json_extract(a.quality_json, '$.reason') IN ({placeholders})
+          AND ({like_conditions})
           AND (
             SELECT COUNT(*)
             FROM article_events e
@@ -2690,7 +2855,7 @@ def list_transient_recheck_candidates(
         """,
         (
             str(updated_before),
-            *retryable_reasons,
+            *[f"%{reason}%" for reason in retryable_reasons],
             max(1, int(max_attempts)),
             limit,
         ),

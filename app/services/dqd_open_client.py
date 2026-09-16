@@ -37,15 +37,22 @@ class DqdOpenClientError(RuntimeError):
         status_code: int | None = None,
         diagnostics: dict[str, Any] | None = None,
         result_unknown: bool = False,
+        duplicate_request: bool = False,
     ):
         super().__init__(message)
         self.payload = payload
         self.status_code = status_code
         self.result_unknown = bool(result_unknown)
+        self.duplicate_request = bool(duplicate_request)
         self.diagnostics = dict(diagnostics or {})
         self.diagnostics["result_unknown"] = self.result_unknown
+        if self.duplicate_request:
+            self.diagnostics["duplicate_request"] = True
         self.diagnostics.setdefault(
-            "error_kind", "remote_result_unknown" if self.result_unknown else "request_failed"
+            "error_kind",
+            "remote_duplicate_request"
+            if self.duplicate_request
+            else ("remote_result_unknown" if self.result_unknown else "request_failed"),
         )
 
 
@@ -278,6 +285,30 @@ def _business_failure_result_unknown(payload: Any) -> bool:
     return False
 
 
+def _business_failure_duplicate_request(payload: Any) -> bool:
+    """A code:3 or "重复请求" signal means the draft was already accepted.
+
+    The open platform de-duplicates by client_request_id: when the same
+    submission arrives twice, the second call returns this signal (nested as
+    ``code:3`` and/or a "重复请求" message) instead of a fresh archive_id. It must
+    be treated as an already-succeeded draft, not a failure, otherwise a
+    concurrent retry can overwrite a good DRAFT_CREATED.
+    """
+
+    if isinstance(payload, Mapping):
+        code = _numeric_code(payload.get("code"))
+        message = str(payload.get("message") or payload.get("msg") or "")
+        if code == 3 or "重复请求" in message:
+            return True
+        return any(
+            _business_failure_duplicate_request(payload.get(key))
+            for key in ("data", "result")
+        )
+    if isinstance(payload, list):
+        return any(_business_failure_duplicate_request(item) for item in payload)
+    return False
+
+
 def _request_diagnostics(
     request_url: str,
     form: list[tuple[str, str]],
@@ -441,6 +472,7 @@ class DqdOpenClient:
                 status_code=response.status_code,
                 diagnostics=diagnostics,
                 result_unknown=_business_failure_result_unknown(payload),
+                duplicate_request=_business_failure_duplicate_request(payload),
             )
 
         archive_id = _extract_archive_id(payload)

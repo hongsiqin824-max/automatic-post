@@ -277,7 +277,8 @@ def test_create_draft_retry_api_records_attempt_and_archive_id(app, client, monk
             self.config = config
 
         def create_article(self, article, tab, **kwargs):
-            assert article["status"] == "PUBLISH_FAILED"
+            # 重试入口同样先 CAS 锁定为 PUBLISHING 再提交。
+            assert article["status"] == "PUBLISHING"
             assert tab["backend_tab_id"]
             return DqdOpenDraftResult(
                 archive_id=3802222,

@@ -6,6 +6,7 @@ import logging
 import errno
 import fcntl
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -23,16 +24,23 @@ from .quality import (
     evaluate,
     is_photo_credit_advisory_plans,
     plan_local_repair,
+    verify_removal_keeps_facts,
 )
 from .link_sanitizer import find_media_artifact_lines, preprocess_quality_body
 from .promotion_repair import (
     MAX_AI_REPAIR_REMOVED_CHARS,
     MAX_AI_REPAIR_PLANS,
+    MAX_AI_REPAIR_ROUNDS,
+    REPAIR_RULE_VERSION,
     apply_repair_plan,
     body_safety_stats,
+    delete_only_replacement,
     find_promotional_blocks,
     normalize_photo_credits,
+    plans_from_dirty_targets,
+    removal_matches_known_artifact,
     remove_promotional_blocks,
+    removal_is_duplicated,
 )
 
 logger = logging.getLogger(__name__)
@@ -376,6 +384,114 @@ def _repair_validation_error_allows_replan(error: Any) -> bool:
     }
 
 
+class _RemovalVerifier:
+    """Information-preservation gate for deletions no pattern rule recognises.
+
+    The validator in :mod:`promotion_repair` proves an edit is a verbatim
+    deletion; this class answers the only remaining question — whether the
+    deletion drops a news fact.  It replaces the per-wording pattern whitelists
+    that previously had to grow for every new promo phrasing.
+
+    Two channels, cheapest first: a mechanical check (the removed text still
+    exists elsewhere in the body, so no fact can be lost) and a single model
+    call.  Verdicts are cached per fragment so the plan-validation retries do
+    not multiply the call count, and every verdict is recorded for audit.
+    """
+
+    def __init__(self, config: AppConfig, *, body: str) -> None:
+        self._config = config
+        self.body = body
+        self._cache: dict[str, bool] = {}
+        self.records: list[dict[str, Any]] = []
+
+    def __call__(self, context: dict[str, Any]) -> bool:
+        removed = str(context.get("removed_text") or "").strip()
+        if not removed:
+            return False
+        cached = self._cache.get(removed)
+        if cached is not None:
+            return cached
+        verdict, record = self._decide(removed, context)
+        self._cache[removed] = verdict
+        if len(self.records) < MAX_AI_REPAIR_PLANS * MAX_AI_REPAIR_ROUNDS:
+            self.records.append(record)
+        return verdict
+
+    def _decide(
+        self, removed: str, context: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        record: dict[str, Any] = {
+            "removed_text": removed[:300],
+            "issue_type": str(context.get("issue_type") or "")[:80],
+            "shape": str(context.get("shape") or "")[:40],
+        }
+        if removal_is_duplicated(removed, self.body):
+            return True, {**record, "channel": "duplicate_elsewhere", "safe": True}
+        llm = _make_llm(self._config)
+        if llm is None:
+            return False, {
+                **record,
+                "channel": "unavailable",
+                "safe": False,
+                "error": "未配置 LLM，无法核验删除是否丢失事实",
+            }
+        result = verify_removal_keeps_facts(
+            removed_text=removed,
+            kept_text=str(context.get("replacement") or ""),
+            body=self.body,
+            llm=llm,
+            llm_fallback=_make_fallback_llm(self._config),
+        )
+        return bool(result.get("safe")), {
+            **record,
+            "channel": "fact_verification",
+            "safe": bool(result.get("safe")),
+            "loses_fact": result.get("loses_fact"),
+            "confidence": result.get("confidence"),
+            "verifier_reason": str(result.get("reason") or "")[:300],
+            "error": result.get("error"),
+        }
+
+
+def _repair_fingerprint(body: str) -> dict[str, Any]:
+    return {
+        "body_sha256": body_safety_stats(body)["sha256"],
+        "rule_version": REPAIR_RULE_VERSION,
+    }
+
+
+def _repair_already_consumed(previous_repair: dict[str, Any], body: str) -> bool:
+    """Return whether the article already consumed its auto-repair attempt.
+
+    A *successful* repair is final: the body was mutated, so a second round
+    could delete more content and must never run again.  A *failed* attempt
+    left the body untouched, so it only blocks further attempts for the same
+    body under the same rule version — bumping :data:`REPAIR_RULE_VERSION`
+    lets improved validation retry an article once.
+
+    Records written before fingerprints existed carry no version information;
+    they keep the original one-attempt-forever behaviour so historical review
+    items are not silently reprocessed.
+    """
+
+    if not isinstance(previous_repair, dict) or not previous_repair.get("attempted"):
+        return False
+    if previous_repair.get("applied") is True:
+        return True
+    fingerprint = previous_repair.get("repair_fingerprint")
+    if not isinstance(fingerprint, dict):
+        return True
+    current = _repair_fingerprint(body)
+    try:
+        previous_version = int(fingerprint.get("rule_version") or 0)
+    except (TypeError, ValueError):
+        return True
+    return bool(
+        str(fingerprint.get("body_sha256") or "") == current["body_sha256"]
+        and previous_version >= REPAIR_RULE_VERSION
+    )
+
+
 def _clear_non_blocking_photo_advisory(
     quality: dict[str, Any],
     *,
@@ -414,16 +530,34 @@ def _clear_non_blocking_photo_advisory(
     return normalized
 
 
+def _skipped_plan_errors(matches: list[dict[str, Any]]) -> list[str]:
+    """Return the validation errors of plan items silently skipped on apply.
+
+    ``apply_repair_plan`` applies the verifiable items of a multi-item plan and
+    records the rejected ones on the first match.  A partially repaired body
+    still carries the remaining dirt, so the caller must react instead of
+    sending that candidate into the second quality pass.
+    """
+
+    if not matches:
+        return []
+    errors = matches[0].get("skipped_plan_errors")
+    if not isinstance(errors, list):
+        return []
+    return [str(item)[:300] for item in errors if str(item or "").strip()]
+
+
 def _quality_allows_followup_body_repair(
     quality: dict[str, Any],
 ) -> bool:
-    """Allow one narrowly-scoped retry for a clean result with a local plan.
+    """Allow another narrowly-scoped repair round for a result with a plan.
 
-    Some model responses mark an article clean while also returning a repair
-    plan for a harmless leftover block.  That plan is useful only when every
-    other quality dimension is explicitly clean and the target can be
-    validated by ``apply_repair_plan``.  The caller still limits this path to
-    remove-only operations and runs a complete quality pass afterwards.
+    A model response often reports only part of the dirt per round, or marks an
+    article clean while still returning a plan for a leftover block.  That plan
+    is usable only when every other quality dimension is explicitly clean and
+    the target can be validated by ``apply_repair_plan``.  The caller limits the
+    path to deletion-shaped operations, caps the number of rounds, and runs a
+    complete quality pass after every round.
     """
 
     if not isinstance(quality, dict):
@@ -521,6 +655,12 @@ def _quality_allows_followup_body_repair(
             "remove_empty_block",
             "delete_empty_block",
             "delete_duplicate",
+            # 后续轮的计划多半是"删掉段尾那一小截"，也就是 replace_text。把它挡在门外
+            # 等于让系统看着一份自己刚生成的可执行计划转人工。安全性不靠这份动作白名单，
+            # 而靠 apply_repair_plan 对每一条计划做的逐字校验——保留文本必须原样来自
+            # 原文，否则整份计划作废。这与第一轮用的是同一套校验。
+            "replace_text",
+            "replace",
         }:
             return False
         issue_type = str(item.get("issue_type") or item.get("issue_code") or "").strip().lower()
@@ -533,8 +673,17 @@ def _quality_allows_followup_body_repair(
             "delete_empty_block",
         }:
             return False
-        reason = str(item.get("reason") or "")
-        if not any(marker in reason for marker in reason_markers):
+        reason = re.sub(r"\s+", " ", str(item.get("reason") or "")).strip()
+        # 只要求理由是一段像样的说明。此前这里额外要求理由里出现"残留/引流/重复"等
+        # 关键词，但模型完全可以用别的说法描述同一件事（"该段是 b2 的简化版，信息被
+        # b2 覆盖"），结果是一份本来能执行的计划因为措辞被否掉。问题类别已经限定在可
+        # 删除的范围内，计划本身还要过 apply_repair_plan 的逐字校验，措辞不必再管。
+        if not 4 <= len(reason) <= 500 or "<" in reason or ">" in reason:
+            return False
+        if action in {"remove_link", "delete_link", "remove_anchor"} and not any(
+            marker in reason for marker in reason_markers
+        ):
+            # 链接删除没有可比对的替换文本，保留原来的措辞检查作为额外约束。
             return False
     return True
 
@@ -738,6 +887,8 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
 
         first_failed = not _quality_passes(first_quality)
         body_before = str(current.get("body_html") or "")
+        repair_consumed = _repair_already_consumed(previous_repair, body_before)
+        removal_verifier = _RemovalVerifier(config, body=body_before)
         raw_repair_plans = first_quality.get("repair_plans")
         if isinstance(raw_repair_plans, dict):
             repair_plans = [raw_repair_plans]
@@ -747,12 +898,54 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             repair_plans = []
         repair_plan_error = first_quality.get("repair_plan_error")
         original_repair_plan_error = repair_plan_error
+        # 质检已经逐字指出脏内容位置时，直接据此合成删除计划：模型经常一边报脏、
+        # 一边以"无法定位"为由不给计划，而位置信息本身是可校验的。合成计划仍要过
+        # apply_repair_plan 的逐字校验、信息保全核验和完整的二次质检。
+        synthesized_plans: list[dict[str, Any]] = []
+        if (
+            first_failed
+            and not repair_plans
+            and not repair_consumed
+            and _quality_allows_body_repair_planning(first_quality)
+        ):
+            synthesized_plans = plans_from_dirty_targets(
+                body_before, first_quality.get("dirty_targets")
+            )
+            # 合成计划来自"模型说这里脏"，而不是模型自己提交的可执行计划，因此每一条
+            # 都必须先过信息保全核验——包括整块删除。apply_repair_plan 只在段内替换
+            # 时才会问核验器，整块删除没有任何内容判据，若不在这里拦一道，模型把一段
+            # 新闻误标成脏内容就会被整段删掉。核验结果按片段缓存，重复问不额外花钱。
+            verified_plans: list[dict[str, Any]] = []
+            for plan in synthesized_plans:
+                removed_text = str(plan.get("evidence") or "")
+                if str(plan.get("action")) == "replace_text":
+                    fragment, shape = delete_only_replacement(
+                        removed_text, str(plan.get("after") or "")
+                    )
+                    if fragment is None:
+                        continue
+                    removed_text, plan_shape = fragment, shape
+                else:
+                    plan_shape = str(plan.get("action"))
+                if removal_matches_known_artifact(removed_text) or removal_verifier({
+                    "removed_text": removed_text,
+                    "evidence": plan.get("evidence"),
+                    "replacement": plan.get("after") or "",
+                    "issue_type": plan.get("issue_type"),
+                    "reason": plan.get("reason"),
+                    "shape": plan_shape,
+                }):
+                    verified_plans.append(plan)
+            synthesized_plans = verified_plans
+            if synthesized_plans:
+                repair_plans = synthesized_plans
+                repair_plan_error = None
         repair_planner: dict[str, Any] | None = None
         if (
             first_failed
             and not repair_plans
             and _plan_error_allows_dedicated_planner(repair_plan_error)
-            and not previous_repair.get("attempted")
+            and not repair_consumed
             and _quality_allows_body_repair_planning(first_quality)
         ):
             planner_llm = _make_llm(config)
@@ -805,15 +998,17 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             repairable_ai_plan = bool(
                 repair_plans and _quality_allows_body_repair_planning(first_quality)
             )
-        if first_failed and repair_plan_error and not previous_repair.get("attempted"):
+        elif synthesized_plans:
+            repairable_ai_plan = _quality_allows_body_repair_planning(first_quality)
+        if first_failed and repair_plan_error and not repair_consumed:
             ai_plan_error = str(repair_plan_error)[:300]
         elif (
             first_failed
             and repairable_ai_plan
-            and not previous_repair.get("attempted")
+            and not repair_consumed
         ):
             ai_body_after, ai_plan_matches, ai_plan_error = apply_repair_plan(
-                body_before, repair_plans
+                body_before, repair_plans, verifier=removal_verifier
             )
             if (
                 _repair_validation_error_allows_replan(ai_plan_error)
@@ -862,6 +1057,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                             ai_body_after, ai_plan_matches, ai_plan_error = apply_repair_plan(
                                 body_before,
                                 repair_plans,
+                                verifier=removal_verifier,
                             )
                             repair_replanner["validation_error"] = (
                                 str(ai_plan_error)[:300] if ai_plan_error else None
@@ -883,9 +1079,90 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                             "repair_plan_error": str(exc)[:300],
                         }
                         ai_plan_error = str(exc)[:300]
+            if (
+                ai_plan_error is None
+                and repair_replanner is None
+                and _skipped_plan_errors(ai_plan_matches)
+                and (
+                    first_quality.get("decision") == "repairable"
+                    or _quality_allows_body_repair_planning(first_quality)
+                )
+            ):
+                # 部分计划被跳过时候选正文仍残留脏内容，二次质检必然不通过。
+                # 把跳过原因交给 AI 重新规划一次；重规划不可用时保留已验证的
+                # 部分修复，不改变原有兜底行为。
+                skipped_errors = _skipped_plan_errors(ai_plan_matches)
+                replanner_llm = _make_llm(config)
+                if replanner_llm is not None:
+                    trigger_error = skipped_errors[0]
+                    rejected_plans = [dict(item) for item in repair_plans]
+                    try:
+                        replanner_result = plan_local_repair(
+                            title=current.get("title_final", ""),
+                            body=body_before,
+                            first_quality=first_quality,
+                            llm=replanner_llm,
+                            llm_fallback=_make_fallback_llm(config),
+                            validation_error=trigger_error,
+                            rejected_plans=rejected_plans,
+                        )
+                        replanned = replanner_result.get("repair_plans")
+                        replanned_plans = (
+                            [item for item in replanned if isinstance(item, dict)]
+                            if isinstance(replanned, list) else []
+                        )
+                        replanner_error = replanner_result.get("repair_plan_error")
+                        repair_replanner = {
+                            "attempted": True,
+                            "trigger": "skipped_plan_items",
+                            "trigger_error": trigger_error,
+                            "skipped_plan_errors": skipped_errors,
+                            "rejected_plans": _audit_repair_plans(rejected_plans),
+                            "repairable": replanner_result.get("repairable") is True,
+                            "reason": str(replanner_result.get("reason") or "")[:500],
+                            "repair_plans": _audit_repair_plans(replanned_plans),
+                            "repair_plan_error": (
+                                str(replanner_error)[:300] if replanner_error else None
+                            ),
+                        }
+                        if (
+                            replanner_result.get("repairable") is True
+                            and replanned_plans
+                            and not replanner_error
+                        ):
+                            retry_body, retry_matches, retry_error = apply_repair_plan(
+                                body_before,
+                                replanned_plans,
+                                verifier=removal_verifier,
+                            )
+                            repair_replanner["validation_error"] = (
+                                str(retry_error)[:300] if retry_error else None
+                            )
+                            if (
+                                retry_error is None
+                                and retry_matches
+                                and not _skipped_plan_errors(retry_matches)
+                            ):
+                                repair_plans = replanned_plans
+                                ai_body_after, ai_plan_matches = retry_body, retry_matches
+                    except Exception as exc:  # a failed re-plan keeps the verified subset
+                        logger.warning(
+                            "AI 局部修复跳过项重新规划失败 article_id=%s: %s", article_id, exc
+                        )
+                        repair_replanner = {
+                            "attempted": True,
+                            "trigger": "skipped_plan_items",
+                            "trigger_error": trigger_error,
+                            "skipped_plan_errors": skipped_errors,
+                            "rejected_plans": _audit_repair_plans(rejected_plans),
+                            "repairable": False,
+                            "reason": "AI 局部修复重新规划调用失败",
+                            "repair_plans": [],
+                            "repair_plan_error": str(exc)[:300],
+                        }
             promotion_candidates = []
             attribution_candidates = []
-        elif first_failed and repair_plans and not previous_repair.get("attempted"):
+        elif first_failed and repair_plans and not repair_consumed:
             ai_plan_error = "当前质检失败还包含无法通过正文局部修改解决的问题"
             promotion_candidates = []
             attribution_candidates = []
@@ -894,12 +1171,12 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             and repair_scope_is_dirty_only
             and isinstance(first_quality.get("semantic_check"), dict)
             and first_quality["semantic_check"].get("has_ad_or_dirty") is True
-            and not previous_repair.get("attempted")
+            and not repair_consumed
         ):
             ai_plan_error = "AI 发现广告或脏内容，但未提供可验证的局部修复计划"
             promotion_candidates = []
             attribution_candidates = []
-        elif first_failed and repair_scope_is_dirty_only and not previous_repair.get("attempted"):
+        elif first_failed and repair_scope_is_dirty_only and not repair_consumed:
             promotion_candidates = find_promotional_blocks(body_before)
             _, attribution_candidates = normalize_photo_credits(body_before)
         else:
@@ -913,8 +1190,13 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 "outcome": "failed",
                 "plan_error": ai_plan_error,
                 "repair_plans": _audit_repair_plans(repair_plans),
+                "repair_fingerprint": _repair_fingerprint(body_before),
                 "first_quality": first_quality,
             }
+            if removal_verifier.records:
+                repair["removal_verification"] = removal_verifier.records
+            if synthesized_plans:
+                repair["dirty_target_plans"] = _audit_repair_plans(synthesized_plans)
             if repair_planner is not None:
                 repair["repair_planner"] = repair_planner
             if repair_replanner is not None:
@@ -950,7 +1232,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             final_quality = dict(first_quality)
             if repair_planner is not None:
                 final_quality["repair_planner"] = repair_planner
-            if previous_repair.get("attempted"):
+            if repair_consumed:
                 # A worker can stop after persisting the one-attempt marker
                 # but before the body mutation or second quality pass.  A
                 # later ingest must never turn that incomplete history into
@@ -1016,8 +1298,13 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             "removed_count": 0,
             "attribution_normalized_count": 0,
             "matches": audit_matches,
+            "repair_fingerprint": _repair_fingerprint(body_before),
             "first_quality": first_quality,
         }
+        if removal_verifier.records:
+            repair["removal_verification"] = removal_verifier.records
+        if synthesized_plans:
+            repair["dirty_target_plans"] = _audit_repair_plans(synthesized_plans)
         if repair_planner is not None:
             repair["repair_planner"] = repair_planner
         if repair_replanner is not None:
@@ -1195,86 +1482,104 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
         followup_matches: list[dict[str, Any]] = []
         followup_quality: dict[str, Any] | None = None
         followup_error: str | None = None
-        if (
+        followup_before_stats: dict[str, Any] = {}
+        followup_after_stats: dict[str, Any] = {}
+        followup_rounds = 0
+        quality_round = 2
+        # 模型每轮只稳定地看到一部分脏内容：第一轮删掉引流块，第二轮才报出段尾的图片
+        # 署名。只要上一轮质检明确给出可执行的局部修复计划，就再修一轮，直到通过、
+        # 出错或用完 MAX_AI_REPAIR_ROUNDS 轮。每轮都跑同一套逐字校验、正文与图片安全
+        # 不变量和累计删除字数上限，最后仍须整体通过质检才提交。
+        while (
             second_error is None
             and not second_passed
+            and followup_error is None
+            and followup_rounds + 1 < MAX_AI_REPAIR_ROUNDS
             and _quality_allows_followup_body_repair(second_quality)
         ):
-            followup_plans = second_quality.get("repair_plans")
-            followup_body, followup_matches, followup_error = apply_repair_plan(
+            removal_verifier.body = body_after
+            round_body, round_matches, round_error = apply_repair_plan(
                 body_after,
-                followup_plans,
+                second_quality.get("repair_plans"),
+                verifier=removal_verifier,
             )
-            followup_safe, followup_before_stats, followup_after_stats = (
-                _followup_body_is_safe(body_after, followup_body)
+            round_safe, round_before_stats, round_after_stats = _followup_body_is_safe(
+                body_after, round_body
             )
-            if not followup_safe:
-                followup_error = followup_error or (
-                    "二次局部修复未通过正文或图片安全校验"
+            if not round_safe:
+                round_error = round_error or "二次局部修复未通过正文或图片安全校验"
+                round_matches = []
+            if round_error is not None or not round_matches:
+                # 这一轮修不动就停下：再调用一次模型也只会拿到同一份计划。
+                followup_error = round_error
+                if followup_quality is None:
+                    followup_quality = second_quality
+                break
+            if not followup_before_stats:
+                followup_before_stats = round_before_stats
+            followup_after_stats = round_after_stats
+            followup_rounds += 1
+            quality_round += 1
+            try:
+                followup_quality = evaluate(
+                    title=current.get("title_final", ""),
+                    body=round_body,
+                    channels=current.get("channels", []),
+                    llm=_make_llm(config),
+                    llm_fallback=_make_fallback_llm(config),
                 )
-                followup_matches = []
-            if followup_error is None and followup_matches:
-                try:
-                    followup_quality = evaluate(
-                        title=current.get("title_final", ""),
-                        body=followup_body,
-                        channels=current.get("channels", []),
-                        llm=_make_llm(config),
-                        llm_fallback=_make_fallback_llm(config),
-                    )
-                    if not isinstance(followup_quality, dict):
-                        raise TypeError("最终质检返回结果格式错误")
-                except Exception as exc:  # fail closed; keep canonical body
-                    followup_error = str(exc)[:300]
-                    followup_quality = _second_quality_error(second_quality, exc)
-                if followup_quality.get("title_after") not in {
-                    None,
-                    current.get("title_final", ""),
-                }:
-                    followup_error = "最终质检提出标题修改，局部修复不自动改标题"
-                    followup_quality = dict(followup_quality)
-                    followup_quality["pass"] = False
-                    followup_quality["needs_review"] = True
-                _record_quality_result(
-                    article_id,
-                    followup_quality,
-                    3,
-                    connection,
-                    status="QUALITY_CHECKING",
-                    quality_claim_token=quality_claim_token,
+                if not isinstance(followup_quality, dict):
+                    raise TypeError("最终质检返回结果格式错误")
+            except Exception as exc:  # fail closed; keep canonical body
+                followup_error = str(exc)[:300]
+                followup_quality = _second_quality_error(second_quality, exc)
+            if followup_quality.get("title_after") not in {
+                None,
+                current.get("title_final", ""),
+            }:
+                followup_error = "最终质检提出标题修改，局部修复不自动改标题"
+                followup_quality = dict(followup_quality)
+                followup_quality["pass"] = False
+                followup_quality["needs_review"] = True
+            _record_quality_result(
+                article_id,
+                followup_quality,
+                quality_round,
+                connection,
+                status="QUALITY_CHECKING",
+                quality_claim_token=quality_claim_token,
+            )
+            body_after = round_body
+            followup_matches = [*followup_matches, *round_matches]
+            cumulative_removed_visible_chars = _removed_visible_chars(
+                [*removed, *followup_matches]
+            )
+            if cumulative_removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS:
+                followup_error = (
+                    "整次局部修复累计删除可见文字超过 "
+                    f"{MAX_AI_REPAIR_REMOVED_CHARS} 字上限"
+                    f"（实际 {cumulative_removed_visible_chars} 字）"
                 )
-                body_after = followup_body
-                cumulative_removed_visible_chars = _removed_visible_chars(
-                    [*removed, *followup_matches]
-                )
-                if cumulative_removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS:
-                    followup_error = (
-                        "整次局部修复累计删除可见文字超过 "
-                        f"{MAX_AI_REPAIR_REMOVED_CHARS} 字上限"
-                        f"（实际 {cumulative_removed_visible_chars} 字）"
-                    )
-                    second_quality = dict(followup_quality)
-                    issues = dict(second_quality.get("issues") or {})
-                    semantic_problems = list(issues.get("semantic_problems") or [])
-                    semantic_problems.append(followup_error)
-                    issues["semantic_problems"] = semantic_problems
-                    semantic_check = dict(second_quality.get("semantic_check") or {})
-                    semantic_check["needs_review"] = True
-                    second_quality.update({
-                        "pass": False,
-                        "needs_review": True,
-                        "decision": "manual_review",
-                        "decision_reason": followup_error,
-                        "score": min(int(second_quality.get("score") or 50), 50),
-                        "issues": issues,
-                        "semantic_check": semantic_check,
-                        "reason": followup_error,
-                    })
-                else:
-                    second_quality = followup_quality
-                second_passed = followup_error is None and _quality_passes(second_quality)
+                second_quality = dict(followup_quality)
+                issues = dict(second_quality.get("issues") or {})
+                semantic_problems = list(issues.get("semantic_problems") or [])
+                semantic_problems.append(followup_error)
+                issues["semantic_problems"] = semantic_problems
+                semantic_check = dict(second_quality.get("semantic_check") or {})
+                semantic_check["needs_review"] = True
+                second_quality.update({
+                    "pass": False,
+                    "needs_review": True,
+                    "decision": "manual_review",
+                    "decision_reason": followup_error,
+                    "score": min(int(second_quality.get("score") or 50), 50),
+                    "issues": issues,
+                    "semantic_check": semantic_check,
+                    "reason": followup_error,
+                })
             else:
-                followup_quality = second_quality
+                second_quality = followup_quality
+            second_passed = followup_error is None and _quality_passes(second_quality)
         if followup_matches:
             removed = [*removed, *followup_matches]
             repair["removed_count"] = len(removed)
@@ -1329,12 +1634,16 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 applied_event_payload["followup_repair"] = {
                     "removed_blocks": _audit_matches(followup_matches),
                     "removed_count": len(followup_matches),
-                    "quality_round": 3,
+                    "rounds": followup_rounds,
+                    "quality_round": quality_round,
                 }
         repair.update({
             "outcome": "error" if second_error else ("passed" if second_passed else "failed"),
             "second_quality": second_quality,
         })
+        if removal_verifier.records:
+            # 后续修复轮可能追加了新的核验判定，用最终快照覆盖首轮写入的记录。
+            repair["removal_verification"] = removal_verifier.records
         if followup_matches or followup_error:
             repair["followup_repair"] = {
                 "attempted": True,
@@ -1343,6 +1652,8 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     "failed" if followup_error or followup_matches else "skipped"
                 ),
                 "matches": _audit_matches(followup_matches),
+                "rounds": followup_rounds,
+                "quality_round": quality_round,
                 "before": followup_before_stats,
                 "after": followup_after_stats,
                 "error": followup_error,

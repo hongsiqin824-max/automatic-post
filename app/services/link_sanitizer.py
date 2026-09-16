@@ -165,8 +165,11 @@ _ARTIFACT_TEXT_BLOCK = re.compile(
 _BYLINE_LEAD_IN = r"编写|编译|撰文|编撰|编辑|记者|编排|整理|构成|供稿|文|著者"
 _MEDIA_ARTIFACT_PROBE = re.compile(
     r"【\s*(?:图片|写真|视频|集锦|实战|直播|积分榜|赛程)"
-    r"|\[\s*(?:图片|写真|photo|video|视频|集锦|直播|积分榜|赛程)"
-    r"|(?:" + _BYLINE_LEAD_IN + r")\s*[●•・·:：]",
+    r"|\[\s*(?:图片|照片|写真|photo|video|视频|集锦|直播|积分榜|赛程)"
+    r"|(?:" + _BYLINE_LEAD_IN + r")\s*[●•・·:：]"
+    r"|(?:编辑部|編集部)"
+    r"|\(\s*[Cc]\s*\)"
+    r"|[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+\.[A-Za-z]",
     re.IGNORECASE,
 )
 # The Chinese full stop is excluded on purpose: a caption glued to a following
@@ -217,6 +220,36 @@ _EDITORIAL_BYLINE_TAIL = re.compile(
     r"(?<=[。！？!?])[ \t\u3000]*"
     r"(?:" + _BYLINE_LEAD_IN + r")\s*[●•・·]\s*"
     r"[^<>\r\n。！？!?]{1,40}[ \t\u3000]*$",
+    re.IGNORECASE,
+)
+# 同类残留的另外两种形态，AI 不一定每次都判为脏内容，所以在质检前确定性删除：
+# 1) 段尾记者邮箱，例如 "……顺利开启金牌之旅。 /reccos23@osen.co.kr"；
+# 2) 段尾编辑部署名，例如
+#    "……目标就是在主场争取夺冠。 FOOTBALL ZONE编辑部・上原拓真 / Takuma Uehara"。
+# 两者同样要求紧跟句末标点、长度受限且不含句末标点，正常报道句不会被截断；
+# 编辑部形态还必须带 ●・/ 之类署名分隔符，避免误删"编辑部对此未予置评"这类句子。
+_BYLINE_EMAIL_TAIL = re.compile(
+    r"(?<=[。！？!?])[ \t\u3000]*"
+    r"[/／|｜·・\-—]?[ \t\u3000]*"
+    r"(?:(?:" + _BYLINE_LEAD_IN + r")\s*[:：]?[ \t\u3000]*)?"
+    r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63}){1,3}"
+    r"[ \t\u3000]*$",
+    re.IGNORECASE,
+)
+_EDITORIAL_DEPARTMENT_TAIL = re.compile(
+    r"(?<=[。！？!?])[ \t\u3000]*"
+    r"[^<>\r\n。！？!?]{0,30}(?:编辑部|編集部)[ \t\u3000]*[●•・·:：/／\-—]"
+    r"[^<>\r\n。！？!?]{0,40}[ \t\u3000]*$",
+    re.IGNORECASE,
+)
+# 段尾图片版权标记，例如 "朗斯在联赛开局4场后解雇主帅[图片]=Getty Images"
+# 或 "……庆祝胜利。(C)Getty Images"。图注本身不一定以句号结尾，所以这里不要求
+# 句末标点，改由"删除后剩余文本不能为空"来保证图注被保留。
+_PHOTO_CREDIT_TAIL = re.compile(
+    r"[ \t\u3000]*(?:"
+    r"\[\s*(?:照片|写真|图片|photo)\s*\]\s*[=＝]\s*[^<>\[\]\r\n。！？!?]{1,60}"
+    r"|\(\s*[Cc]\s*\)\s*[^<>\[\]\r\n。！？!?]{1,60}"
+    r")[ \t\u3000]*$",
     re.IGNORECASE,
 )
 # Upstream feeds occasionally leak the Dongqiudi highlight-tag syntax into the
@@ -646,26 +679,38 @@ def _artifact_line_rule(line: str) -> str | None:
     return None
 
 
-def _strip_editorial_byline_tail(line: str) -> tuple[str, str | None]:
-    """Strip a byline glued to the tail of a reporting line.
+def _strip_editorial_byline_tail(line: str) -> tuple[str, str | None, str]:
+    """Strip a byline or photo credit glued to the tail of a reporting line.
 
-    Returns ``(line, None)`` when nothing is removed. Otherwise returns the
-    line with only the trailing signature removed and the removed tail text.
-    The reporting sentence (including its ending punctuation) is preserved.
+    Returns ``(line, None, rule)`` when nothing is removed. Otherwise returns
+    the line with only the trailing signature removed, the removed tail text,
+    and the rule that matched. The reporting sentence (including its ending
+    punctuation) is preserved.
     """
 
     original = str(line or "")
     if len(original) > 200:
-        return original, None
-    match = _EDITORIAL_BYLINE_TAIL.search(original)
+        return original, None, "editorial_byline_tail"
+    match = None
+    rule = "editorial_byline_tail"
+    for pattern, pattern_rule in (
+        (_EDITORIAL_BYLINE_TAIL, "editorial_byline_tail"),
+        (_EDITORIAL_DEPARTMENT_TAIL, "editorial_byline_tail"),
+        (_BYLINE_EMAIL_TAIL, "editorial_byline_tail"),
+        (_PHOTO_CREDIT_TAIL, "photo_credit_tail"),
+    ):
+        match = pattern.search(original)
+        if match is not None:
+            rule = pattern_rule
+            break
     if match is None:
-        return original, None
+        return original, None, rule
     stripped = original[: match.start()]
     tail = original[match.start():].strip().strip("\u3000").strip()
     # The remaining text must still be a real sentence, not whitespace only.
     if not stripped.strip().strip("\u3000").strip():
-        return original, None
-    return stripped, tail or None
+        return original, None, rule
+    return stripped, tail or None, rule
 
 
 def _media_artifact_block_replacements(body: str) -> list[tuple[int, int, str, list[dict[str, str]]]]:
@@ -685,9 +730,9 @@ def _media_artifact_block_replacements(body: str) -> list[tuple[int, int, str, l
                 # The whole line is legitimate, but a byline may be glued to
                 # its tail after a sentence-ending mark.  Strip only that tail
                 # while keeping the reporting sentence intact.
-                stripped, tail = _strip_editorial_byline_tail(line)
+                stripped, tail, tail_rule = _strip_editorial_byline_tail(line)
                 if tail is not None:
-                    removed.append({"rule": "editorial_byline_tail", "text": tail[:180]})
+                    removed.append({"rule": tail_rule, "text": tail[:180]})
                     edited_lines[index] = stripped
                 kept.append(index)
                 continue

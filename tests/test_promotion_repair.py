@@ -7,11 +7,17 @@ from app.services.promotion_repair import (
     body_safety_stats,
     content_blocks,
     content_links,
+    delete_only_replacement,
     find_promotional_blocks,
     find_promotional_lines,
     normalize_photo_credits,
+    plans_from_dirty_targets,
     remove_promotional_blocks,
+    removal_is_duplicated,
+    removal_matches_known_artifact,
 )
+
+from app.services.quality import dirty_targets_from_semantic
 
 
 VIDEO_TEASER = "【视频】佐藤龙之介送出引发进球的凶狠逼抢，以及他的威胁场面"
@@ -195,6 +201,29 @@ def test_content_blocks_and_ai_plan_support_attribute_less_nested_presentation_t
     assert error is None
     assert cleaned == f"<p>{news}</p><p>{news}</p>"
     assert matches[0]["text"] == promotion
+
+
+def test_content_blocks_expose_heading_blocks_for_ai_plans() -> None:
+    # #18814：br 源的栏目模板写在 <h2> 里，此前标题块不在可定位块列表中，
+    # AI 无论怎么规划都无法定位，只能转人工。
+    news = "报道介绍了球队本轮比赛的完整过程、球员表现以及后续训练安排。" * 2
+    body = f"<p>{news}</p><h2>头条新闻</h2><p>{news}</p>"
+
+    blocks = content_blocks(body)
+
+    assert [item["tag"] for item in blocks] == ["p", "h2", "p"]
+    cleaned, matches, error = apply_repair_plan(body, {
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": "头条新闻",
+        "issue_type": "template_artifact",
+        "reason": "该栏目标题是采集模板残留，与新闻事实无关",
+        "confidence": 0.98,
+    })
+
+    assert error is None
+    assert cleaned == f"<p>{news}</p><p>{news}</p>"
+    assert matches and matches[0]["tag"] == "h2"
 
 
 def test_nested_presentation_tags_do_not_allow_attributes_or_arbitrary_markup() -> None:
@@ -600,6 +629,8 @@ def test_ai_repair_plan_rejects_more_than_three_operations() -> None:
         "点击查看球队最新消息",
         "点击查看比赛详情",
         "点击查看赛事官网",
+        "点击查看更多内容",
+        "点击查看专题报道",
     ]
     body = f"<p>{context}</p>" + "".join(f"<p>{item}</p>" for item in promotions)
     blocks = content_blocks(body)
@@ -617,7 +648,7 @@ def test_ai_repair_plan_rejects_more_than_three_operations() -> None:
 
     assert cleaned == body
     assert matches == []
-    assert "最多3个局部操作" in str(error)
+    assert "最多5个局部操作" in str(error)
 
 
 def test_ai_repair_plan_rejects_confidence_below_point_ninety_five() -> None:
@@ -1452,6 +1483,85 @@ def test_edge_fragment_removal_strips_leading_google_ad_token() -> None:
     assert matches and matches[0]["validation"] == "ai_edge_fragment_removal"
 
 
+def test_edge_fragment_removal_strips_chinese_intro_link_tail() -> None:
+    """#18727: a trailing Chinese template residue '前言链接' must be removable."""
+    body = "<p>亚冠精英联赛（ACLE）15日将迎来日本球队的首轮小组赛。 前言链接</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "亚冠精英联赛（ACLE）15日将迎来日本球队的首轮小组赛。 前言链接",
+        "after": "亚冠精英联赛（ACLE）15日将迎来日本球队的首轮小组赛。",
+        "issue_type": "template_artifact",
+        "reason": "该段末尾的'前言链接'是模板残留，删除后不影响新闻事实完整性",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "前言链接" not in cleaned
+    assert "亚冠精英联赛（ACLE）15日将迎来日本球队的首轮小组赛。" in cleaned
+
+
+def test_edge_fragment_removal_strips_trailing_media_pointer() -> None:
+    """#18743 b4: a trailing '（见下方视频）' media pointer must be removable."""
+    body = (
+        "<p>在半决赛对阵纽维尔老男孩时，米内罗竞技坐满独立球场，力争在常规时间内追成2比0，"
+        "最终还经历了下半场一次标志性的停电。伯纳德和吉列尔梅进球，球队随后在点球大战中晋级。"
+        "（见下方视频）</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": (
+            "在半决赛对阵纽维尔老男孩时，米内罗竞技坐满独立球场，力争在常规时间内追成2比0，"
+            "最终还经历了下半场一次标志性的停电。伯纳德和吉列尔梅进球，球队随后在点球大战中晋级。"
+            "（见下方视频）"
+        ),
+        "after": (
+            "在半决赛对阵纽维尔老男孩时，米内罗竞技坐满独立球场，力争在常规时间内追成2比0，"
+            "最终还经历了下半场一次标志性的停电。伯纳德和吉列尔梅进球，球队随后在点球大战中晋级。"
+        ),
+        "issue_type": "media_promotion",
+        "reason": "段尾“（见下方视频）”是媒体推广引流短语，删除后剩余句子语义完整。",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "见下方视频" not in cleaned
+    assert "球队随后在点球大战中晋级。" in cleaned
+
+
+def test_infix_fragment_removal_strips_media_pointer_between_sentences() -> None:
+    """#18743 b8: a '（见下方视频）' wedged between two sentences must be removable."""
+    body = (
+        "<p>巴伊亚先打进2球。但在下半场第27分钟到第32分钟的5分钟内，米内罗竞技依靠胡尔克和凯诺的2个进球"
+        "完成逆转，以“3比2”在2021年重夺巴西全国联赛冠军，结束了长达50年的等待。（见下方视频）"
+        "不过，这场周三19点在MRV竞技场的“3比2”并不能直接带来晋级，米内罗竞技仍需要更大的净胜球。"
+        "但这依然是一次极具象征意义的逆转，足以调动球迷的热情。</p>"
+    )
+    evidence = (
+        "巴伊亚先打进2球。但在下半场第27分钟到第32分钟的5分钟内，米内罗竞技依靠胡尔克和凯诺的2个进球"
+        "完成逆转，以“3比2”在2021年重夺巴西全国联赛冠军，结束了长达50年的等待。（见下方视频）"
+        "不过，这场周三19点在MRV竞技场的“3比2”并不能直接带来晋级，米内罗竞技仍需要更大的净胜球。"
+        "但这依然是一次极具象征意义的逆转，足以调动球迷的热情。"
+    )
+    after = evidence.replace("（见下方视频）", "")
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": evidence,
+        "after": after,
+        "issue_type": "media_promotion",
+        "reason": "段中“（见下方视频）”是媒体推广引流短语，删除后剩余句子语义完整。",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "见下方视频" not in cleaned
+    assert "结束了长达50年的等待。" in cleaned
+    assert "不过，这场周三19点在MRV竞技场" in cleaned
+    assert matches and matches[0]["validation"] == "ai_infix_fragment_removal"
+
+
 def test_edge_fragment_removal_strips_trailing_cta() -> None:
     body = "<p>球队已经抵达日本，全队备战就绪，士气高涨。 点击这里查看更多精彩内容</p>"
     plan = {
@@ -1469,7 +1579,7 @@ def test_edge_fragment_removal_strips_trailing_cta() -> None:
     assert "球队已经抵达日本" in cleaned
 
 
-def test_edge_fragment_removal_rejects_middle_deletion() -> None:
+def test_infix_fragment_removal_strips_ad_residue_between_sentences() -> None:
     body = "<p>上半场比分一比零，google广告分区开始(name=s1)下半场再进两球，最终三比零获胜。</p>"
     plan = {
         "action": "replace_text",
@@ -1477,11 +1587,159 @@ def test_edge_fragment_removal_rejects_middle_deletion() -> None:
         "evidence": "上半场比分一比零，google广告分区开始(name=s1)下半场再进两球，最终三比零获胜。",
         "after": "上半场比分一比零，下半场再进两球，最终三比零获胜。",
         "issue_type": "template_artifact",
-        "reason": "中间广告残留",
+        "reason": "中间广告残留，删除后新闻事实完整",
+        "confidence": 0.98,
+    }
+    cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "google" not in cleaned
+    assert "name=s1" not in cleaned
+    assert "上半场比分一比零，下半场再进两球，最终三比零获胜。" in cleaned
+
+
+def test_infix_fragment_removal_rejects_deleting_news_content() -> None:
+    """An infix cut of a factual clause (not dirt) must still be rejected."""
+    body = "<p>上半场比分一比零，下半场再进两球，最终三比零获胜。</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "上半场比分一比零，下半场再进两球，最终三比零获胜。",
+        "after": "上半场比分一比零，最终三比零获胜。",
+        "issue_type": "template_artifact",
+        "reason": "删除中间内容",
         "confidence": 0.98,
     }
     _cleaned, _matches, error = apply_repair_plan(body, plan)
     assert error is not None
+
+
+def test_remove_link_plan_downgrades_to_text_line_when_source_has_no_anchor() -> None:
+    """#18897: the model emits remove_link for a plain-text URL line that has no
+    <a> anchor and whose evidence is only the platform label. The plan must be
+    downgraded to a segment-level text removal instead of being dropped."""
+    body = (
+        "<p>节目里会出现许多鲜为人知、出人意料的纪录！<br>"
+        "关西电视台DOGA：https://ktv-smart.jp/store/series.php?id=KTV7980<br>"
+        "TVer：https://tver.jp/series/sro2am1wu6</p>"
+    )
+    plans = [
+        {
+            "action": "remove_link",
+            "link_id": "l1",
+            "evidence": "关西电视台DOGA",
+            "issue_type": "media_promotion",
+            "reason": "直接引流至外部平台，与新闻事实无关",
+            "confidence": 0.98,
+        },
+        {
+            "action": "remove_link",
+            "link_id": "l2",
+            "evidence": "TVer",
+            "issue_type": "media_promotion",
+            "reason": "直接引流至外部平台，与新闻事实无关",
+            "confidence": 0.98,
+        },
+    ]
+    cleaned, matches, error = apply_repair_plan(body, plans)
+    assert error is None
+    assert matches
+    assert "ktv-smart.jp" not in cleaned
+    assert "tver.jp" not in cleaned
+    assert "节目里会出现许多鲜为人知、出人意料的纪录！" in cleaned
+
+
+def test_remove_link_plan_without_anchor_rejects_news_sentence_target() -> None:
+    """The downgrade must never delete a factual sentence: when the evidence
+    label sits inside a normal news clause (not a bare URL line) the plan is
+    rejected as an unresolved link target."""
+    body = (
+        "<p>※节目播出结束后，可在“关西电视台DOGA”“TVer”观看完整比赛录像。</p>"
+    )
+    plan = {
+        "action": "remove_link",
+        "link_id": "l1",
+        "evidence": "关西电视台DOGA",
+        "issue_type": "media_promotion",
+        "reason": "外部平台引流",
+        "confidence": 0.98,
+    }
+    _cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is not None
+
+
+def test_edge_fragment_removal_strips_tune_in_cta_tail() -> None:
+    """#18897: a trailing program tune-in CTA '这周也要看J！' must be removable."""
+    body = "<p>节目里会出现许多鲜为人知、出人意料的纪录！这周也要看J！</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "节目里会出现许多鲜为人知、出人意料的纪录！这周也要看J！",
+        "after": "节目里会出现许多鲜为人知、出人意料的纪录！",
+        "issue_type": "call_to_action",
+        "reason": "独立引流句，与新闻事实无关",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "这周也要看J" not in cleaned
+    assert "节目里会出现许多鲜为人知、出人意料的纪录！" in cleaned
+    assert matches and matches[0]["validation"] == "ai_edge_fragment_removal"
+
+
+def test_tune_in_cta_probe_keeps_ordinary_news_sentences() -> None:
+    """The tune-in CTA probe must not treat factual clauses as dirt."""
+    body = (
+        "<p>本周他将迎来复出，球迷本周可以在主场观看比赛。这周球队状态不错值得一看。</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "本周他将迎来复出，球迷本周可以在主场观看比赛。这周球队状态不错值得一看。",
+        "after": "本周他将迎来复出，球迷本周可以在主场观看比赛。",
+        "issue_type": "call_to_action",
+        "reason": "疑似引流句",
+        "confidence": 0.98,
+    }
+    _cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is not None
+
+
+def test_segment_scoped_replace_text_only_touches_its_own_line() -> None:
+    """#18897: a replace_text carrying a segment_id must edit only that line and
+    must not overlap sibling line removals in the same block."""
+    body = (
+        "<p>节目里会出现许多鲜为人知、出人意料的纪录！这周也要看J！<br>"
+        "关西电视台DOGA：https://ktv-smart.jp/store/series.php?id=KTV7980<br>"
+        "TVer：https://tver.jp/series/sro2am1wu6</p>"
+    )
+    plans = [
+        {
+            "action": "replace_text",
+            "block_id": "b1",
+            "segment_id": "b1.s1",
+            "evidence": "节目里会出现许多鲜为人知、出人意料的纪录！这周也要看J！",
+            "after": "节目里会出现许多鲜为人知、出人意料的纪录！",
+            "issue_type": "call_to_action",
+            "reason": "独立引流句，与新闻事实无关",
+            "confidence": 0.98,
+        },
+        {
+            "action": "remove_link",
+            "link_id": "l1",
+            "evidence": "关西电视台DOGA",
+            "issue_type": "media_promotion",
+            "reason": "直接引流至外部平台，与新闻事实无关",
+            "confidence": 0.98,
+        },
+    ]
+    cleaned, matches, error = apply_repair_plan(body, plans)
+    assert error is None
+    assert len(matches) == 2
+    assert "这周也要看J" not in cleaned
+    assert "ktv-smart.jp" not in cleaned
+    # The untouched sibling line must survive intact.
+    assert "tver.jp/series/sro2am1wu6" in cleaned
+    assert "节目里会出现许多鲜为人知、出人意料的纪录！" in cleaned
 
 
 def test_edge_fragment_removal_strips_both_ends() -> None:
@@ -1539,6 +1797,106 @@ def test_edge_fragment_removal_rejects_plain_news_sentence() -> None:
     assert error is not None
 
 
+@pytest.mark.parametrize(
+    ("evidence", "after", "issue_type"),
+    [
+        # 段尾媒体自荐句：品牌名里的数字（SPORT1）不算事实数字。
+        (
+            "TSV 1860慕尼黑今天客场挑战格雷特霍夫二队。SPORT1为您介绍如何观看这场比赛的直播。",
+            "TSV 1860慕尼黑今天客场挑战格雷特霍夫二队。",
+            "media_promotion",
+        ),
+        # 裸社媒账号署名，没有括号也没有引导词。
+        (
+            "南墨尔本球员在澳大利亚杯期间庆祝胜利。Instagram/@southmelbournefc",
+            "南墨尔本球员在澳大利亚杯期间庆祝胜利。",
+            "social_promotion",
+        ),
+        # 括号来源标注，全中文，靠"供图"这个来源词命中。
+        (
+            "尽管俱乐部在场上成绩不俗，普雷斯顿狮队仍深陷争议。（供图：普雷斯顿狮队）",
+            "尽管俱乐部在场上成绩不俗，普雷斯顿狮队仍深陷争议。",
+            "extraneous_content",
+        ),
+        # 括号社媒来源标注。
+        (
+            "普雷斯顿狮队球迷举起了一条令许多希腊裔澳大利亚人愤怒的横幅。（Facebook：Konstantinos Kalymnios）",
+            "普雷斯顿狮队球迷举起了一条令许多希腊裔澳大利亚人愤怒的横幅。",
+            "extraneous_content",
+        ),
+        # 段尾裸图库名。
+        (
+            "澳大利亚女足球星斯蒂芙-卡特利与前教练拉多-维多西奇捧起A联赛女足常规赛冠军奖杯。Getty",
+            "澳大利亚女足球星斯蒂芙-卡特利与前教练拉多-维多西奇捧起A联赛女足常规赛冠军奖杯。",
+            "extraneous_content",
+        ),
+        # 段尾引流句，平台名 + 行动号召。
+        (
+            "帕尔梅拉斯和纳维拉伊恩西将于周三在巴鲁埃里竞技场交锋。 ge 将进行实时跟踪 - 点击这里。",
+            "帕尔梅拉斯和纳维拉伊恩西将于周三在巴鲁埃里竞技场交锋。",
+            "traffic_generation",
+        ),
+    ],
+)
+def test_edge_fragment_removal_accepts_unlisted_residue_shapes(
+    evidence: str, after: str, issue_type: str
+) -> None:
+    """形态白名单没收录的残留写法，只要指向外部平台或账号就应放行。"""
+
+    body = f"<p>{evidence}</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": evidence,
+        "after": after,
+        "issue_type": issue_type,
+        "reason": "段尾为来源标注或引流内容，删除后剩余正文语义完整",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert matches
+    assert cleaned == f"<p>{after}</p>"
+
+
+@pytest.mark.parametrize(
+    "evidence, after",
+    [
+        # 汉字写的进球数是事实，片段里也没有任何外部平台。
+        (
+            "上半场比分一比零，下半场再进两球，最终三比零获胜。",
+            "上半场比分一比零，最终三比零获胜。",
+        ),
+        # 普通叙述句，没有可核实的外部指向。
+        (
+            "上半场比赛非常胶着。中场休息后节奏明显加快。最终主队一球小胜。",
+            "上半场比赛非常胶着。最终主队一球小胜。",
+        ),
+        # 含"观看/收看/直播"但没点名任何平台，无法核实是不是引流。
+        (
+            "球队上一轮失利。想观看这场关键战的球迷可以通过多个平台收看直播。球队仍有机会夺冠。",
+            "球队上一轮失利。球队仍有机会夺冠。",
+        ),
+    ],
+)
+def test_structural_removal_rejects_narrative_without_external_entity(
+    evidence: str, after: str
+) -> None:
+    """结构化通道要求片段指向外部实体，普通叙述句必须继续 fail-closed。"""
+
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": evidence,
+        "after": after,
+        "issue_type": "promotion",
+        "reason": "疑似推广内容，删除后不影响新闻事实",
+        "confidence": 0.98,
+    }
+    _cleaned, _matches, error = apply_repair_plan(f"<p>{evidence}</p>", plan)
+    assert error is not None
+
+
 def test_edge_fragment_removal_rejects_number_tampering() -> None:
     body = "<p>最终比分三比零，主队大胜。 google广告分区结束(name=s1)</p>"
     plan = {
@@ -1574,8 +1932,8 @@ def test_edge_fragment_removal_strips_trailing_editor_byline() -> None:
 
 
 def test_edge_fragment_removal_strips_trailing_copyright_byline() -> None:
-    # (C) 版权署名现在优先由图片署名规范化规则处理：AI 的 after 必须与
-    # 规范化结果一致，直接删除会保持原文不变（fail-closed）。
+    # (C) 版权署名既可以按系统规则规范化为图片来源，也可以按 AI 的判断整段删除，
+    # 两种结果都保留图注原文。
     body = "<p>阿隆索主帅正切身感受到防守松散的问题。(C)TOSHI TAKEYA（SOCCER DIGEST）</p>"
     delete_plan = {
         "action": "replace_text",
@@ -1586,8 +1944,11 @@ def test_edge_fragment_removal_strips_trailing_copyright_byline() -> None:
         "reason": "段尾版权署名属于模板残留，与新闻事实无关",
         "confidence": 0.98,
     }
-    _cleaned, _matches, error = apply_repair_plan(body, delete_plan)
-    assert error is not None
+    cleaned, matches, error = apply_repair_plan(body, delete_plan)
+    assert error is None
+    assert "TOSHI TAKEYA" not in cleaned
+    assert "阿隆索主帅正切身感受到防守松散的问题。" in cleaned
+    assert matches and matches[0]["validation"] == "ai_photo_credit_removal"
 
     normalize_plan = {
         "action": "replace_text",
@@ -1619,6 +1980,215 @@ def test_edge_fragment_removal_strips_trailing_lead_link_marker() -> None:
     assert error is None
     assert "导语链接" not in cleaned
     assert "新潟队" in cleaned
+
+
+def test_edge_fragment_removal_strips_trailing_reporter_email() -> None:
+    body = (
+        "<p>这是冲击四连冠的第一步。外界关注李敏成队能否迅速撕开卡塔尔的密集防守，"
+        "顺利开启金牌之旅。 /reccos23@osen.co.kr</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": (
+            "这是冲击四连冠的第一步。外界关注李敏成队能否迅速撕开卡塔尔的密集防守，"
+            "顺利开启金牌之旅。 /reccos23@osen.co.kr"
+        ),
+        "after": (
+            "这是冲击四连冠的第一步。外界关注李敏成队能否迅速撕开卡塔尔的密集防守，"
+            "顺利开启金牌之旅。"
+        ),
+        "issue_type": "extraneous_content",
+        "reason": "段尾斜杠开头的邮箱地址是来源署名残留，与新闻事实无关",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "osen.co.kr" not in cleaned
+    assert "顺利开启金牌之旅。" in cleaned
+    assert matches and matches[0]["validation"] == "ai_edge_fragment_removal"
+
+
+def test_edge_fragment_removal_strips_trailing_labelled_reporter_email() -> None:
+    body = "<p>球队宣布主力中场将在本周复出参加合练。 记者 hong@news.co.kr</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "球队宣布主力中场将在本周复出参加合练。 记者 hong@news.co.kr",
+        "after": "球队宣布主力中场将在本周复出参加合练。",
+        "issue_type": "template_artifact",
+        "reason": "段尾记者邮箱署名属于模板残留，与新闻事实无关",
+        "confidence": 0.97,
+    }
+    cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "hong@news.co.kr" not in cleaned
+    assert "本周复出" in cleaned
+
+
+def test_edge_fragment_removal_strips_trailing_labelled_photo_credit() -> None:
+    # 署名不带外层括号、直接以"图片："标签贴在段尾，括号只包住了后半段。
+    body = (
+        "<p>预计中村将在对阵安德莱赫特一战中迎来加盟后的首次首发。"
+        "图片：金子拓弥（足球文摘摄影部／JMPA代表拍摄）</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": (
+            "预计中村将在对阵安德莱赫特一战中迎来加盟后的首次首发。"
+            "图片：金子拓弥（足球文摘摄影部／JMPA代表拍摄）"
+        ),
+        "after": "预计中村将在对阵安德莱赫特一战中迎来加盟后的首次首发。",
+        "issue_type": "extraneous_content",
+        "reason": "该句末尾的图片来源署名属于模板残留，与新闻事实无关，可安全删除。",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "金子拓弥" not in cleaned
+    assert "首次首发。" in cleaned
+    assert matches and matches[0]["validation"] == "ai_edge_fragment_removal"
+
+
+def test_edge_fragment_removal_rejects_sentence_opening_with_photo_word() -> None:
+    # 以"图片"开头的完整叙述句不是署名残留，必须 fail-closed 保持原文。
+    body = (
+        "<p>球队在主场以三比一取胜，"
+        "图片来源于官方社媒的庆祝画面被大量转发并引发讨论</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": (
+            "球队在主场以三比一取胜，"
+            "图片来源于官方社媒的庆祝画面被大量转发并引发讨论"
+        ),
+        "after": "球队在主场以三比一取胜",
+        "issue_type": "extraneous_content",
+        "reason": "段尾内容看起来像图片来源署名，建议删除",
+        "confidence": 0.98,
+    }
+    cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error == "AI 文本替换不是可验证的轻微局部修复"
+    assert cleaned == body
+
+
+def test_edge_fragment_removal_allows_short_caption_remainder() -> None:
+    # 图注块本身就短：删掉白名单署名后只剩 14 个字，不应因为差一个字就整条丢弃。
+    body = "<p>阿吉雷成为瓦伦西亚新帅候选人【照片】=Getty Images</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "阿吉雷成为瓦伦西亚新帅候选人【照片】=Getty Images",
+        "after": "阿吉雷成为瓦伦西亚新帅候选人",
+        "issue_type": "extraneous_content",
+        "reason": "删除正文块末端的图片来源残留标记，该标记与新闻事实无关。",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "Getty Images" not in cleaned
+    assert cleaned == "<p>阿吉雷成为瓦伦西亚新帅候选人</p>"
+    assert matches and matches[0]["validation"] == "ai_edge_fragment_removal"
+
+
+def test_edge_fragment_removal_keeps_strict_remainder_for_structural_residue() -> None:
+    # 放宽只对逐字命中形态白名单的片段生效。裸社媒账号署名走的是结构化启发式
+    # 通道，剩余正文太短时仍必须按 15 字的严格下限 fail-closed。
+    body = "<p>球员庆祝胜利。Instagram/@southmelbournefc</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "球员庆祝胜利。Instagram/@southmelbournefc",
+        "after": "球员庆祝胜利。",
+        "issue_type": "extraneous_content",
+        "reason": "段尾裸社媒账号署名属于来源残留，与新闻事实无关",
+        "confidence": 0.98,
+    }
+    cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error == "AI 文本替换不是可验证的轻微局部修复"
+    assert cleaned == body
+
+
+def test_edge_fragment_removal_rejects_sentence_containing_email() -> None:
+    # 含邮箱的完整新闻句不是署名残留，必须 fail-closed 保持原文。
+    body = (
+        "<p>俱乐部表示球迷可通过 ticket@club.com 申请客场球票。"
+        "官方同时公布了本轮的售票时间安排。</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": (
+            "俱乐部表示球迷可通过 ticket@club.com 申请客场球票。"
+            "官方同时公布了本轮的售票时间安排。"
+        ),
+        "after": "官方同时公布了本轮的售票时间安排。",
+        "issue_type": "extraneous_content",
+        "reason": "AI 认为包含邮箱的句子属于无关内容",
+        "confidence": 0.9,
+    }
+    cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is not None
+    assert "ticket@club.com" in cleaned
+
+
+def test_edge_fragment_removal_strips_trailing_editorial_byline() -> None:
+    body = (
+        "<p>他再次强调，目标就是在主场争取夺冠。 "
+        "FOOTBALL ZONE编辑部・上原拓真 / Takuma Uehara</p>"
+    )
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": (
+            "他再次强调，目标就是在主场争取夺冠。 "
+            "FOOTBALL ZONE编辑部・上原拓真 / Takuma Uehara"
+        ),
+        "after": "他再次强调，目标就是在主场争取夺冠。",
+        "issue_type": "template_artifact",
+        "reason": "段尾编辑部与记者署名属于来源残留，与新闻事实无关",
+        "confidence": 0.98,
+    }
+    cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert "Takuma Uehara" not in cleaned
+    assert "在主场争取夺冠" in cleaned
+
+
+def test_photo_credit_removal_accepts_marker_deletion() -> None:
+    body = "<p>目前仍处于无球队状态的中场比斯马[照片]=Getty Images</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "目前仍处于无球队状态的中场比斯马[照片]=Getty Images",
+        "after": "目前仍处于无球队状态的中场比斯马",
+        "issue_type": "extraneous_content",
+        "reason": "该段末尾的图片来源标记与新闻事实无关，可安全删除",
+        "confidence": 0.99,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan)
+    assert error is None
+    assert cleaned == "<p>目前仍处于无球队状态的中场比斯马</p>"
+    assert matches and matches[0]["validation"] == "ai_photo_credit_removal"
+
+
+def test_photo_credit_removal_rejects_caption_rewrite() -> None:
+    # 只允许"规范化"或"整段删除署名"两种结果，改写图注仍然 fail-closed。
+    body = "<p>目前仍处于无球队状态的中场比斯马[照片]=Getty Images</p>"
+    plan = {
+        "action": "replace_text",
+        "block_id": "b1",
+        "evidence": "目前仍处于无球队状态的中场比斯马[照片]=Getty Images",
+        "after": "中场比斯马目前没有球队",
+        "issue_type": "extraneous_content",
+        "reason": "顺带改写图注",
+        "confidence": 0.99,
+    }
+    cleaned, _matches, error = apply_repair_plan(body, plan)
+    assert error == "图片署名替换内容与规范化结果不一致"
+    assert cleaned == body
 
 
 def test_whole_sentence_removal_strips_mid_paragraph_promotion() -> None:
@@ -1746,3 +2316,259 @@ def test_multi_plan_relocates_drifted_block_ids() -> None:
     assert applied and len(applied) == 1
     assert applied[0]["text"] == "观看 ge、Globo 和 sportv 上的全部内容"
 
+
+
+# 通用删除通道：校验层只证明"这是一次逐字删除"，"删了会不会丢事实"交给核验器。
+DUPLICATE_SENTENCE = "结果，天安综合运动场获得最高分。"
+DUPLICATE_PARAGRAPH = (
+    "绿茵场奖的评选综合了比赛监督和客队球员的评价，并纳入主裁判的评分。"
+    f"{DUPLICATE_SENTENCE}{DUPLICATE_SENTENCE}"
+    "天安市公社持续改善草皮密度，维持场地最佳状态。"
+)
+EXTRANEOUS_FRAGMENT = "长泽雅美、Gakki、广濑铃等人都被压过，排在第1的是……"
+EXTRANEOUS_PARAGRAPH = (
+    "据雅虎日本报道，J1联赛町田泽维亚宣布，中场增山朝阳租借加盟长崎。"
+    f"{EXTRANEOUS_FRAGMENT}"
+    "东福冈高中时期被称为“东之C罗”的增山，此前效力于神户胜利船。"
+)
+
+
+def _duplicate_sentence_plan() -> dict:
+    return {
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": DUPLICATE_PARAGRAPH,
+        "after": DUPLICATE_PARAGRAPH.replace(DUPLICATE_SENTENCE, "", 1),
+        "issue_type": "duplicate_content",
+        "reason": "该段中这句与前一句完全重复，删除后语义不变",
+        "confidence": 0.99,
+    }
+
+
+def test_delete_only_replacement_reports_interior_sentence_shape() -> None:
+    # 段内整句删除属于可证明的逐字删除，形态判定不应再要求命中残留词典。
+    removed, shape = delete_only_replacement(
+        DUPLICATE_PARAGRAPH,
+        DUPLICATE_PARAGRAPH.replace(DUPLICATE_SENTENCE, "", 1),
+    )
+    assert removed == DUPLICATE_SENTENCE
+    assert shape == "ai_whole_sentence_removal"
+
+
+def test_delete_only_replacement_rejects_rewrite() -> None:
+    # 改写而非删除：保留文字不是原文的连续片段，必须拿不到删除形态。
+    removed, shape = delete_only_replacement(
+        DUPLICATE_PARAGRAPH, "天安综合运动场在评选中排名第一。"
+    )
+    assert removed is None and shape is None
+
+
+def test_removal_is_duplicated_requires_a_second_occurrence() -> None:
+    body = f"<p>{DUPLICATE_PARAGRAPH}</p>"
+    assert removal_is_duplicated(DUPLICATE_SENTENCE, body) is True
+    assert removal_is_duplicated("天安市公社持续改善草皮密度，维持场地最佳状态。", body) is False
+
+
+def test_interior_duplicate_sentence_stays_fail_closed_without_verifier() -> None:
+    # 没有核验器时保持原有 fail-closed 行为，避免无人把关的删除。
+    body = f"<p>{DUPLICATE_PARAGRAPH}</p>"
+    cleaned, matches, error = apply_repair_plan(body, _duplicate_sentence_plan())
+    assert error == "AI 文本替换不是可验证的轻微局部修复"
+    assert cleaned == body and matches == []
+
+
+def test_verifier_authorises_interior_duplicate_sentence_removal() -> None:
+    body = f"<p>{DUPLICATE_PARAGRAPH}</p>"
+    seen: list[dict] = []
+
+    def verifier(context: dict) -> bool:
+        seen.append(context)
+        return True
+
+    cleaned, matches, error = apply_repair_plan(
+        body, _duplicate_sentence_plan(), verifier=verifier
+    )
+    assert error is None
+    assert cleaned.count(DUPLICATE_SENTENCE) == 1
+    assert matches[0]["validation"] == "ai_verified_removal"
+    assert seen[0]["removed_text"] == DUPLICATE_SENTENCE
+    assert seen[0]["shape"] == "ai_whole_sentence_removal"
+
+
+def test_verifier_veto_keeps_the_body_unchanged() -> None:
+    body = f"<p>{DUPLICATE_PARAGRAPH}</p>"
+    cleaned, matches, error = apply_repair_plan(
+        body, _duplicate_sentence_plan(), verifier=lambda context: False
+    )
+    assert error == "AI 删除内容未通过信息保全核验"
+    assert cleaned == body and matches == []
+
+
+def test_verifier_authorises_unrelated_infix_fragment_removal() -> None:
+    # #20427 形态：夹在两句之间的无关明星榜，既不含 CTA 也不命中任何残留词典。
+    body = f"<p>{EXTRANEOUS_PARAGRAPH}</p>"
+    plan = {
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": EXTRANEOUS_PARAGRAPH,
+        "after": EXTRANEOUS_PARAGRAPH.replace(EXTRANEOUS_FRAGMENT, "", 1),
+        "issue_type": "extraneous_content",
+        "reason": "该句提及明星排名，与租借新闻无关，删除后不影响新闻事实",
+        "confidence": 0.98,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan, verifier=lambda context: True)
+    assert error is None
+    assert EXTRANEOUS_FRAGMENT not in cleaned
+    assert "增山朝阳租借加盟长崎" in cleaned and "神户胜利船" in cleaned
+    assert matches[0]["validation"] == "ai_verified_removal"
+
+
+def test_verifier_cannot_authorise_a_text_rewrite() -> None:
+    # 核验器只对"逐字删除"有发言权；改写文字仍然拿不到通道。
+    body = f"<p>{DUPLICATE_PARAGRAPH}</p>"
+    plan = {
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": DUPLICATE_PARAGRAPH,
+        "after": "天安综合运动场在本赛季草皮评选中排名第一。",
+        "issue_type": "duplicate_content",
+        "reason": "改写为更简洁的表述",
+        "confidence": 0.99,
+    }
+    cleaned, matches, error = apply_repair_plan(body, plan, verifier=lambda context: True)
+    assert error == "AI 文本替换不是可验证的轻微局部修复"
+    assert cleaned == body and matches == []
+
+
+# 质检逐字指出脏内容位置后，删除计划由程序合成（模型常常报脏但拒绝给计划）。
+def test_plans_from_dirty_targets_removes_whole_block() -> None:
+    body = "<p>球队在主场以三比一取胜，下轮将客场作战。</p><p>点击这里查看完整赛程</p>"
+    plans = plans_from_dirty_targets(body, [{
+        "block_id": "b2",
+        "evidence": "点击这里查看完整赛程",
+        "issue_type": "promotion",
+        "reason": "独立推广段落，与新闻事实无关",
+    }])
+    assert len(plans) == 1
+    assert plans[0]["action"] == "remove_block"
+    assert plans[0]["block_id"] == "b2"
+    cleaned, matches, error = apply_repair_plan(body, plans)
+    assert error is None
+    assert "点击这里查看完整赛程" not in cleaned
+    assert matches[0]["issue_type"] == "promotion"
+
+
+def test_plans_from_dirty_targets_builds_replace_for_inline_dirt() -> None:
+    # 脏内容只是块里的一小截时，合成 replace_text，保留文字逐字来自原文。
+    paragraph = "球队在主场以三比一取胜。点击这里查看完整赛程。下轮他们将客场作战。"
+    body = f"<p>{paragraph}</p>"
+    plans = plans_from_dirty_targets(body, [{
+        "block_id": "b1",
+        "evidence": "点击这里查看完整赛程。",
+        "issue_type": "traffic_generation",
+        "reason": "段中引流句，与新闻事实无关",
+    }])
+    assert plans[0]["action"] == "replace_text"
+    assert plans[0]["evidence"] == paragraph
+    assert plans[0]["after"] == "球队在主场以三比一取胜。下轮他们将客场作战。"
+    cleaned, matches, error = apply_repair_plan(body, plans, verifier=lambda ctx: True)
+    assert error is None
+    assert "点击这里查看" not in cleaned
+    assert "三比一取胜" in cleaned and "客场作战" in cleaned
+
+
+def test_plans_from_dirty_targets_relocates_wrong_block_id() -> None:
+    # 块号写错但引文真实：按引文重新定位，而不是丢弃整条目标。
+    body = "<p>球队在主场以三比一取胜，下轮将客场作战。</p><p>扫码关注官方频道</p>"
+    plans = plans_from_dirty_targets(body, [{
+        "block_id": "b7",
+        "evidence": "扫码关注官方频道",
+        "issue_type": "channel_promotion",
+        "reason": "独立引流段落",
+    }])
+    assert plans[0]["block_id"] == "b2"
+    assert plans[0]["action"] == "remove_block"
+
+
+def test_plans_from_dirty_targets_skips_unquotable_target() -> None:
+    body = "<p>球队在主场以三比一取胜，下轮将客场作战。</p>"
+    assert plans_from_dirty_targets(body, [{
+        "block_id": "b1",
+        "evidence": "正文里并不存在的一段文字",
+        "issue_type": "promotion",
+        "reason": "无法逐字引用",
+    }]) == []
+
+
+def test_plans_from_dirty_targets_keeps_block_with_content() -> None:
+    # 引文等于整块时走 remove_block；若删空后块内一无所剩则不合成 replace_text。
+    body = "<p>点击这里</p>"
+    plans = plans_from_dirty_targets(body, [{
+        "block_id": "b1", "evidence": "点击这里",
+        "issue_type": "promotion", "reason": "独立推广块",
+    }])
+    assert plans[0]["action"] == "remove_block"
+
+
+def test_dirty_targets_from_semantic_validates_against_body() -> None:
+    body = "<p>球队在主场以三比一取胜。</p><p>扫码关注官方频道</p>"
+    targets = dirty_targets_from_semantic({
+        "dirty_targets": [
+            {"block_id": "b2", "evidence": "扫码关注官方频道", "issue_type": "promotion",
+             "reason": "独立引流段落"},
+            {"block_id": "b9", "evidence": "正文没有这句话", "issue_type": "promotion",
+             "reason": "无法引用"},
+        ]
+    }, body)
+    assert len(targets) == 1
+    assert targets[0]["block_id"] == "b2"
+    assert targets[0]["evidence"] == "扫码关注官方频道"
+
+
+def test_dirty_targets_from_semantic_ignores_missing_field() -> None:
+    assert dirty_targets_from_semantic({}, "<p>正文</p>") == []
+
+
+def test_plans_from_dirty_targets_merges_two_fragments_in_one_block() -> None:
+    # 同一块两条脏内容：必须合并成一条 replace_text，否则两条计划范围重叠被整份否决。
+    paragraph = "球队在主场以三比一取胜。点击这里查看赛程。下轮客场作战。扫码关注官方频道。"
+    body = f"<p>{paragraph}</p>"
+    plans = plans_from_dirty_targets(body, [
+        {"block_id": "b1", "evidence": "点击这里查看赛程。", "issue_type": "promotion",
+         "reason": "段中引流句"},
+        {"block_id": "b1", "evidence": "扫码关注官方频道。", "issue_type": "promotion",
+         "reason": "段尾引流句"},
+    ])
+    assert len(plans) == 1
+    assert plans[0]["action"] == "replace_text"
+    assert plans[0]["after"] == "球队在主场以三比一取胜。下轮客场作战。"
+    cleaned, _matches, error = apply_repair_plan(body, plans, verifier=lambda ctx: True)
+    assert error is None
+    assert "点击这里" not in cleaned and "扫码关注" not in cleaned
+    assert "三比一取胜" in cleaned and "客场作战" in cleaned
+
+
+def test_plans_from_dirty_targets_prefers_whole_block_removal() -> None:
+    # 一条目标指整块、另一条指块内片段时，整块删除优先，避免范围重叠。
+    body = "<p>球队在主场以三比一取胜，下轮将客场作战。</p><p>扫码关注官方频道</p>"
+    plans = plans_from_dirty_targets(body, [
+        {"block_id": "b2", "evidence": "官方频道", "issue_type": "promotion",
+         "reason": "引流文字"},
+        {"block_id": "b2", "evidence": "扫码关注官方频道", "issue_type": "promotion",
+         "reason": "整段引流"},
+    ])
+    assert len(plans) == 1
+    assert plans[0]["action"] == "remove_block"
+
+
+def test_known_artifact_fast_path_rejects_long_news_paragraph() -> None:
+    # 形态词典里的非锚定模式（如"观看…直播"）不得让整段新闻免检。
+    news = (
+        "据雅虎日本报道，伯恩利在当地9月6日宣布与杰米-瓦尔迪签下一份为期一年的合同，"
+        "球迷可以在本周末观看他代表新东家的首场直播比赛，"
+        "主教练尼基-海恩也对这笔签约寄予厚望，称他的经验对球队非常重要。"
+    )
+    assert len(news) > 80
+    assert removal_matches_known_artifact(news) is False
+    # 同样的措辞出现在短片段里仍然免检，快路径没有失效。
+    assert removal_matches_known_artifact("点击下方视频") is True

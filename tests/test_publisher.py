@@ -176,12 +176,12 @@ def test_publish_ready_article_passes_all_snapshot_tabs(app, monkeypatch):
             self.config = config
 
         def create_article(self, article, tabs, **kwargs):
-            assert [tab["backend_tab_id"] for tab in tabs] == [58, 349]
+            assert [tab["backend_tab_id"] for tab in tabs] == [348, 349]
             return DqdOpenDraftResult(
                 archive_id=3805555,
                 payload={"code": 0, "data": {"archive_id": 3805555}},
                 request_url="https://platform.dongqiudi.com/open/v1/do",
-                form_fields=[("tabs[]", "58"), ("tabs[]", "349")],
+                form_fields=[("tabs[]", "348"), ("tabs[]", "349")],
             )
 
     monkeypatch.setattr("app.services.publisher.DqdOpenClient", FakeClient)
@@ -189,7 +189,7 @@ def test_publish_ready_article_passes_all_snapshot_tabs(app, monkeypatch):
         tabs_by_backend_id = {
             tab["backend_tab_id"]: tab for tab in repo.list_tabs()
         }
-        first = tabs_by_backend_id[58]
+        first = tabs_by_backend_id[348]
         second = tabs_by_backend_id[349]
         repo.update_source("marca", tab_ids=[first["id"], second["id"]], enabled=True)
         article = repo.upsert_material(_ready_article())["article"]
@@ -200,13 +200,74 @@ def test_publish_ready_article_passes_all_snapshot_tabs(app, monkeypatch):
     assert result["draft_created"] == 1
 
 
+def test_publish_ready_article_never_submits_featured_tab(app, monkeypatch):
+    """「精选」is legacy-only and must never reach the backend as a column."""
+
+    class FakeClient:
+        def __init__(self, config):
+            self.config = config
+
+        def create_article(self, article, tabs, **kwargs):
+            assert tabs["backend_tab_id"] == 349
+            return DqdOpenDraftResult(
+                archive_id=3806666,
+                payload={"code": 0, "data": {"archive_id": 3806666}},
+                request_url="https://platform.dongqiudi.com/open/v1/do",
+                form_fields=[("tabs[]", "349")],
+            )
+
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", FakeClient)
+    with app.app_context():
+        tabs_by_backend_id = {
+            tab["backend_tab_id"]: tab for tab in repo.list_tabs()
+        }
+        article = repo.upsert_material(_ready_article())["article"]
+        repo.assign_article_tabs(
+            article["id"],
+            [tabs_by_backend_id[58]["id"], tabs_by_backend_id[349]["id"]],
+        )
+        repo.transition_status(article["id"], "READY_TO_PUBLISH")
+
+        result = publish_ready_articles(_open_config(app.config["DATABASE"]), get_db())
+        updated = repo.get_article(article["id"])
+        resolved_mode = repo.get_article_publish_mode(article["id"])
+
+    assert result["draft_created"] == 1
+    assert updated["status"] == "DRAFT_CREATED"
+    assert resolved_mode == 0
+
+
+@pytest.mark.parametrize(
+    ("backend_tab_id", "tab_name"), [(58, "精选"), (12, "法甲")]
+)
+def test_publish_ready_article_with_only_blocked_tab_is_mapping_blocked(
+    app, backend_tab_id, tab_name
+):
+    with app.app_context():
+        blocked = {
+            tab["backend_tab_id"]: tab for tab in repo.list_tabs()
+        }[backend_tab_id]
+        article = repo.upsert_material(_ready_article())["article"]
+        repo.assign_article_tabs(article["id"], [blocked["id"]])
+        repo.transition_status(article["id"], "READY_TO_PUBLISH")
+
+        result = publish_ready_articles(_open_config(app.config["DATABASE"]), get_db())
+        updated = repo.get_article(article["id"])
+
+    assert result["draft_created"] == 0
+    assert result["mapping_blocked"] == 1
+    assert updated["status"] == "MAPPING_BLOCKED"
+    assert tab_name in str(updated["error"] or result["items"][0]["error"])
+
+
 def test_publish_ready_article_creates_draft_and_saves_archive_id(app, monkeypatch):
     class FakeClient:
         def __init__(self, config):
             self.config = config
 
         def create_article(self, article, tab, **kwargs):
-            assert article["status"] == "READY_TO_PUBLISH"
+            # 提交前文章已被 CAS 锁定为 PUBLISHING，提交用的快照取自锁定结果。
+            assert article["status"] == "PUBLISHING"
             assert tab["backend_tab_id"]
             return DqdOpenDraftResult(
                 archive_id=3801234,
@@ -245,6 +306,74 @@ def test_publish_retry_reuses_existing_archive_id_without_remote_call(app):
     assert result["reused_existing_archive"] is True
     assert updated["status"] == "DRAFT_CREATED"
     assert updated["dqd_archive_id"] == 3802222
+
+
+def test_duplicate_request_recovers_existing_archive_without_overwriting(app, monkeypatch):
+    """A concurrent 重复请求 must not overwrite a good DRAFT_CREATED with a failure."""
+
+    class DuplicateAfterConcurrentSuccessClient:
+        def __init__(self, config):
+            self.config = config
+
+        def create_article(self, article, tabs, **kwargs):
+            # Simulate the other concurrent worker having already persisted the
+            # draft before this attempt reaches the backend.
+            repo.update_article_backend_refs(article["id"], get_db(), dqd_archive_id=6347480)
+            raise DqdOpenClientError(
+                "懂球帝创建草稿失败：重复请求",
+                status_code=200,
+                payload={"code": 0, "data": {"code": 3, "message": "创建失败"}},
+                duplicate_request=True,
+            )
+
+    monkeypatch.setattr(
+        "app.services.publisher.DqdOpenClient", DuplicateAfterConcurrentSuccessClient
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_source("marca", tab_id=tab["id"], enabled=True, connection=conn)
+        article = repo.upsert_material(_ready_article(), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(_open_config(app.config["DATABASE"]), conn, article["id"])
+        updated = repo.get_article(article["id"], conn)
+
+    assert result["reused_existing_archive"] is True
+    assert result["archive_id"] == 6347480
+    assert updated["status"] == "DRAFT_CREATED"
+    assert updated["dqd_archive_id"] == 6347480
+
+
+def test_duplicate_request_without_local_archive_enters_confirmation(app, monkeypatch):
+    """Duplicate accepted upstream but no local archive_id yet -> confirm, not fail."""
+
+    class DuplicateClient:
+        def __init__(self, config):
+            self.config = config
+
+        def create_article(self, article, tabs, **kwargs):
+            raise DqdOpenClientError(
+                "懂球帝创建草稿失败：重复请求",
+                status_code=200,
+                payload={"code": 0, "data": {"code": 3, "message": "创建失败"}},
+                duplicate_request=True,
+            )
+
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", DuplicateClient)
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_source("marca", tab_id=tab["id"], enabled=True, connection=conn)
+        article = repo.upsert_material(_ready_article(), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        with pytest.raises(DqdOpenClientError):
+            create_draft_for_article(_open_config(app.config["DATABASE"]), conn, article["id"])
+        pending = repo.get_article(article["id"], conn)
+
+    assert pending["status"] != "PUBLISH_FAILED"
+    assert pending["status"] == "DRAFT_CONFIRMING"
 
 
 def test_publish_retry_blocks_legacy_kbs_duplicate_without_remote_call(app, monkeypatch):
@@ -1182,6 +1311,54 @@ def test_ai_guard_keeps_draft_when_not_belongs(app, monkeypatch):
     assert guard["effective_publish_mode"] == 0
 
 
+def test_ai_guard_runs_after_publish_claim(app, monkeypatch):
+    """归属护栏必须在 CAS 抢占之后运行，且一次提交只调用一次。
+
+    抢占若留在提交前一刻，抓取轮末尾的发布与独立发布 worker 会同时通过状态检查、
+    各自调用一次大模型。两次结论可能相反：先落地的决定最终状态，后落地的只覆盖
+    quality_json，于是列表会同时出现「已升级直发」与「草稿已创建」。
+    """
+
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    observed = {"statuses": []}
+
+    def _spy(*args, **kwargs):
+        observed["statuses"].append(
+            repo.get_article(observed["article_id"], observed["conn"])["status"]
+        )
+        return {"belongs": True, "confidence": 0.95, "reason": "属于"}
+
+    monkeypatch.setattr("app.services.publisher.check_league_membership", _spy)
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=True,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source(
+            "marca", conn, tab_id=tab["id"], enabled=True,
+            publish_mode_override=None,
+        )
+        article = repo.upsert_material(_ready_article(), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+        observed["article_id"] = article["id"]
+        observed["conn"] = conn
+
+        create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        event_types = [
+            event["event_type"] for event in repo.list_article_events(article["id"], conn)
+        ]
+
+    assert observed["statuses"] == ["PUBLISHING"]
+    assert event_types.index("PUBLISH_CLAIMED") < event_types.index("DRAFT_RETRY_STARTED")
+
+
 def test_ai_guard_skips_check_for_source_direct_publish(app, monkeypatch):
     _GuardClient.captured = []
     calls = []
@@ -1218,6 +1395,376 @@ def test_ai_guard_skips_check_for_source_direct_publish(app, monkeypatch):
     assert _GuardClient.captured == [1]
     assert result["status"] == "PUBLISHED"
     assert updated["publish_mode"] == 1
+
+
+def test_ai_guard_cascade_to_j2_when_not_j1(app, monkeypatch):
+    """Test cascade fallback: article not belonging to 日职联 but belonging to 日职乙."""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+
+    call_count = [0]
+
+    def _mock_check(*args, **kwargs):
+        call_count[0] += 1
+        tab_name = args[2] if len(args) > 2 else kwargs.get("tab_name", "")
+        if tab_name == "日职联":
+            return {"belongs": False, "confidence": 0.95, "reason": "不属于日职联"}
+        elif tab_name == "日职乙":
+            return {"belongs": True, "confidence": 0.92, "reason": "属于日职乙"}
+        return {"belongs": False, "confidence": 0.99, "reason": "不属于"}
+
+    monkeypatch.setattr("app.services.publisher.check_league_membership", _mock_check)
+
+    with app.app_context():
+        conn = get_db()
+        j1_tab = repo.get_tab_by_name("日职联", conn)
+        j2_tab = repo.get_tab_by_name("日职乙", conn)
+
+        repo.update_tab(
+            j1_tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=True,
+            ai_league_guard_definition="日本职业足球联赛J1",
+        )
+        repo.update_tab(
+            j2_tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=False,
+            ai_league_guard_definition="日本职业足球联赛J2",
+        )
+        repo.update_source(
+            "marca", conn, tab_id=j1_tab["id"], enabled=True,
+            publish_mode_override=None,
+        )
+
+        material = _ready_article()
+        # The prefilter gates the second call, so the article must carry a J2
+        # marker the way a real 日职乙 article would.
+        material["translate_title"] = "官方：岐阜后卫平濑大加盟秋田蓝闪电"
+        article = repo.upsert_material(material, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert call_count[0] == 2  # Called twice: first for J1, then for J2
+    assert _GuardClient.captured == [1]  # Should upgrade to publish
+    assert result["status"] == "PUBLISHED"
+    assert updated["publish_mode"] == 1
+    # The article must be moved into the J2 column, not the J1 one.
+    assert j2_tab["id"] in updated["tab_ids"]
+    assert j1_tab["id"] not in updated["tab_ids"]
+    # Content tags are unrelated to columns and must survive untouched.
+    assert updated["channels"] == [11, 12]
+    guard = updated["quality"]["league_guard"]
+    assert guard["upgraded_to_publish"] is True
+    assert guard["effective_publish_mode"] == 1
+    assert guard["fallback_tab_name"] == "日职乙"
+    assert "属于「日职乙」" in guard["reason"]
+
+
+def test_ai_guard_cascade_keeps_draft_when_neither_j1_nor_j2(app, monkeypatch):
+    """Test cascade fallback: article belongs to neither 日职联 nor 日职乙."""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+
+    call_count = [0]
+
+    def _mock_check(*args, **kwargs):
+        call_count[0] += 1
+        # Both return False
+        return {"belongs": False, "confidence": 0.95, "reason": "不属于"}
+
+    monkeypatch.setattr("app.services.publisher.check_league_membership", _mock_check)
+
+    with app.app_context():
+        conn = get_db()
+        j1_tab = repo.get_tab_by_name("日职联", conn)
+        j2_tab = repo.get_tab_by_name("日职乙", conn)
+
+        repo.update_tab(
+            j1_tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=True,
+            ai_league_guard_definition="日本职业足球联赛J1",
+        )
+        repo.update_tab(
+            j2_tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=False,
+            ai_league_guard_definition="日本职业足球联赛J2",
+        )
+        repo.update_source(
+            "marca", conn, tab_id=j1_tab["id"], enabled=True,
+            publish_mode_override=None,
+        )
+
+        material = _ready_article()
+        material["translate_title"] = "官方：岐阜后卫平濑大加盟秋田蓝闪电"
+        article = repo.upsert_material(material, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert call_count[0] == 2  # Called twice: first for J1, then for J2
+    assert _GuardClient.captured == [0]  # Should stay as draft
+    assert result["status"] == "DRAFT_CREATED"
+    assert updated["publish_mode"] == 0
+    # A rejected cascade must not move the article out of its original column.
+    assert j1_tab["id"] in updated["tab_ids"]
+    guard = updated["quality"]["league_guard"]
+    assert guard["upgraded_to_publish"] is False
+    assert guard["effective_publish_mode"] == 0
+    # No candidate won, so there is no landing column. Only 日职乙 is seeded
+    # here: 亚冠精英 is not in DEFAULT_TABS, and the seed drops unresolvable
+    # targets rather than storing a dangling id.
+    assert guard["fallback_tab_name"] is None
+    assert guard["fallback_candidates"] == ["日职乙"]
+    assert "也不属于「日职乙」" in guard["reason"]
+
+
+def test_ai_guard_cascade_skips_second_call_without_fallback_keywords(app, monkeypatch):
+    """The keyword prefilter must save the second call for implausible articles."""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+
+    call_count = [0]
+
+    def _mock_check(*args, **kwargs):
+        call_count[0] += 1
+        return {"belongs": False, "confidence": 0.95, "reason": "不属于"}
+
+    monkeypatch.setattr("app.services.publisher.check_league_membership", _mock_check)
+
+    with app.app_context():
+        conn = get_db()
+        j1_tab = repo.get_tab_by_name("日职联", conn)
+        repo.update_tab(
+            j1_tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=True,
+            ai_league_guard_definition="日本职业足球联赛J1",
+        )
+        repo.update_source(
+            "marca", conn, tab_id=j1_tab["id"], enabled=True,
+            publish_mode_override=None,
+        )
+        material = _ready_article()
+        # No J2 team name anywhere: the fallback check is not worth a call.
+        material["translate_title"] = "官方：曼联发布新赛季第三球衣"
+        material["translate_body"] = "<p>曼联公布了新赛季第三球衣的设计与发售安排。</p>"
+        article = repo.upsert_material(material, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert call_count[0] == 1  # Only the primary column was checked
+    assert _GuardClient.captured == [0]
+    guard = updated["quality"]["league_guard"]
+    assert guard["upgraded_to_publish"] is False
+    assert "特征词" in guard["reason"]
+
+
+def test_ai_guard_cascade_tries_candidates_in_order(app, monkeypatch):
+    """A rejected first candidate must not stop the cascade.
+
+    Mirrors the real 韩K → [亚冠精英, 韩K2联] config: the article is rejected by
+    the primary column and by the first candidate, and is only absorbed by the
+    second one, which must be the column it lands in.
+    """
+
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+
+    asked: list[str] = []
+
+    def _mock_check(*args, **kwargs):
+        tab_name = args[2] if len(args) > 2 else kwargs.get("tab_name", "")
+        asked.append(tab_name)
+        if tab_name == "日职乙":
+            return {"belongs": True, "confidence": 0.93, "reason": "属于日职乙"}
+        return {"belongs": False, "confidence": 0.95, "reason": f"不属于{tab_name}"}
+
+    monkeypatch.setattr("app.services.publisher.check_league_membership", _mock_check)
+
+    with app.app_context():
+        conn = get_db()
+        k1_tab = repo.get_tab_by_name("韩K", conn)
+        acl_tab = repo.get_tab_by_name("亚冠精英", conn)
+        if acl_tab is None:
+            acl_tab = repo.create_tab("亚冠精英", 365, True, conn)
+        j2_tab = repo.get_tab_by_name("日职乙", conn)
+
+        repo.update_tab(
+            k1_tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=True,
+            ai_league_guard_definition="韩国K联赛1",
+            # 亚冠精英 first, 日职乙 second: only the latter accepts the article.
+            ai_fallback_tab_ids=[acl_tab["id"], j2_tab["id"]],
+        )
+        repo.update_tab(
+            acl_tab["id"], conn,
+            ai_league_guard_definition="亚足联冠军联赛精英",
+        )
+        repo.update_tab(
+            j2_tab["id"], conn,
+            ai_league_guard_definition="日本职业足球联赛J2",
+        )
+        repo.update_source(
+            "marca", conn, tab_id=k1_tab["id"], enabled=True,
+            publish_mode_override=None,
+        )
+
+        material = _ready_article()
+        # Carries both an 亚冠 marker and a J2 team, so neither candidate is
+        # gated out by the prefilter and the try order is what decides.
+        material["translate_title"] = "官方：秋田蓝闪电前锋亚冠首发"
+        article = repo.upsert_material(material, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert asked == ["韩K", "亚冠精英", "日职乙"]
+    assert _GuardClient.captured == [1]
+    guard = updated["quality"]["league_guard"]
+    assert guard["fallback_tab_name"] == "日职乙"
+    assert guard["fallback_candidates"] == ["亚冠精英", "日职乙"]
+    # It must land in the accepting column, not the first candidate.
+    assert j2_tab["id"] in updated["tab_ids"]
+    assert acl_tab["id"] not in updated["tab_ids"]
+    assert k1_tab["id"] not in updated["tab_ids"]
+    assert updated["channels"] == [11, 12]
+
+
+def test_title_dedup_does_not_overwrite_concurrently_published_article(app, monkeypatch):
+    """标题查重的结果不得覆盖另一个轮次已经落定的终态。
+
+    查重要调用大模型，期间另一个发布轮次可能已经抢占并发布成功。若用无条件
+    写回落终态，线上已发布的文章会被改写成「已取消自动发布」，运营看到的状态
+    与懂球帝实际情况相反。
+    """
+
+    def _late_dedup(config, connection, current):
+        # 模拟另一个发布轮次在查重期间已抢占并发布成功。
+        repo.transition_status(int(current["id"]), "PUBLISHED", connection)
+        return {
+            "outcome": "duplicate",
+            "matched": {"id": 999999, "title": "撞车的另一篇"},
+            "shared_channels": [11],
+            "error": "",
+        }
+
+    monkeypatch.setattr("app.services.publisher._title_dedup_gate", _late_dedup)
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True)
+        article = repo.upsert_material(_ready_article(), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = publish_ready_articles(_open_config(app.config["DATABASE"]), conn)
+        updated = repo.get_article(article["id"], conn)
+
+    assert updated["status"] == "PUBLISHED"
+    assert result["title_duplicate_skipped"] == 0
+
+
+def test_ai_guard_cascade_submits_reassigned_tab(app, monkeypatch):
+    """级联改判后必须把改判后的栏目提交给开放平台。
+
+    栏目列表在解析发布模式之前就取好了，而护栏的级联兜底是在解析过程中改写
+    数据库的。若提交前不重新读取，AI 判到「日职乙」的稿子仍会被发到「日职联」。
+    """
+
+    submitted = []
+
+    class _CapturingClient:
+        def __init__(self, config):
+            self.config = config
+
+        def create_article(self, article, tabs, **kwargs):
+            submitted.append(tabs)
+            return DqdOpenDraftResult(
+                archive_id=3814200,
+                payload={"code": 0, "data": {"archive_id": 3814200}},
+                request_url="https://platform.dongqiudi.com/open/v1/do",
+                form_fields=[],
+            )
+
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _CapturingClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *args, **kwargs: (
+            {"belongs": True, "confidence": 0.93, "reason": "属于日职乙"}
+            if (args[2] if len(args) > 2 else kwargs.get("tab_name", "")) == "日职乙"
+            else {"belongs": False, "confidence": 0.95, "reason": "不属于"}
+        ),
+    )
+
+    with app.app_context():
+        conn = get_db()
+        j1_tab = repo.get_tab_by_name("日职联", conn)
+        j2_tab = repo.get_tab_by_name("日职乙", conn)
+        repo.update_tab(
+            j1_tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=True,
+            ai_league_guard_definition="日本职业足球联赛J1",
+            ai_fallback_tab_ids=[j2_tab["id"]],
+        )
+        repo.update_tab(
+            j2_tab["id"], conn,
+            ai_league_guard_definition="日本职业足球联赛J2",
+        )
+        repo.update_source(
+            "marca", conn, tab_id=j1_tab["id"], enabled=True,
+            publish_mode_override=None,
+        )
+
+        material = _ready_article()
+        # 含 J2 球队名，兜底候选才能通过关键词前置过滤。
+        material["translate_title"] = "官方：秋田蓝闪电前锋加盟新潟天鹅"
+        article = repo.upsert_material(material, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert len(submitted) == 1
+    payload_tabs = submitted[0] if isinstance(submitted[0], list) else [submitted[0]]
+    backend_ids = {int(tab["backend_tab_id"]) for tab in payload_tabs}
+    assert int(j2_tab["backend_tab_id"]) in backend_ids
+    assert int(j1_tab["backend_tab_id"]) not in backend_ids
+    assert j2_tab["id"] in updated["tab_ids"]
+
+
+def test_update_tab_rejects_bad_fallback_candidates(app):
+    """The write path must reject self-cascade and unknown candidate ids."""
+
+    with app.app_context():
+        conn = get_db()
+        j1_tab = repo.get_tab_by_name("日职联", conn)
+
+        with pytest.raises(ValueError):
+            repo.update_tab(
+                j1_tab["id"], conn, ai_fallback_tab_ids=[j1_tab["id"]]
+            )
+        with pytest.raises(ValueError):
+            repo.update_tab(
+                j1_tab["id"], conn, ai_fallback_tab_ids=[999999]
+            )
 
 
 def test_non_chinese_downgrade_stays_draft_during_502_retry(app, monkeypatch):

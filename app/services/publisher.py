@@ -20,6 +20,7 @@ from .quality import (
     LLMService,
     analyze_body_language,
     check_league_membership,
+    should_check_fallback_tab,
 )
 
 
@@ -169,16 +170,57 @@ def _existing_draft_result(
 
 
 def _current_tabs(article: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the columns that may be submitted for *article*.
+
+    Non-publishable columns (「精选」/「法甲」) are dropped here so a legacy
+    mapping left on an article ingested before those columns stopped being
+    routed can never be sent to the backend.
+    """
+
     tabs = article.get("tabs") or []
     if tabs:
-        return [dict(tab) for tab in tabs if tab.get("backend_tab_id") not in (None, "")]
+        return [dict(tab) for tab in tabs if repo.is_publishable_tab(tab)]
     tab_id = article.get("tab_id")
     backend_tab_id = article.get("backend_tab_id")
     if tab_id in (None, "") or backend_tab_id in (None, ""):
         return []
-    return [{
+    legacy = {
         "id": tab_id,
         "backend_tab_id": backend_tab_id,
+        "name": article.get("tab_name") or "",
+    }
+    return [legacy] if repo.is_publishable_tab(legacy) else []
+
+
+def _missing_tab_message(article: dict[str, Any]) -> str:
+    """Explain why an article has no submittable column."""
+
+    dropped = [
+        str(tab.get("name") or tab.get("backend_tab_id") or "未知栏目")
+        for tab in _mapped_tabs(article)
+        if not repo.is_publishable_tab(tab)
+        and tab.get("backend_tab_id") not in (None, "")
+    ]
+    if dropped:
+        return (
+            "文章仅绑定了不可发布的栏目「"
+            + "、".join(dict.fromkeys(dropped))
+            + "」，无法创建草稿"
+        )
+    return "来源尚未绑定后台栏目，无法创建草稿"
+
+
+def _mapped_tabs(article: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return every column mapped to *article*, publishable or not."""
+
+    tabs = article.get("tabs") or []
+    if tabs:
+        return [dict(tab) for tab in tabs]
+    if article.get("tab_id") in (None, "") or article.get("backend_tab_id") in (None, ""):
+        return []
+    return [{
+        "id": article.get("tab_id"),
+        "backend_tab_id": article.get("backend_tab_id"),
         "name": article.get("tab_name") or "",
     }]
 
@@ -278,11 +320,11 @@ def _apply_language_publish_guard(
     quality_result = dict(quality) if isinstance(quality, dict) else {}
     if quality_result.get("language_check") != check:
         quality_result["language_check"] = check
+        # 与 league guard 同理：沿用数据库现值，避免回写陈旧状态。
         article = repo.save_quality(
             int(article["id"]),
             quality_result,
             connection,
-            status=str(article.get("status") or "READY_TO_PUBLISH"),
         )
     return effective_mode, article
 
@@ -314,6 +356,12 @@ def _apply_ai_league_guard(
     direct publish (mode 1) is trusted as-is and never triggers the AI check.
     Only a positive, high-confidence verdict upgrades the article to publish; any
     negative, low-confidence, or model failure keeps it as a draft (fail closed).
+
+    Cascade fallback: when the article does not belong to the guard column and
+    that column configures ``ai_fallback_tab_ids``, the candidates are checked
+    in order and the first positive, high-confidence verdict wins. A keyword
+    prefilter gates each extra call. The article is then moved into that
+    candidate column and upgraded to publish.
     """
 
     if int(configured_mode) != 0:
@@ -332,6 +380,10 @@ def _apply_ai_league_guard(
     upgrade_reason: str | None = None
     keep_reason: str | None = None
     verdict: dict[str, Any] | None = None
+    fallback_verdict: dict[str, Any] | None = None
+    fallback_tab_name: str | None = None
+    fallback_tab_id: int | None = None
+    fallback_candidates: list[str] = []
     llm = _make_league_guard_llm(config)
     if llm is None:
         keep_reason = "AI 归属校验未配置模型，维持创建草稿"
@@ -357,32 +409,118 @@ def _apply_ai_league_guard(
                     f"已升级为直接发布：{verdict['reason']}"
                 )
             else:
-                keep_reason = (
-                    f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」"
-                    f"（belongs={verdict['belongs']}, confidence={verdict['confidence']:.2f}），"
-                    f"维持创建草稿：{verdict['reason']}"
+                # Cascade: the article does not fit this column, so walk the
+                # column's configured candidates (tabs.ai_fallback_tab_ids) in
+                # order and take the first positive verdict. A cheap keyword
+                # prefilter runs per candidate so the extra calls are only paid
+                # for plausible ones.
+                article_title = str(
+                    article.get("title_final") or article.get("title") or ""
                 )
+                article_body = str(article.get("body_html") or "")
+                skipped: list[str] = []
+                rejected: list[str] = []
+                failed: list[str] = []
+                for candidate_id in repo.tab_fallback_tab_ids(guard_tab):
+                    candidate_row = repo.get_tab(int(candidate_id), connection)
+                    if candidate_row is None:
+                        continue
+                    candidate_name = str(candidate_row.get("name") or "")
+                    fallback_candidates.append(candidate_name)
+                    if not should_check_fallback_tab(
+                        article_title, article_body, candidate_name
+                    ):
+                        skipped.append(candidate_name)
+                        continue
+                    try:
+                        candidate_verdict = check_league_membership(
+                            article_title,
+                            article_body,
+                            candidate_name,
+                            str(candidate_row.get("ai_league_guard_definition") or ""),
+                            llm,
+                        )
+                    except LLMCallError as exc_fallback:
+                        failed.append(f"「{candidate_name}」({exc_fallback})")
+                        continue
+                    if (
+                        candidate_verdict["belongs"] is True
+                        and candidate_verdict["confidence"] >= LEAGUE_GUARD_MIN_CONFIDENCE
+                    ):
+                        fallback_tab_id = int(candidate_row["id"])
+                        fallback_tab_name = candidate_name
+                        fallback_verdict = candidate_verdict
+                        upgrade_reason = (
+                            f"AI 判断本篇不属于「{tab_name}」，但属于「{candidate_name}」"
+                            f"（confidence={candidate_verdict['confidence']:.2f}），"
+                            f"已归属到「{candidate_name}」并升级为直接发布："
+                            f"{candidate_verdict['reason']}"
+                        )
+                        break
+                    rejected.append(
+                        f"「{candidate_name}」"
+                        f"（belongs={candidate_verdict['belongs']}, "
+                        f"confidence={candidate_verdict['confidence']:.2f}）"
+                    )
+                if not upgrade_reason:
+                    notes: list[str] = []
+                    if rejected:
+                        notes.append("也不属于" + "、".join(rejected))
+                    if skipped:
+                        notes.append(
+                            "不含特征词跳过"
+                            + "、".join(f"「{name}」" for name in skipped)
+                        )
+                    if failed:
+                        notes.append("级联判断失败" + "、".join(failed))
+                    keep_reason = (
+                        f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」"
+                        f"（belongs={verdict['belongs']}, confidence={verdict['confidence']:.2f}）"
+                        + ("，" + "；".join(notes) if notes else "")
+                        + f"，维持创建草稿：{verdict['reason']}"
+                    )
 
     effective_mode = 1 if upgrade_reason else int(configured_mode)
+    final_tab_id = guard_tab.get("id")
+    final_tab_name = tab_name
+
+    # If cascade fallback succeeded, move the article into the fallback column.
+    # This rewrites the event column in article_tabs (keeping the generic 「精选」
+    # column); ``channels`` are DQD content tags, not columns, and must not be
+    # touched here.
+    if upgrade_reason and fallback_tab_id is not None:
+        final_tab_id = fallback_tab_id
+        final_tab_name = fallback_tab_name or ""
+        article = repo.reassign_article_event_tab(
+            int(article["id"]),
+            fallback_tab_id,
+            connection,
+        )
+
     guard_record = {
-        "tab_id": guard_tab.get("id"),
-        "tab_name": tab_name,
+        "tab_id": final_tab_id,
+        "tab_name": final_tab_name,
         "configured_publish_mode": int(configured_mode),
         "effective_publish_mode": effective_mode,
         "upgraded_to_publish": effective_mode != int(configured_mode),
         "min_confidence": LEAGUE_GUARD_MIN_CONFIDENCE,
         "verdict": verdict,
+        "fallback_verdict": fallback_verdict,
+        "fallback_tab_name": fallback_tab_name,
+        "fallback_candidates": fallback_candidates,
         "reason": upgrade_reason or keep_reason,
     }
     quality = article.get("quality")
     quality_result = dict(quality) if isinstance(quality, dict) else {}
     if quality_result.get("league_guard") != guard_record:
         quality_result["league_guard"] = guard_record
+        # 不传 status：护栏在发布流程中运行，内存里的 article 可能是抢占前的
+        # 旧快照，显式回写会把 PUBLISHING/DRAFT_CREATED 覆盖成陈旧状态。
+        # save_quality 在 status 为 None 时沿用数据库现值。
         article = repo.save_quality(
             int(article["id"]),
             quality_result,
             connection,
-            status=str(article.get("status") or "READY_TO_PUBLISH"),
         )
     if upgrade_reason:
         repo.add_article_event(
@@ -660,10 +798,11 @@ def _create_draft_attempt(
     if duplicate_of is not None:
         archive_id = int(duplicate_of.get("dqd_archive_id") or 0)
         detail = f"，已有懂球帝草稿 archive_id={archive_id}" if archive_id > 0 else ""
-        repo.transition_status(
+        repo.transition_status_if_current(
             article_id,
             "SOURCE_DUPLICATE",
             connection,
+            allowed_from=allowed_statuses,
             event_type="SOURCE_DUPLICATE_DETECTED",
             message=f"与本地文章 #{duplicate_of['id']} 的来源文章 ID 相同，已自动拦截{detail}",
             payload={
@@ -714,16 +853,40 @@ def _create_draft_attempt(
 
     tabs = _current_tabs(current)
     if not tabs:
+        blocked_message = _missing_tab_message(current)
         if block_if_missing_tab:
-            repo.transition_status(
+            repo.transition_status_if_current(
                 article_id,
                 "MAPPING_BLOCKED",
                 connection,
+                allowed_from=allowed_statuses,
                 event_type=blocked_event_type,
-                message="来源尚未绑定后台栏目，无法创建草稿",
+                message=blocked_message,
                 payload={"retry": retry, "source": current.get("source")},
             )
-        raise ValueError("来源尚未绑定后台栏目，无法创建草稿")
+        raise ValueError(blocked_message)
+
+    # 先抢占再解析发布模式：AI 归属护栏会在 _resolve_publish_mode 里调用大模型，
+    # 若抢占留在提交前，抓取轮末尾的发布与独立发布 worker 会同时跑同一篇，各自
+    # 调用一次大模型并可能得到相反结论，先落地的那一次决定最终状态，后落地的
+    # 那一次只会覆盖 quality_json，导致「已升级直发」与「草稿已创建」并存。
+    claimed = repo.transition_status_if_current(
+        article_id,
+        "PUBLISHING",
+        connection,
+        allowed_from=allowed_statuses,
+        event_type="PUBLISH_CLAIMED",
+        message="已锁定发布任务，开始解析发布模式",
+        payload={"retry": retry, "source": current.get("source")},
+    )
+    if claimed is None:
+        refreshed = repo.get_article(article_id, connection)
+        if refreshed is not None and int(refreshed.get("dqd_archive_id") or 0) > 0:
+            return _existing_draft_result(refreshed, retry=retry)
+        raise DraftClaimSkipped(
+            f"当前状态为 {refreshed.get('status_label') if refreshed else current.get('status_label') or current.get('status') or '未知'}，已有草稿创建任务正在处理"
+        )
+    current = claimed
 
     try:
         publish_mode, current = _resolve_publish_mode(current, tabs, connection, config)
@@ -732,12 +895,17 @@ def _create_draft_attempt(
             article_id,
             "MAPPING_BLOCKED",
             connection,
-            allowed_from=allowed_statuses,
+            allowed_from={"PUBLISHING"},
             event_type="PUBLISH_MODE_CONFLICT",
             message=str(exc),
             payload={"tabs": tabs, "reason": "publish_mode_conflict", "retry": retry},
         )
         raise
+
+    # 归属护栏的级联兜底会在解析发布模式时把文章改判到兜底栏目，此处必须基于
+    # 改判后的文章重新取栏目，否则提交的仍是改判前的旧栏目（AI 判到「日职乙」
+    # 却仍发到「日职联」）。改判失败时保留原栏目，不让提交因此落空。
+    tabs = _current_tabs(current) or tabs
 
     try:
         publish_account, current = _publish_account_for_attempt(current, connection)
@@ -746,7 +914,7 @@ def _create_draft_attempt(
             article_id,
             "PUBLISH_FAILED",
             connection,
-            allowed_from=allowed_statuses,
+            allowed_from={"PUBLISHING"},
             event_type=blocked_event_type,
             message=str(exc)[:300],
             payload={
@@ -758,11 +926,13 @@ def _create_draft_attempt(
         raise
     account_payload = _publish_account_payload(publish_account)
 
+    # 状态已是 PUBLISHING，这里不再改变状态，只为保留带 publish_mode 的开始事件。
+    # 仍走 CAS：若期间被超时恢复抢走，返回 None 并按已有任务处理。
     claimed = repo.transition_status_if_current(
         article_id,
         "PUBLISHING",
         connection,
-        allowed_from=allowed_statuses,
+        allowed_from={"PUBLISHING"},
         event_type=start_event_type,
         message=start_message,
         payload={
@@ -856,6 +1026,45 @@ def _create_draft_attempt(
             payload["response_payload"] = exc.payload
         if getattr(exc, "diagnostics", None):
             payload["diagnostics"] = exc.diagnostics
+
+        # A "重复请求" (duplicate) signal, or any error raised after a draft was
+        # already persisted, means the draft exists upstream. Never overwrite a
+        # good archive_id with PUBLISH_FAILED; recover the success state instead.
+        duplicate_request = bool(getattr(exc, "duplicate_request", False))
+        existing = repo.get_article(article_id, connection)
+        existing_archive_id = int((existing or {}).get("dqd_archive_id") or 0)
+        if existing_archive_id > 0:
+            recovered_status = _success_status(publish_mode)
+            repo.transition_status_if_current(
+                article_id,
+                recovered_status,
+                connection,
+                allowed_from={"PUBLISHING"},
+                event_type="PUBLISHED" if publish_mode else success_event_type,
+                message=(
+                    f"检测到已创建草稿，忽略重复请求，archive_id={existing_archive_id}"
+                    if duplicate_request
+                    else f"提交返回错误但草稿已存在，保留成功状态，archive_id={existing_archive_id}"
+                ),
+                payload={
+                    **payload,
+                    "archive_id": existing_archive_id,
+                    "draft_url": build_draft_url(existing_archive_id),
+                    "duplicate_request": duplicate_request,
+                    "result_status": recovered_status,
+                },
+            )
+            return _existing_draft_result(
+                existing,
+                retry=retry,
+                status=recovered_status,
+            )
+        if duplicate_request:
+            # Duplicate accepted upstream but no local archive_id yet: treat
+            # as result_unknown so the confirmation flow can fetch it back.
+            exc.result_unknown = True
+            payload["result_unknown"] = True
+
         if exc.result_unknown:
             request_id = _upstream_request_id(exc.diagnostics)
             next_confirm_at, message = _initial_confirmation_schedule(config, exc)
@@ -1018,6 +1227,8 @@ def confirm_due_draft_results(
             publish_mode, claimed = _resolve_publish_mode(
                 claimed, tabs, connection, config
             )
+            # 与创建草稿路径同理：解析发布模式时护栏可能改判栏目，重新取一次。
+            tabs = _current_tabs(claimed) or tabs
             expected_updated_at = claimed.get("updated_at")
             account, claimed = _publish_account_for_attempt(claimed, connection)
             expected_updated_at = claimed.get("updated_at")
@@ -1305,10 +1516,11 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
         # terminal state on ingest), but guard against a stale mode anyway.
         if repo.resolve_article_publish_mode(article_id, connection).get("publish_mode") == 2:
             skipped += 1
-            repo.transition_status(
+            repo.transition_status_if_current(
                 article_id,
                 "ABANDONED",
                 connection,
+                allowed_from={"READY_TO_PUBLISH"},
                 event_type="ARTICLE_ABANDONED",
                 message="命中放弃配置，跳过提交",
             )
@@ -1316,15 +1528,18 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
         duplicate_of = repo.get_duplicate_canonical(article_id, connection)
         if duplicate_of is not None:
             skipped += 1
-            duplicate_skipped += 1
-            repo.transition_status(
+            blocked = repo.transition_status_if_current(
                 article_id,
                 "SOURCE_DUPLICATE",
                 connection,
+                allowed_from={"READY_TO_PUBLISH"},
                 event_type="SOURCE_DUPLICATE_DETECTED",
                 message=f"与本地文章 #{duplicate_of['id']} 的来源文章 ID 相同，已自动拦截",
                 payload={"duplicate_of_article_id": int(duplicate_of["id"])},
             )
+            if blocked is None:
+                continue
+            duplicate_skipped += 1
             result_items.append({
                 "article_id": article_id,
                 "source": current.get("source"),
@@ -1335,13 +1550,15 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
         dedup_result = _title_dedup_gate(config, connection, current)
         if dedup_result is not None and dedup_result["outcome"] in {"duplicate", "needs_review"}:
             skipped += 1
+            # 查重要调用大模型，期间另一个发布轮次可能已经抢占并提交成功。必须
+            # 用 CAS 落终态，否则会把线上已发布的文章改写成「已取消自动发布」。
             if dedup_result["outcome"] == "duplicate":
-                title_duplicate_skipped += 1
                 matched = dedup_result["matched"] or {}
-                repo.transition_status(
+                blocked = repo.transition_status_if_current(
                     article_id,
                     "TITLE_DUPLICATE",
                     connection,
+                    allowed_from={"READY_TO_PUBLISH"},
                     event_type="TITLE_DUPLICATE_DETECTED",
                     message=(
                         f"与文章 #{matched.get('id')}《{matched.get('title')}》标题高度相似"
@@ -1349,16 +1566,22 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
                     ),
                     payload=dedup_result,
                 )
+                if blocked is None:
+                    continue
+                title_duplicate_skipped += 1
                 error_text = f"与文章 #{matched.get('id')} 标题高度相似，已取消自动发布"
             else:
-                repo.transition_status(
+                blocked = repo.transition_status_if_current(
                     article_id,
                     "NEEDS_REVIEW",
                     connection,
+                    allowed_from={"READY_TO_PUBLISH"},
                     event_type="TITLE_DUPLICATE_REVIEW",
                     message=f"标题查重判定失败：{dedup_result['error']}，转人工审核",
                     payload=dedup_result,
                 )
+                if blocked is None:
+                    continue
                 error_text = f"标题查重判定失败：{dedup_result['error']}，转人工审核"
             result_items.append({
                 "article_id": article_id,
@@ -1370,17 +1593,19 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
         if not _current_tabs(current):
             skipped += 1
             mapping_blocked += 1
-            repo.transition_status(
+            blocked_message = _missing_tab_message(current)
+            repo.transition_status_if_current(
                 article_id,
                 "MAPPING_BLOCKED",
                 connection,
+                allowed_from={"READY_TO_PUBLISH"},
                 event_type="DRAFT_CREATE_BLOCKED",
-                message="来源尚未绑定后台栏目，无法创建草稿",
+                message=blocked_message,
             )
             result_items.append({
                 "article_id": article_id,
                 "source": current.get("source"),
-                "error": "来源尚未绑定后台栏目",
+                "error": blocked_message,
             })
             continue
         try:

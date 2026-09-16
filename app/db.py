@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS tabs (
     fallback_litpic TEXT NOT NULL DEFAULT '',
     ai_league_guard_enabled INTEGER NOT NULL DEFAULT 0 CHECK (ai_league_guard_enabled IN (0, 1)),
     ai_league_guard_definition TEXT NOT NULL DEFAULT '',
+    ai_fallback_tab_ids TEXT NOT NULL DEFAULT '[]',
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -218,6 +219,25 @@ CREATE TABLE IF NOT EXISTS report_deliveries (
 CREATE INDEX IF NOT EXISTS idx_report_deliveries_status_retry
     ON report_deliveries(status, next_attempt_at);
 
+CREATE TABLE IF NOT EXISTS source_daily_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stat_date TEXT NOT NULL,
+    source_code TEXT NOT NULL,
+    source_name TEXT NOT NULL DEFAULT '',
+    total_count INTEGER NOT NULL,
+    published_count INTEGER NOT NULL,
+    draft_count INTEGER NOT NULL,
+    rejected_count INTEGER NOT NULL,
+    abandoned_count INTEGER NOT NULL DEFAULT 0,
+    duplicate_count INTEGER NOT NULL DEFAULT 0,
+    is_source_enabled INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(stat_date, source_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_daily_stats_date
+    ON source_daily_stats(stat_date DESC);
+
 CREATE TABLE IF NOT EXISTS open_platform_auth (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     auth_status TEXT NOT NULL DEFAULT 'UNAUTHORIZED',
@@ -309,6 +329,7 @@ def init_db(database: Optional[PathLike] = None) -> None:
         _migrate_tab_fallback_litpic(connection)
         _migrate_tab_ai_league_guard(connection)
         _seed_tab_ai_league_guard(connection)
+        seed_tab_ai_fallback(connection)
         _migrate_event_tab_routing(connection)
         _migrate_abandon_publish_mode(connection)
         seed_event_tab_rules(connection)
@@ -708,6 +729,65 @@ def _migrate_tab_ai_league_guard(connection: sqlite3.Connection) -> None:
             connection.execute(
                 "ALTER TABLE tabs ADD COLUMN ai_league_guard_definition TEXT NOT NULL DEFAULT ''"
             )
+        if "ai_fallback_tab_ids" not in columns:
+            connection.execute(
+                "ALTER TABLE tabs ADD COLUMN ai_fallback_tab_ids TEXT "
+                "NOT NULL DEFAULT '[]'"
+            )
+
+
+# When the guard rules out the current column, the article is re-checked against
+# these candidate columns in order and the first positive verdict wins. Keyed by
+# backend_tab_id so a rebuilt local ``tabs.id`` never breaks the mapping:
+#   日职联(349) → 日职乙(376), 亚冠精英(365)
+#   韩K(359)    → 亚冠精英(365), 韩K2联(381)
+# Order matters: put the column that absorbs the most traffic first so the
+# cheaper verdict is reached before paying for the next candidate.
+_TAB_AI_FALLBACK_SEEDS: tuple[tuple[int, tuple[int, ...]], ...] = (
+    (349, (376, 365)),
+    (359, (365, 381)),
+)
+
+
+def seed_tab_ai_fallback(connection: sqlite3.Connection) -> None:
+    """Point guard-enabled columns at their ordered candidate columns.
+
+    Only fills rows whose ``ai_fallback_tab_ids`` is still unset so operator
+    edits are never overwritten. Targets are resolved by ``backend_tab_id`` and
+    missing ones are dropped rather than failing startup; a source with no
+    resolvable target is skipped entirely.
+    """
+
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(tabs)").fetchall()
+    }
+    if "ai_fallback_tab_ids" not in columns:
+        return
+    backend_to_id = {
+        int(row["backend_tab_id"]): int(row["id"])
+        for row in connection.execute(
+            "SELECT id, backend_tab_id FROM tabs"
+        ).fetchall()
+    }
+    with connection:
+        for source_backend_id, target_backend_ids in _TAB_AI_FALLBACK_SEEDS:
+            source_id = backend_to_id.get(source_backend_id)
+            if source_id is None:
+                continue
+            targets = [
+                backend_to_id[backend_id]
+                for backend_id in target_backend_ids
+                if backend_id in backend_to_id
+            ]
+            if not targets:
+                continue
+            connection.execute(
+                "UPDATE tabs SET ai_fallback_tab_ids=? WHERE id=? AND ("
+                "ai_fallback_tab_ids IS NULL OR TRIM(ai_fallback_tab_ids) IN ('', '[]')"
+                ")",
+                (json.dumps(targets), source_id),
+            )
 
 
 _TAB_GUARD_SEEDS: dict[str, str] = {
@@ -804,7 +884,9 @@ _TAB_GUARD_SEEDS: dict[str, str] = {
         "1. 只看文章的主要报道对象，不做关键词匹配；仅顺带提及不算。"
         "2. 主要内容属于巴西杯、南美解放者杯、各州联赛或国家队赛事的，不收录。"
         "3. 巴甲球队参加杯赛时，只有核心报道对象仍是该巴甲球队才收录。"
-        "4. 正文信息不足以确认时，按“不属于”处理。"
+        "4. 以巴甲俱乐部或其在役球员为核心的转会、签约、续约、伤病、复出、"
+        "教练更迭与俱乐部运营新闻同样收录，不要求以某场联赛比赛为报道对象。"
+        "5. 正文信息不足以确认时，按“不属于”处理。"
     ),
     "哥伦甲": (
         "本栏目收录以哥伦比亚足球甲级联赛（Categoría Primera A，哥伦甲）为主要报道对象的文章，"

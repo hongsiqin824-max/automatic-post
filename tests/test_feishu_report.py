@@ -32,8 +32,9 @@ def test_report_period_uses_beijing_19_boundary() -> None:
 
 def test_direct_publish_report_counts_published_articles_by_snapshot_tabs(app) -> None:
     with app.app_context():
-        first = repo.create_tab("统计栏目一", 910001)
-        second = repo.create_tab("统计栏目二", 910002)
+        tabs_by_name = {tab["name"]: tab for tab in repo.list_tabs()}
+        first = tabs_by_name["日职联"]
+        second = tabs_by_name["澳超"]
         article_one = repo.upsert_material({
             "source": "report-source",
             "source_url": "https://example.com/report/1",
@@ -67,11 +68,46 @@ def test_direct_publish_report_counts_published_articles_by_snapshot_tabs(app) -
         report = repo.direct_publish_report(
             "2026-09-07T11:00:00.000Z", "2026-09-08T11:00:00.000Z", conn
         )
+        counts = {item["name"]: item["count"] for item in report["tab_counts"]}
         assert report["article_count"] == 2
-        assert report["tab_counts"] == [
-            {"name": "统计栏目一", "count": 1},
-            {"name": "统计栏目二", "count": 2},
-        ]
+        # The per-article snapshot keeps the name used at publish time, so a
+        # later rename does not drop the column from the report.
+        assert counts["日职联"] == 1
+        assert counts["澳超"] == 2
+        assert sorted(counts) == sorted(repo.REPORT_TAB_NAMES)
+
+
+def test_direct_publish_report_only_counts_tracked_columns(app) -> None:
+    with app.app_context():
+        conn = get_db()
+        with conn:
+            conn.executemany(
+                """
+                INSERT INTO articles
+                (source, source_url, status, publish_mode, published_at,
+                 published_tab_names_json)
+                VALUES ('whitelist-test', ?, 'PUBLISHED', 1,
+                        '2026-09-07T12:00:00Z', ?)
+                """,
+                [
+                    ("https://example.com/whitelist/1", '["日职联"]'),
+                    ("https://example.com/whitelist/2", '["荷甲"]'),
+                    ("https://example.com/whitelist/3", '["巴甲","精选"]'),
+                ],
+            )
+        report = repo.direct_publish_report(
+            "2026-09-07T11:00:00.000Z", "2026-09-08T11:00:00.000Z", conn
+        )
+        counts = {item["name"]: item["count"] for item in report["tab_counts"]}
+
+    # 荷甲 is published on purpose but is not part of the digest, so it is
+    # excluded from both the column detail and the deduplicated total.
+    assert report["article_count"] == 2
+    assert "荷甲" not in counts
+    assert "精选" not in counts
+    assert counts["日职联"] == 1
+    assert counts["巴甲"] == 1
+    assert counts["韩K"] == 0
 
 
 def test_direct_publish_report_uses_half_open_millisecond_boundaries(app) -> None:
@@ -87,8 +123,9 @@ def test_direct_publish_report_uses_half_open_millisecond_boundaries(app) -> Non
             conn.executemany(
                 """
                 INSERT INTO articles
-                (source, source_url, status, publish_mode, published_at)
-                VALUES ('boundary-test', ?, 'PUBLISHED', 1, ?)
+                (source, source_url, status, publish_mode, published_at,
+                 published_tab_names_json)
+                VALUES ('boundary-test', ?, 'PUBLISHED', 1, ?, '["日职联"]')
                 """,
                 [(f"https://example.com/boundary/{index}", value) for index, value in enumerate(timestamps)],
             )
@@ -98,7 +135,7 @@ def test_direct_publish_report_uses_half_open_millisecond_boundaries(app) -> Non
             conn,
         )
     assert report["article_count"] == 2
-    assert report["tab_counts"] == [{"name": "未配置栏目", "count": 2}]
+    assert {"name": "日职联", "count": 2} in report["tab_counts"]
 
 
 def test_confirmed_direct_publish_gets_time_and_tab_snapshot(app) -> None:

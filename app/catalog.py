@@ -157,7 +157,7 @@ def seed_catalog(connection=None) -> dict:
     """
 
     from . import repository
-    from .db import get_db, seed_event_tab_rules
+    from .db import get_db, seed_event_tab_rules, seed_tab_ai_fallback
 
     conn = connection or get_db()
     already_seeded = bool(repository.get_setting("default_catalog_seeded", False, conn))
@@ -171,4 +171,5 @@ def seed_catalog(connection=None) -> dict:
     # init_db() runs before the catalog is populated on a fresh database.
     # Run the idempotent rule seed again now that target tabs exist.
     seed_event_tab_rules(conn)
+    seed_tab_ai_fallback(conn)
     return result

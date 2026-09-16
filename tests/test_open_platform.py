@@ -571,6 +571,9 @@ def test_create_article_reports_nested_business_failure(
     assert raised.value.diagnostics["request_id"] == "request-123"
     assert raised.value.result_unknown is (inner_data.get("code") == 5)
     assert raised.value.diagnostics["result_unknown"] is (inner_data.get("code") == 5)
+    expected_duplicate = inner_data.get("code") == 3
+    assert raised.value.duplicate_request is expected_duplicate
+    assert raised.value.diagnostics.get("duplicate_request", False) is expected_duplicate
 
 
 def test_create_article_keeps_missing_archive_id_fallback_for_ambiguous_success(app, monkeypatch):

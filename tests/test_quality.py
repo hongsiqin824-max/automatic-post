@@ -8,6 +8,7 @@ from app.services.quality import (
     html_to_text,
     is_photo_credit_advisory_plan,
     plan_local_repair,
+    verify_removal_keeps_facts,
 )
 
 
@@ -876,3 +877,93 @@ def test_photo_advisory_requires_explicit_credit_format_and_exact_evidence():
         plan,
         body="<p>球员赛后展示照片。</p>",
     )
+
+
+class _StubVerifierLLM:
+    """最小 LLM 替身：直接返回预置的核验 JSON 或抛出预置异常。"""
+
+    configured = True
+    model = "stub-verifier"
+    timeout = 10
+
+    def __init__(self, payload=None, error=None):
+        self._payload = payload
+        self._error = error
+        self.prompts: list[str] = []
+
+    def chat_json(self, prompt):
+        self.prompts.append(prompt)
+        if self._error is not None:
+            raise self._error
+        return self._payload
+
+
+def test_verify_removal_accepts_confident_no_fact_loss() -> None:
+    llm = _StubVerifierLLM({"loses_fact": False, "confidence": 0.96, "reason": "仅推广内容"})
+    result = verify_removal_keeps_facts(
+        removed_text="请关注我们的官方频道获取最新消息",
+        kept_text="球队在主场以三比一取胜。",
+        body="<p>球队在主场以三比一取胜。请关注我们的官方频道获取最新消息</p>",
+        llm=llm,
+    )
+    assert result["safe"] is True
+    assert result["loses_fact"] is False
+    assert "请关注我们的官方频道获取最新消息" in llm.prompts[0]
+
+
+def test_verify_removal_rejects_fact_loss() -> None:
+    llm = _StubVerifierLLM({"loses_fact": True, "confidence": 0.99, "reason": "含比分"})
+    result = verify_removal_keeps_facts(
+        removed_text="下半场补时阶段又追加一球。",
+        kept_text="球队在主场取胜。",
+        body="<p>球队在主场取胜。下半场补时阶段又追加一球。</p>",
+        llm=llm,
+    )
+    assert result["safe"] is False
+
+
+def test_verify_removal_rejects_low_confidence() -> None:
+    llm = _StubVerifierLLM({"loses_fact": False, "confidence": 0.7, "reason": "不太确定"})
+    result = verify_removal_keeps_facts(
+        removed_text="某段内容",
+        kept_text="保留内容",
+        body="<p>保留内容某段内容</p>",
+        llm=llm,
+    )
+    assert result["safe"] is False
+
+
+def test_verify_removal_fails_closed_on_malformed_payload() -> None:
+    llm = _StubVerifierLLM({"loses_fact": "no", "confidence": 0.99})
+    result = verify_removal_keeps_facts(
+        removed_text="某段内容", kept_text="保留内容", body="<p>正文</p>", llm=llm
+    )
+    assert result["safe"] is False
+    assert result["error"] == "核验字段格式错误"
+
+
+def test_verify_removal_fails_closed_on_call_error() -> None:
+    llm = _StubVerifierLLM(
+        error=LLMCallError("核验超时", category="timeout", retryable=True)
+    )
+    result = verify_removal_keeps_facts(
+        removed_text="某段内容", kept_text="保留内容", body="<p>正文</p>", llm=llm
+    )
+    assert result["safe"] is False
+    assert "核验超时" in str(result["error"])
+
+
+def test_verify_removal_uses_fallback_model_after_primary_failure() -> None:
+    primary = _StubVerifierLLM(
+        error=LLMCallError("主模型不可用", category="connection", retryable=True)
+    )
+    fallback = _StubVerifierLLM({"loses_fact": False, "confidence": 0.95, "reason": "仅模板残留"})
+    result = verify_removal_keeps_facts(
+        removed_text="関連記事",
+        kept_text="球队在主场以三比一取胜。",
+        body="<p>球队在主场以三比一取胜。関連記事</p>",
+        llm=primary,
+        llm_fallback=fallback,
+    )
+    assert result["safe"] is True
+    assert fallback.prompts

@@ -86,6 +86,10 @@
       <section class="panel quality-panel">
         <div class="panel-head"><div><h2>质检结果</h2><p>本轮自动检查明细</p></div><span class="level-mark">B</span></div>
         {% set issues = quality.get('issues', {}) if quality else {} %}
+        {% set is_regional_sensitive = quality.get('regional_sensitive') if quality else false %}
+        {% if is_regional_sensitive %}
+        <div class="inline-alert" style="background-color: #fff3cd; border-color: #ffc107; color: #856404;"><i data-lucide="alert-triangle"></i><span><strong>地域敏感词拦截</strong><br>匹配关键词：「{{ quality.get('matched_keyword', '-') }}」<br>{{ quality.get('reason', '涉及台湾、香港、澳门相关内容需人工审核') }}</span></div>
+        {% endif %}
         {% set checks = [('标题完整', not issues.get('title_problems'), false, '完整', '不完整'), ('正文完整', not issues.get('completeness_problems'), false, '完整', '不完整'), ('广告或脏内容', (issues.get('dirty_content') or [])|length > 0, true, '是', '否'), ('需要人工审核', quality.get('needs_review'), true, '是', '否')] if quality else [] %}
         <div class="check-list">
           {% for label, value, bad_when_true, true_label, false_label in checks %}
@@ -95,7 +99,18 @@
             <div class="check-row"><span>尚未完成质检</span><b class="muted">未检测</b><i class="check-icon" data-lucide="minus-circle"></i></div>
           {% endfor %}
         </div>
-        {% if quality.reason %}<div class="quality-reason"><strong>说明</strong><p>{{ quality.reason }}</p></div>{% endif %}
+        {% if quality.reason and not is_regional_sensitive %}<div class="quality-reason"><strong>说明</strong><p>{{ quality.reason }}</p></div>{% endif %}
+        {% set repair = quality.get('promotion_repair') if quality else None %}
+        {% if repair and repair.get('outcome') in ['failed', 'error'] %}
+        <div class="quality-reason"><strong>自动修复终态</strong>
+          <p>结果：{{ '未通过安全校验或核验' if repair.get('outcome') == 'failed' else '修复过程异常' }}，正文未改动</p>
+          {% if repair.get('plan_error') %}<p>拦截原因：{{ repair.get('plan_error') }}</p>{% endif %}
+          {% if repair.get('error') %}<p>异常信息：{{ repair.get('error') }}</p>{% endif %}
+          {% for record in (repair.get('removal_verification') or []) if not record.get('safe') %}
+          <p>核验未通过：{{ record.get('verifier_reason') or record.get('error') or '删除可能丢失新闻事实' }}</p>
+          {% endfor %}
+        </div>
+        {% endif %}
       </section>
 
       <section class="panel routing-panel">

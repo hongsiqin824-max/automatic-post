@@ -79,6 +79,7 @@ EVENT_LABELS = {
     "QUALITY_RECHECK_REQUESTED": "重新执行自动质检",
     "MANUAL_REVIEW": "人工审核",
     "ALREADY_PUBLISHED_DETECTED": "发现已有文章 ID",
+    "PUBLISH_CLAIMED": "锁定发布任务",
     "DRAFT_CREATE_STARTED": "开始创建草稿",
     "DRAFT_CREATED": "草稿创建完成",
     "PUBLISHED": "直接发布完成",
@@ -236,9 +237,21 @@ def _article_view(article: dict | None) -> dict | None:
     if guard:
         verdict = guard.get("verdict") if isinstance(guard.get("verdict"), dict) else {}
         guard_tab_name = str(guard.get("tab_name") or "")
-        if guard.get("upgraded_to_publish"):
+        # 护栏结论写入 quality_json 与发布模式落定是两次独立写入，并发抢占失败的
+        # 那一次仍会留下 upgraded_to_publish=True。此时若文章实际以草稿落定，
+        # 必须显式提示升级未生效，否则列表会出现「已升级直发」与「草稿已创建」并存。
+        article_mode = article.get("publish_mode")
+        try:
+            article_mode = int(article_mode)
+        except (TypeError, ValueError):
+            article_mode = None
+        upgrade_applied = article_mode != 0
+        if guard.get("upgraded_to_publish") and upgrade_applied:
             item["league_guard_state"] = "upgraded"
             item["league_guard_label"] = f"AI：属于「{guard_tab_name}」已升级直发"
+        elif guard.get("upgraded_to_publish"):
+            item["league_guard_state"] = "stale"
+            item["league_guard_label"] = f"AI：属于「{guard_tab_name}」但升级未生效"
         elif verdict.get("belongs") is False:
             item["league_guard_state"] = "kept"
             item["league_guard_label"] = f"AI：不属于「{guard_tab_name}」维持草稿"
@@ -754,6 +767,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         conn = get_db()
         status = _status_value(request.args.get("status"))
         tab_arg = request.args.get("tab")
+        filter_type = request.args.get("filter_type") or None
         try:
             tab_id = int(tab_arg) if tab_arg else None
         except ValueError:
@@ -764,6 +778,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             source=request.args.get("source") or None,
             tab_id=tab_id,
             query=request.args.get("q") or None,
+            filter_type=filter_type,
             limit=200,
         )
         return render_template(
@@ -773,7 +788,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             sources=[_source_view(row) for row in repo.list_sources(conn)],
             status_labels={_status_key(key): value for key, value in STATUS_LABELS.items()},
             filters={"q": request.args.get("q", ""), "status": _status_key(status),
-                     "source": request.args.get("source", ""), "tab": tab_arg or ""},
+                     "source": request.args.get("source", ""), "tab": tab_arg or "",
+                     "filter_type": filter_type or ""},
         )
 
     @app.get("/articles/<int:article_id>")

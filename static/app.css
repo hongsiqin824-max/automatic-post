@@ -154,7 +154,9 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .status-ingested, .status-received, .status-pending { background: #edf1f4; color: #53616d; }
 .status-quality_checking, .status-needs_review { background: var(--amber-bg); color: var(--amber); }
 .status-ready_to_publish, .status-publishing, .status-draft_confirming { background: var(--blue-bg); color: var(--blue); }
-.status-draft_created, .status-published, .status-already_published, .status-success, .status-passed { background: var(--green-bg); color: var(--green); }
+.status-draft_created, .status-already_published, .status-success, .status-passed { background: var(--green-bg); color: var(--green); }
+.status-published { background: #3b82f6; color: #ffffff; }
+.status-regional-review { background: var(--purple-bg); color: var(--purple); }
 .status-publish_failed, .status-rejected, .status-failed, .status-error { background: var(--red-bg); color: var(--red); }
 .status-running { color: var(--blue); }
 .result-label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; }
@@ -165,6 +167,7 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .league-guard-reason { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .league-guard-kept { background: rgba(217, 119, 6, .12); color: var(--amber); }
 .league-guard-upgraded { background: rgba(22, 163, 74, .12); color: var(--green); }
+.league-guard-stale { background: var(--red-bg); color: var(--red); }
 
 .filter-bar { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 9px; margin-bottom: 17px; }
 .filter-bar label:not(.search-field), .field { display: grid; gap: 5px; }

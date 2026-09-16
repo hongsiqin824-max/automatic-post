@@ -516,6 +516,89 @@ def test_quality_preprocess_keeps_sentence_that_merely_mentions_editor():
     assert preprocess_quality_body(body) == body
 
 
+def test_quality_preprocess_strips_trailing_reporter_email():
+    # #19098/#19089：韩媒稿件段尾的记者邮箱以前只能靠 AI 判脏后再修复，
+    # AI 判定不稳定时就会带着残留发布，因此在质检前确定性删除。
+    body = (
+        "<p>这是冲击四连冠的第一步。外界关注李敏成队能否迅速撕开卡塔尔的密集防守，"
+        "顺利开启金牌之旅。 /reccos23@osen.co.kr</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == (
+        "<p>这是冲击四连冠的第一步。外界关注李敏成队能否迅速撕开卡塔尔的密集防守，"
+        "顺利开启金牌之旅。</p>"
+    )
+    assert preprocess_quality_body(cleaned) == cleaned
+    assert [item["rule"] for item in find_media_artifact_lines(body)] == [
+        "editorial_byline_tail",
+    ]
+
+
+def test_quality_preprocess_strips_trailing_editorial_department_byline():
+    # #19160：署名把"编辑部"写在媒体名之后，旧的 lead-in 规则匹配不到。
+    body = (
+        "<p>他再次强调，目标就是“在主场争取夺冠”。 "
+        "FOOTBALL ZONE编辑部・上原拓真 / Takuma Uehara</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == "<p>他再次强调，目标就是“在主场争取夺冠”。</p>"
+    assert preprocess_quality_body(cleaned) == cleaned
+    assert [item["rule"] for item in find_media_artifact_lines(body)] == [
+        "editorial_byline_tail",
+    ]
+
+
+def test_quality_preprocess_keeps_sentence_containing_email():
+    # 含邮箱的完整报道句不是署名残留，必须逐字保留。
+    body = (
+        "<p>俱乐部表示球迷可通过 ticket@club.com 申请客场球票。"
+        "官方同时公布了本轮的售票时间安排。</p>"
+    )
+
+    assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_keeps_editorial_department_sentence():
+    # "编辑部"后面没有署名分隔符时是普通句子，不能删。
+    body = "<p>俱乐部已经提出申诉，编辑部对此未予置评。</p>"
+
+    assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_strips_trailing_photo_credit_marker():
+    # #19189：图注末尾的 "[图片]=Getty Images" 既不以句号结尾也不是整行图注，
+    # 此前只能靠 AI 判脏后修复，而 AI 的计划会留下孤立的 "[图片]" 标记。
+    body = "<p>朗斯在联赛开局4场后解雇主帅[图片]=Getty Images</p>"
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == "<p>朗斯在联赛开局4场后解雇主帅</p>"
+    assert preprocess_quality_body(cleaned) == cleaned
+    assert [item["rule"] for item in find_media_artifact_lines(body)] == [
+        "photo_credit_tail",
+    ]
+
+
+def test_quality_preprocess_strips_trailing_copyright_credit_marker():
+    body = "<p>田中和卡尔弗特-勒温用膝滑庆祝胜利（右）。(C)Getty Images</p>"
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == "<p>田中和卡尔弗特-勒温用膝滑庆祝胜利（右）。</p>"
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_keeps_inline_c_in_score():
+    # 句中出现的 (C) 不是版权标记，正文必须逐字保留。
+    body = "<p>本场比赛的比分是2(C)1，主队获胜。</p>"
+
+    assert preprocess_quality_body(body) == body
+
+
 def test_quality_preprocess_strips_inline_promo_mid_paragraph():
     # 引流句夹在正常段落中间（平台词 ge + 行动号召 点击这里/跟进），
     # 只删这句，前后正文保留。

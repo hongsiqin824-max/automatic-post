@@ -518,6 +518,135 @@ def test_pipeline_replan_exception_keeps_original_body_in_review(
         conn.close()
 
 
+def _skipped_item_first_quality() -> dict:
+    """首轮质检：一条可验证的引流删除 + 一条无法验证的正文改写。"""
+
+    first = _quality(needs_review=True, reason="正文末尾存在赛程引流")
+    first["decision"] = "repairable"
+    first["issues"]["semantic_problems"] = ["正文末尾存在赛程引流"]
+    first.update({
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "repairable": True,
+            "needs_review": True,
+        },
+        "repair_plans": [
+            {
+                "block_id": "b2",
+                "action": "remove_block",
+                "evidence": PROMOTION,
+                "issue_type": "traffic_generation",
+                "reason": "该赛程入口属于引流，与新闻事实无关",
+                "confidence": 0.99,
+            },
+            {
+                "block_id": "b1",
+                "action": "replace_text",
+                "evidence": ARTICLE_TEXT,
+                "after": "澳超官方公布了新赛季安排。",
+                "issue_type": "extraneous_content",
+                "reason": "顺带精简正文表述",
+                "confidence": 0.98,
+            },
+        ],
+        "repair_plan_error": None,
+    })
+    return first
+
+
+def test_pipeline_replans_skipped_plan_items_once(app, monkeypatch) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{PROMOTION}</p>"
+    _fetch(monkeypatch, [_item("skipped-item-replan", body=body)])
+    answers = iter([_skipped_item_first_quality(), deepcopy(SECOND_PASS)])
+    quality_calls: list[dict] = []
+
+    def fake_evaluate(**kwargs):
+        quality_calls.append(kwargs)
+        return next(answers)
+
+    replanner_calls: list[dict] = []
+
+    def fake_replanner(**kwargs):
+        replanner_calls.append(kwargs)
+        return {
+            "repairable": True,
+            "reason": "已剔除无法验证的正文改写，仅保留引流删除",
+            "repair_plans": [{
+                "block_id": "b2",
+                "action": "remove_block",
+                "evidence": PROMOTION,
+                "issue_type": "traffic_generation",
+                "reason": "该赛程入口属于引流，与新闻事实无关",
+                "confidence": 0.99,
+            }],
+            "repair_plan_error": None,
+        }
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+    monkeypatch.setattr("app.services.pipeline._make_llm", lambda config: object())
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", fake_replanner)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(replanner_calls) == 1
+    assert "不是可验证的轻微局部修复" in replanner_calls[0]["validation_error"]
+    assert len(quality_calls) == 2
+    assert PROMOTION not in quality_calls[1]["body"]
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert PROMOTION not in article["body_html"]
+        assert ARTICLE_TEXT in article["body_html"]
+        replanner = article["quality"]["promotion_repair"]["repair_replanner"]
+        assert replanner["trigger"] == "skipped_plan_items"
+        assert replanner["validation_error"] is None
+    finally:
+        conn.close()
+
+
+def test_pipeline_keeps_verified_subset_when_skip_replan_fails(app, monkeypatch) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{PROMOTION}</p>"
+    _fetch(monkeypatch, [_item("skipped-item-replan-error", body=body)])
+    answers = iter([_skipped_item_first_quality(), deepcopy(SECOND_PASS)])
+
+    def fake_evaluate(**kwargs):
+        return next(answers)
+
+    replanner_calls: list[dict] = []
+
+    def failing_replanner(**kwargs):
+        replanner_calls.append(kwargs)
+        raise RuntimeError("replanner unavailable")
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+    monkeypatch.setattr("app.services.pipeline._make_llm", lambda config: object())
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", failing_replanner)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(replanner_calls) == 1
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        # 重规划不可用时保留已验证的那条删除，正文其余部分逐字不变。
+        assert PROMOTION not in article["body_html"]
+        assert ARTICLE_TEXT in article["body_html"]
+        replanner = article["quality"]["promotion_repair"]["repair_replanner"]
+        assert replanner["trigger"] == "skipped_plan_items"
+        assert replanner["repair_plan_error"] == "replanner unavailable"
+    finally:
+        conn.close()
+
+
 def test_pipeline_does_not_replan_a_confidence_safety_rejection(
     app, monkeypatch
 ) -> None:
@@ -594,9 +723,11 @@ def test_pipeline_second_quality_failure_goes_to_manual_review(app, monkeypatch)
         conn.close()
 
 
-def test_pipeline_photo_credit_only_repair_passes_second_quality_with_audit(
+def test_pipeline_photo_credit_is_stripped_before_quality_check(
     app, monkeypatch
 ) -> None:
+    # 图片版权标记统一在质检前确定性删除：AI 看不到它，也就不会再因为
+    # "该删还是该规范化"产生矛盾计划而转人工。图注与图片节点逐字保留。
     database = app.config["DATABASE"]
     _enable_source(database)
     second_image = '<img src="https://img.example/second.jpg" alt="次图">'
@@ -607,79 +738,53 @@ def test_pipeline_photo_credit_only_repair_passes_second_quality_with_audit(
     )
     _fetch(monkeypatch, [_item("photo-credit-pass", body=body)])
     calls: list[dict] = []
-    answers = iter([deepcopy(FIRST_DIRTY), deepcopy(SECOND_PASS)])
 
     def fake_evaluate(**kwargs):
         calls.append(kwargs)
-        return next(answers)
+        return deepcopy(SECOND_PASS)
 
     monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
 
     run_once(_config(database))
 
     expected_body = (
-        f"<p>{ARTICLE_TEXT}</p>{IMAGE}"
-        f"<p>{caption}（图片来源：Getty Images）</p>{second_image}"
+        f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{caption}</p>{second_image}"
     )
-    assert len(calls) == 2
-    assert calls[0]["body"] == body
-    assert calls[1]["body"] == expected_body
-    for submitted_body in (calls[0]["body"], calls[1]["body"]):
-        assert submitted_body.count("<img") == 2
-        assert submitted_body.index('/fastdfs8/promotion-test.jpg') < submitted_body.index(
-            "https://img.example/second.jpg"
-        )
+    assert len(calls) == 1
+    assert calls[0]["body"] == expected_body
+    assert "Getty Images" not in calls[0]["body"]
+    assert calls[0]["body"].count("<img") == 2
+    assert calls[0]["body"].index('/fastdfs8/promotion-test.jpg') < calls[0]["body"].index(
+        "https://img.example/second.jpg"
+    )
 
     conn = _connect(database)
     try:
         article = repo.list_articles(conn)[0]
         assert article["status"] == "READY_TO_PUBLISH"
         assert article["body_html"] == expected_body
-        repair = article["quality"]["promotion_repair"]
-        assert repair["removed_count"] == 0
-        assert repair["attribution_normalized_count"] == 1
-        assert repair["outcome"] == "passed"
-
-        events = _event_map(article["id"], conn)
-        assert [event["payload"]["quality_round"] for event in events["QUALITY_RESULT"]] == [1, 2]
-        triggered = events["AUTO_REPAIR_TRIGGERED"][0]["payload"]
-        assert triggered["match_count"] == 1
-        assert triggered["rules"] == ["photo_credit_marker"]
-        assert triggered["matched_texts"] == [
-            f"{caption} [照片]＝Getty Images"
+        preprocess = _event_map(article["id"], conn)["LINKS_REMOVED"][0]["payload"]
+        assert preprocess["applied"] is True
+        assert [item["rule"] for item in preprocess["media_artifact_lines"]] == [
+            "photo_credit_tail",
         ]
-        applied = events["AUTO_REPAIR_APPLIED"][0]["payload"]
-        assert applied["removed_count"] == 0
-        assert applied["attribution_normalized_count"] == 1
-        assert applied["attribution_only"] is True
-        assert applied["image_count_before"] == applied["image_count_after"] == 2
-        assert applied["image_sources_unchanged"] is True
-        assert applied["attribution_changes"] == [{
-            "rule": "photo_credit_marker",
-            "tag": "p",
-            "caption": caption,
-            "source": "Getty Images",
-            "before": f"{caption} [照片]＝Getty Images",
-            "after": f"{caption}（图片来源：Getty Images）",
-        }]
-        finished = events["AUTO_REPAIR_FINISHED"][0]["payload"]
-        assert finished["outcome"] == "passed"
-        assert finished["final_status"] == "READY_TO_PUBLISH"
-        assert finished["second_quality"]["needs_review"] is False
     finally:
         conn.close()
 
 
-def test_pipeline_photo_credit_repair_second_quality_failure_is_audited(
+def test_pipeline_photo_credit_strip_still_reviews_other_dirt(
     app, monkeypatch
 ) -> None:
+    # 版权标记在质检前已删除，剩余问题仍未通过质检时照常转人工，
+    # 且预处理结果不会因此回滚。
     database = app.config["DATABASE"]
     _enable_source(database)
     caption = "双方队长在赛前交换队旗"
     body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{caption} [照片]=Getty Images</p>"
     _fetch(monkeypatch, [_item("photo-credit-fail", body=body)])
-    answers = iter([deepcopy(FIRST_DIRTY), deepcopy(SECOND_FAIL)])
-    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: next(answers))
+    monkeypatch.setattr(
+        "app.services.pipeline.evaluate", lambda **kwargs: deepcopy(SECOND_FAIL)
+    )
 
     run_once(_config(database))
 
@@ -687,21 +792,9 @@ def test_pipeline_photo_credit_repair_second_quality_failure_is_audited(
     try:
         article = repo.list_articles(conn)[0]
         assert article["status"] == "NEEDS_REVIEW"
-        assert "[照片]" in article["body_html"]
-        assert f"{caption}（图片来源：Getty Images）" not in article["body_html"]
-        repair = article["quality"]["promotion_repair"]
-        assert repair["attribution_normalized_count"] == 1
-        assert repair["removed_count"] == 0
-        assert repair["outcome"] == "failed"
-        assert repair["candidate_committed"] is False
-
-        events = _event_map(article["id"], conn)
-        assert "AUTO_REPAIR_APPLIED" not in events
-        finished = events["AUTO_REPAIR_FINISHED"][0]["payload"]
-        assert finished["outcome"] == "failed"
-        assert finished["final_status"] == "NEEDS_REVIEW"
-        assert finished["destination"] == "人工审核"
-        assert finished["second_quality"]["needs_review"] is True
+        assert "[照片]" not in article["body_html"]
+        assert "Getty Images" not in article["body_html"]
+        assert caption in article["body_html"]
     finally:
         conn.close()
 
@@ -1239,6 +1332,162 @@ def test_pipeline_keeps_contradictory_remove_plan_blocked_on_second_pass(
         assert article["status"] == "NEEDS_REVIEW"
         assert article["quality"]["promotion_repair"]["outcome"] == "failed"
         assert article["quality"]["repair_plans"]
+    finally:
+        conn.close()
+
+
+def test_pipeline_runs_three_repair_rounds_until_quality_passes(
+    app, monkeypatch
+) -> None:
+    """模型每轮只报一部分脏内容时，应连续修到干净而不是转人工。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    tail = f"{ARTICLE_TEXT}Getty"
+    orphan = "里尔前锋上田绮世"
+    body = f"<p>{tail}</p><p>{orphan}</p>{IMAGE}<p>{PROMOTION}</p>"
+    _fetch(monkeypatch, [_item("three-round-repair", body=body)])
+
+    def _dirty_with_plan(plans: list[dict]) -> dict:
+        quality = deepcopy(FIRST_DIRTY)
+        quality.update({
+            "decision": "repairable",
+            "semantic_check": {
+                "title_complete": True,
+                "body_complete": True,
+                "has_ad_or_dirty": True,
+                "repairable": True,
+                "needs_review": False,
+            },
+            "repair_plans": plans,
+            "repair_plan_error": None,
+        })
+        return quality
+
+    # 第 1 轮删推广段，第 2 轮删孤立片段，第 3 轮才报出段尾的图库署名。
+    first = _dirty_with_plan([{
+        "block_id": "b3",
+        "action": "remove_block",
+        "evidence": PROMOTION,
+        "issue_type": "promotion",
+        "reason": "独立推广段落，与新闻事实无关",
+        "confidence": 0.99,
+    }])
+    second = _dirty_with_plan([{
+        "block_id": "b2",
+        "action": "remove_block",
+        "evidence": orphan,
+        "issue_type": "template_artifact",
+        "reason": "不完整的孤立片段，与正文事实无关",
+        "confidence": 0.99,
+    }])
+    third = _dirty_with_plan([{
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": tail,
+        "after": ARTICLE_TEXT,
+        "issue_type": "extraneous_content",
+        "reason": "段尾 Getty 是图库版权标记，删除后剩余正文语义完整",
+        "confidence": 0.99,
+    }])
+    answers = iter([first, second, third, deepcopy(SECOND_PASS)])
+    calls: list[dict] = []
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return next(answers)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(calls) == 4
+    assert PROMOTION not in calls[1]["body"]
+    assert orphan not in calls[2]["body"]
+    assert "Getty" not in calls[3]["body"]
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert "Getty" not in article["body_html"]
+        assert IMAGE in article["body_html"]
+        repair = article["quality"]["promotion_repair"]
+        assert repair["outcome"] == "passed"
+        assert repair["removed_count"] == 3
+        assert repair["followup_repair"]["rounds"] == 2
+        assert repair["followup_repair"]["applied"] is True
+        events = _event_map(article["id"], conn)
+        assert [
+            event["payload"]["quality_round"] for event in events["QUALITY_RESULT"]
+        ] == [1, 2, 3, 4]
+    finally:
+        conn.close()
+
+
+def test_pipeline_stops_after_the_repair_round_cap(app, monkeypatch) -> None:
+    """轮数用完仍不干净时必须转人工，不能无限调用模型。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = (
+        f"<p>{ARTICLE_TEXT}</p><p>推广段甲</p><p>推广段乙</p>"
+        f"<p>推广段丙</p><p>推广段丁</p>{IMAGE}"
+    )
+    _fetch(monkeypatch, [_item("repair-round-cap", body=body)])
+
+    def _dirty_with_plan(block_id: str, evidence: str) -> dict:
+        quality = deepcopy(FIRST_DIRTY)
+        quality.update({
+            "decision": "repairable",
+            "semantic_check": {
+                "title_complete": True,
+                "body_complete": True,
+                "has_ad_or_dirty": True,
+                "repairable": True,
+                "needs_review": False,
+            },
+            "repair_plans": [{
+                "block_id": block_id,
+                "action": "remove_block",
+                "evidence": evidence,
+                "issue_type": "promotion",
+                "reason": "独立推广段落，与新闻事实无关",
+                "confidence": 0.99,
+            }],
+            "repair_plan_error": None,
+        })
+        return quality
+
+    answers = iter([
+        _dirty_with_plan("b2", "推广段甲"),
+        _dirty_with_plan("b2", "推广段乙"),
+        _dirty_with_plan("b2", "推广段丙"),
+        _dirty_with_plan("b2", "推广段丁"),
+    ])
+    calls: list[dict] = []
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return next(answers)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"NEEDS_REVIEW": 1}
+    # 3 轮修复 + 每轮一次质检 = 4 次调用，之后不再追加。
+    assert len(calls) == 4
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "NEEDS_REVIEW"
+        # 未通过的候选正文不提交，正文保持原样。
+        assert "推广段甲" in article["body_html"]
+        repair = article["quality"]["promotion_repair"]
+        assert repair["outcome"] == "failed"
+        assert repair["applied"] is False
+        assert repair["followup_repair"]["rounds"] == 2
     finally:
         conn.close()
 
@@ -1980,3 +2229,359 @@ def test_schedule_transient_rechecks_skips_content_failures(app) -> None:
         _llm_config(database), _connect(database)
     )
     assert article_id not in scheduled
+
+
+# 段内重复句与无关插入句：模型给的都是逐字删除计划，此前被形态白名单一律否决。
+DUPLICATE_SENTENCE = "结果，天安综合运动场获得最高分。"
+DUPLICATE_PARAGRAPH = (
+    "绿茵场奖的评选综合了比赛监督和客队球员的评价，并纳入主裁判的评分。"
+    f"{DUPLICATE_SENTENCE}{DUPLICATE_SENTENCE}"
+    "天安市公社持续改善草皮密度，维持场地最佳状态。"
+)
+EXTRANEOUS_FRAGMENT = "长泽雅美、Gakki、广濑铃等人都被压过，排在第1的是……"
+EXTRANEOUS_PARAGRAPH = (
+    "据雅虎日本报道，J1联赛町田泽维亚宣布，中场增山朝阳租借加盟长崎。"
+    f"{EXTRANEOUS_FRAGMENT}"
+    "东福冈高中时期被称为“东之C罗”的增山，此前效力于神户胜利船。"
+)
+
+
+def _dirty_with_repair_plan(plans: list[dict]) -> dict:
+    quality = deepcopy(FIRST_DIRTY)
+    quality.update({
+        "decision": "repairable",
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "repairable": True,
+            "needs_review": False,
+        },
+        "repair_plans": plans,
+        "repair_plan_error": None,
+    })
+    return quality
+
+
+def test_pipeline_removes_interior_duplicate_sentence_without_model_call(
+    app, monkeypatch
+) -> None:
+    """段内重复句删除由机械判据放行：信息在正文别处仍存在，无需核验调用。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{DUPLICATE_PARAGRAPH}</p>{IMAGE}"
+    _fetch(monkeypatch, [_item("interior-duplicate", body=body)])
+    first = _dirty_with_repair_plan([{
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": DUPLICATE_PARAGRAPH,
+        "after": DUPLICATE_PARAGRAPH.replace(DUPLICATE_SENTENCE, "", 1),
+        "issue_type": "duplicate_content",
+        "reason": "该段中这句与前一句完全重复，删除后语义不变",
+        "confidence": 0.99,
+    }])
+    answers = iter([first, deepcopy(SECOND_PASS)])
+    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: next(answers))
+
+    def fail_verification(**kwargs):
+        raise AssertionError("重复内容不应触发核验调用")
+
+    monkeypatch.setattr(
+        "app.services.pipeline.verify_removal_keeps_facts", fail_verification
+    )
+
+    run_once(_config(database))
+
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert article["body_html"].count(DUPLICATE_SENTENCE) == 1
+        assert IMAGE in article["body_html"]
+        repair = article["quality"]["promotion_repair"]
+        assert repair["outcome"] == "passed"
+        assert repair["applied"] is True
+        assert repair["matches"][0]["validation"] == "ai_verified_removal"
+        assert repair["removal_verification"][0]["channel"] == "duplicate_elsewhere"
+    finally:
+        conn.close()
+
+
+def test_pipeline_removes_unrelated_fragment_after_fact_verification(
+    app, monkeypatch
+) -> None:
+    """无关插入句不命中任何残留词典，改由一次信息保全核验放行。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{EXTRANEOUS_PARAGRAPH}</p>{IMAGE}"
+    _fetch(monkeypatch, [_item("unrelated-infix", body=body)])
+    first = _dirty_with_repair_plan([{
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": EXTRANEOUS_PARAGRAPH,
+        "after": EXTRANEOUS_PARAGRAPH.replace(EXTRANEOUS_FRAGMENT, "", 1),
+        "issue_type": "extraneous_content",
+        "reason": "该句提及明星排名，与租借新闻无关，删除后不影响新闻事实",
+        "confidence": 0.98,
+    }])
+    answers = iter([first, deepcopy(SECOND_PASS)])
+    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: next(answers))
+    verifications: list[dict] = []
+
+    def fake_verification(**kwargs):
+        verifications.append(kwargs)
+        return {"safe": True, "loses_fact": False, "confidence": 0.97, "reason": "无事实丢失"}
+
+    monkeypatch.setattr(
+        "app.services.pipeline.verify_removal_keeps_facts", fake_verification
+    )
+
+    run_once(_llm_config(database))
+
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert EXTRANEOUS_FRAGMENT not in article["body_html"]
+        assert "增山朝阳租借加盟长崎" in article["body_html"]
+        assert "神户胜利船" in article["body_html"]
+        repair = article["quality"]["promotion_repair"]
+        assert repair["outcome"] == "passed"
+        assert repair["removal_verification"][0]["channel"] == "fact_verification"
+    finally:
+        conn.close()
+    # 每个片段只核验一次，计划校验的重试不应放大调用量。
+    assert len(verifications) == 1
+    assert verifications[0]["removed_text"] == EXTRANEOUS_FRAGMENT
+
+
+def test_pipeline_keeps_body_when_fact_verification_declines(app, monkeypatch) -> None:
+    """核验认为会丢事实时保持 fail-closed：正文不动，转人工并记录原因。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{EXTRANEOUS_PARAGRAPH}</p>{IMAGE}"
+    _fetch(monkeypatch, [_item("verification-veto", body=body)])
+    first = _dirty_with_repair_plan([{
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": EXTRANEOUS_PARAGRAPH,
+        "after": EXTRANEOUS_PARAGRAPH.replace(EXTRANEOUS_FRAGMENT, "", 1),
+        "issue_type": "extraneous_content",
+        "reason": "该句疑似与新闻无关",
+        "confidence": 0.98,
+    }])
+    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: deepcopy(first))
+    monkeypatch.setattr(
+        "app.services.pipeline.verify_removal_keeps_facts",
+        lambda **kwargs: {
+            "safe": False,
+            "loses_fact": True,
+            "confidence": 0.94,
+            "reason": "被删片段含删除后无法找回的信息",
+        },
+    )
+
+    run_once(_llm_config(database))
+
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "NEEDS_REVIEW"
+        assert article["body_html"] == body
+        repair = article["quality"]["promotion_repair"]
+        assert repair["applied"] is False
+        assert repair["plan_error"] == "AI 删除内容未通过信息保全核验"
+        assert repair["removal_verification"][0]["safe"] is False
+    finally:
+        conn.close()
+
+
+def test_failed_repair_retries_after_rule_version_bump(app, monkeypatch) -> None:
+    """失败的修复没有改动正文，因此校验规则升级后应允许再尝试一次。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{EXTRANEOUS_PARAGRAPH}</p>{IMAGE}"
+    _fetch(monkeypatch, [_item("rule-version-retry", body=body)])
+    plan = {
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": EXTRANEOUS_PARAGRAPH,
+        "after": EXTRANEOUS_PARAGRAPH.replace(EXTRANEOUS_FRAGMENT, "", 1),
+        "issue_type": "extraneous_content",
+        "reason": "该句提及明星排名，与租借新闻无关",
+        "confidence": 0.98,
+    }
+    monkeypatch.setattr(
+        "app.services.pipeline.evaluate",
+        lambda **kwargs: _dirty_with_repair_plan([deepcopy(plan)]),
+    )
+    monkeypatch.setattr(
+        "app.services.pipeline.verify_removal_keeps_facts",
+        lambda **kwargs: {"safe": False, "loses_fact": True, "confidence": 0.95, "reason": "保守拒绝"},
+    )
+
+    run_once(_llm_config(database))
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "NEEDS_REVIEW"
+        repo.transition_status(article["id"], "ERROR", conn, message="rerun after fix")
+    finally:
+        conn.close()
+
+    # 规则版本提升 + 核验放行：同一篇文章重新获得一次修复机会。
+    monkeypatch.setattr("app.services.pipeline.REPAIR_RULE_VERSION", 999)
+    answers = iter([_dirty_with_repair_plan([deepcopy(plan)]), deepcopy(SECOND_PASS)])
+    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: next(answers))
+    monkeypatch.setattr(
+        "app.services.pipeline.verify_removal_keeps_facts",
+        lambda **kwargs: {"safe": True, "loses_fact": False, "confidence": 0.97, "reason": "无事实丢失"},
+    )
+
+    run_once(_llm_config(database))
+
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert EXTRANEOUS_FRAGMENT not in article["body_html"]
+        assert article["quality"]["promotion_repair"]["outcome"] == "passed"
+    finally:
+        conn.close()
+
+
+def _dirty_without_plan(targets: list[dict]) -> dict:
+    """复刻线上最大一桶：报脏、给出定位、但拒绝给 repair_plans。"""
+    quality = deepcopy(FIRST_DIRTY)
+    quality.update({
+        "decision": "manual_review",
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "repairable": False,
+            "needs_review": False,
+        },
+        "repair_plans": [],
+        "repair_plan_error": None,
+        "dirty_targets": targets,
+    })
+    return quality
+
+
+def test_pipeline_synthesizes_plan_from_dirty_targets(app, monkeypatch) -> None:
+    """模型只说位置不给计划时，程序据此合成删除计划并完成修复。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    _fetch(monkeypatch, [_item("dirty-target-synthesis")])
+    first = _dirty_without_plan([{
+        "block_id": "b2",
+        "evidence": PROMOTION,
+        "issue_type": "promotion",
+        "reason": "独立推广段落，与新闻事实无关",
+    }])
+    answers = iter([first, deepcopy(SECOND_PASS)])
+    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: next(answers))
+    # 规划器不该被调用：位置已经给出，不需要再花一次调用去规划。
+    monkeypatch.setattr(
+        "app.services.pipeline.plan_local_repair",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("不应调用规划器")),
+    )
+
+    run_once(_config(database))
+
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert PROMOTION not in article["body_html"]
+        assert ARTICLE_TEXT in article["body_html"]
+        assert IMAGE in article["body_html"]
+        repair = article["quality"]["promotion_repair"]
+        assert repair["outcome"] == "passed"
+        assert repair["applied"] is True
+        assert repair["dirty_target_plans"][0]["action"] == "remove_block"
+    finally:
+        conn.close()
+
+
+def test_pipeline_falls_back_to_planner_without_dirty_targets(app, monkeypatch) -> None:
+    """没有可引用的定位时保持原路径：调用规划器，仍不可修则转人工。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    _fetch(monkeypatch, [_item("dirty-target-missing")])
+    monkeypatch.setattr(
+        "app.services.pipeline.evaluate", lambda **kwargs: _dirty_without_plan([])
+    )
+    calls: list[dict] = []
+
+    def fake_planner(**kwargs):
+        calls.append(kwargs)
+        return {"repairable": False, "reason": "无法局部处理", "repair_plans": [],
+                "repair_plan_error": None}
+
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", fake_planner)
+
+    run_once(_llm_config(database))
+
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "NEEDS_REVIEW"
+        assert PROMOTION in article["body_html"]
+        assert "dirty_target_plans" not in article["quality"]["promotion_repair"]
+    finally:
+        conn.close()
+    assert len(calls) == 1
+
+
+def test_pipeline_synthesized_inline_plan_needs_fact_verification(app, monkeypatch) -> None:
+    """合成的段内删除同样要过信息保全核验，核验否决则正文不动。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    # 刻意选一段不命中任何残留词典的文字，逼迫走核验通道而不是免检快路径。
+    tail = "顺带一提，当地的天气一直不错。"
+    paragraph = f"{ARTICLE_TEXT}{tail}"
+    body = f"<p>{paragraph}</p>{IMAGE}"
+    _fetch(monkeypatch, [_item("dirty-target-inline", body=body)])
+    monkeypatch.setattr(
+        "app.services.pipeline.evaluate",
+        lambda **kwargs: _dirty_without_plan([{
+            "block_id": "b1",
+            "evidence": tail,
+            "issue_type": "extraneous_content",
+            "reason": "段尾与本篇新闻无关的闲话",
+        }]),
+    )
+    monkeypatch.setattr(
+        "app.services.pipeline.verify_removal_keeps_facts",
+        lambda **kwargs: {"safe": False, "loses_fact": True, "confidence": 0.96,
+                          "reason": "被删片段含删除后无法找回的信息"},
+    )
+    monkeypatch.setattr(
+        "app.services.pipeline.plan_local_repair",
+        lambda **kwargs: {"repairable": False, "reason": "无法局部处理",
+                          "repair_plans": [], "repair_plan_error": None},
+    )
+
+    run_once(_llm_config(database))
+
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "NEEDS_REVIEW"
+        assert article["body_html"] == body
+        repair = article["quality"]["promotion_repair"]
+        # 核验否决 → 合成计划被丢弃 → 正文一个字都没动
+        assert repair["applied"] is False
+        assert "dirty_target_plans" not in repair
+        assert repair["removal_verification"][0]["safe"] is False
+    finally:
+        conn.close()

@@ -205,10 +205,10 @@ def test_rule_publish_action_precedes_source_override_and_tab_conflict(app):
         tabs = _configure_sources()
         repo.update_source(
             "yahoojp",
-            tab_ids=[tabs[58]["id"], tabs[348]["id"]],
+            tab_ids=[tabs[348]["id"]],
             publish_mode_override=0,
         )
-        repo.update_tab(tabs[58]["id"], publish_mode=0)
+        repo.update_tab(tabs[348]["id"], publish_mode=0)
         repo.update_tab(tabs[349]["id"], publish_mode=1)
         rule = repo.create_event_tab_rule(
             "league", "j1_conflict", tabs[349]["id"], source_code="yahoojp",
@@ -217,10 +217,15 @@ def test_rule_publish_action_precedes_source_override_and_tab_conflict(app):
         article = repo.upsert_material(
             _material("yahoojp", "publish-conflict", league="j1_conflict")
         )["article"]
+        # Routing replaces the event column, so map both columns explicitly to
+        # reproduce a genuine conflict between two publishable columns.
+        article = repo.assign_article_tabs(
+            article["id"], [tabs[348]["id"], tabs[349]["id"]]
+        )
 
         resolved = repo.resolve_article_publish_mode(article["id"])
 
-        assert article["backend_tab_ids"] == [58, 349]
+        assert article["backend_tab_ids"] == [348, 349]
         assert article["route_rule_id"] == rule["id"]
         assert resolved["tab_conflict"] is True
         assert resolved["source_publish_mode_override"] == 0

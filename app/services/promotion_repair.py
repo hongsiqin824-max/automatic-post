@@ -16,6 +16,7 @@ import html
 import math
 import re
 import unicodedata
+from collections.abc import Callable
 from html.parser import HTMLParser
 from typing import Any
 
@@ -141,7 +142,7 @@ _PRESENTATIONAL_TAG_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 _LINE_BLOCK_RE = re.compile(
-    rf"<(?P<tag>p|div|li)(?P<attrs>\s[^>]*)?>(?P<content>(?:[^<>]|<br\b[^>]*>|{_PRESENTATIONAL_TOKEN})*?)</(?P=tag)\s*>",
+    rf"<(?P<tag>p|div|li|h[1-6])(?P<attrs>\s[^>]*)?>(?P<content>(?:[^<>]|<br\b[^>]*>|{_PRESENTATIONAL_TOKEN})*?)</(?P=tag)\s*>",
     re.IGNORECASE,
 )
 _LINE_SEPARATOR_RE = re.compile(r"(?:\r\n|\r|\n|<br\b[^>]*>)", re.IGNORECASE)
@@ -180,9 +181,20 @@ _AI_PLAN_ACTION_ALIASES = {
 # A targeted repair is deliberately more conservative than a deterministic
 # feed cleanup.  The complete candidate must still pass the second quality
 # check before it can be committed.
-MAX_AI_REPAIR_PLANS = 3
+MAX_AI_REPAIR_PLANS = 5
 MIN_AI_REPAIR_CONFIDENCE = 0.95
 MAX_AI_REPAIR_REMOVED_CHARS = 600
+# 一篇稿子常有多处脏内容，而模型每轮只稳定地看到其中一部分：第一轮删掉引流块，第二轮
+# 才报出段尾的图片署名。只要上一轮质检明确给出可执行的局部修复计划，就允许再修一轮，
+# 总修复轮数不超过这个上限。每轮都跑同一套逐字校验和累计删除字数上限，最后一轮的正文
+# 仍须整体通过质检才提交。
+MAX_AI_REPAIR_ROUNDS = 3
+
+# 自动修复规则版本。一次失败的修复并没有改动正文，因此它不该像成功修复那样永久占用
+# 这篇文章的唯一一次修复机会——否则校验规则升级后，旧文章永远停在人工审核。幂等因此
+# 记录 {正文指纹, 规则版本}：同一份正文在同一规则版本下只尝试一次，规则版本提升后允许
+# 再尝试一次。升级校验逻辑时必须同时提升这个数字。
+REPAIR_RULE_VERSION = 3
 
 # The model is allowed to describe a new promotion wording without waiting
 # for a new regular expression.  These are content categories, rather than
@@ -257,7 +269,14 @@ _AI_ARTIFACT_EVIDENCE_CTA_RE = re.compile(
     r"|^(?:更多|完整).{0,30}(?:内容|资讯|新闻|赛程|视频|节目|回放)"
     r"|(?:直播(?:结束后)?还?(?:会|将)?提供?回放|提供回放)"
     r"|(?:只要|仅需|注册(?:即|后)?即?可|登录后即可).{0,20}(?:免费)?(?:观看|收看|回看)"
-    r"|(?:免费观看|免费收看|随时回看|随时观看)",
+    r"|(?:免费观看|免费收看|随时回看|随时观看)"
+    # Media-embed pointer glued to a paragraph, e.g. （见下方视频）/见下图/
+    # 详见文末视频/点击下方视频 — a promotion pointer, not a news clause. A
+    # locator word (见/详见/点击/下方/文末…) is required so an ordinary news
+    # clause that merely mentions 视频/图片 is never matched.
+    r"|(?:见|详见|点击|观看|参见)\s*(?:下方|下图|上方|文末|文中|上图|下面|以下|本文)?\s*"
+    r"(?:视频|图片|集锦|录像|回放|直播|海报)"
+    r"|(?:下方|文末|文中|以下)\s*(?:视频|图片|集锦|录像|回放|直播|海报)",
     re.IGNORECASE,
 )
 _NUMERIC_EXPRESSION_RE = re.compile(
@@ -596,6 +615,12 @@ def _is_template_residue_cleanup(evidence: str, replacement: str) -> bool:
 # is accepted so the deletion can never split a sentence into two disjoint
 # halves.  The shortest news text that must remain after the strip.
 _MIN_EDGE_REMOVAL_REMAINDER_CHARS = 15
+# 图注块本身就只有十几个字，用同一个阈值会把一条完全合格的清理计划整条丢弃：
+# "阿吉雷成为瓦伦西亚新帅候选人【照片】=Getty Images" 删掉署名后只剩 14 个字，
+# 差一个字就转人工。剩余长度阈值防的是"把正文删成残片"，而当被删片段已经逐字
+# 命中确定性形态白名单（不含结构化启发式通道）时，剩下多少字不再是安全要素，
+# 因此这种情况下下调到与整句删除同一量级的下限。
+_MIN_WHITELISTED_REMOVAL_REMAINDER_CHARS = 6
 # A removed edge fragment must itself look like template/ad residue — never an
 # ordinary reporting clause. This probe recognises the Google ad-section token
 # (English or translated), a ``name=s1`` style argument, a bracketed template
@@ -611,9 +636,47 @@ _EDGE_ARTIFACT_FRAGMENT_RE = re.compile(
     # Chinese-source editor/byline templates glued to paragraph tails, e.g.
     # 编制●足球文摘Web编辑部 / 编成●…编辑部 / 导语链接 / 文末链接.
     r"|[编編]制●.*[编編]辑部$|[编編]成●.*[编編]辑部$|[编編]辑部$"
-    r"|^导语链接$|^导语$|^正文链接$|^文末链接$"
+    # 同类署名还会把编辑部写在中间，例如
+    # "FOOTBALL ZONE编辑部・上原拓真 / Takuma Uehara"。端到端锚定、长度上限，
+    # 且片段内不得出现句末标点，普通报道句不会命中。
+    r"|^[^。！？!?\r\n]{0,40}(?:[编編]辑部|編集部)[^。！？!?\r\n]{0,40}$"
+    r"|^导语链接$|^导语$|^正文链接$|^文末链接$|^前言链接$|^前文链接$|^相关链接$|^原文链接$"
+    # Media-embed pointers glued to paragraph edges or wedged between sentences,
+    # e.g. （见下方视频）/详见文末视频/点击下方视频 — promotion pointers, not news.
+    r"|^\s*[（(]\s*见下?方?视频\s*[）)]\s*$|[（(]\s*见下?方?视频\s*[）)]"
+    r"|详见(?:文末|下方)(?:视频|图片)|点击(?:下方|文末)(?:视频|图片)"
+    # Program viewership call-to-action glued to a paragraph tail, e.g.
+    # 这周也要看J！/本周继续收看/下周也别错过节目 — a standalone tune-in prompt,
+    # not a news clause. Anchored end-to-end and length-capped so an ordinary
+    # reporting sentence that merely contains 看/观看 is never matched.
+    r"|^(?:这|本|下|每)(?:周|週)[^。！？!?\r\n]{0,4}"
+    r"(?:也|还|继续|接着|记得|别忘了|不要错过|别错过)?[^。！？!?\r\n]{0,4}"
+    r"(?:看|收看|观看|追)[^。！？!?\r\n]{0,8}[！!。]?$"
+    r"|^(?:敬请期待|千万别错过|不要错过|别错过)[^。！？!?\r\n]{0,12}[！!。]?$"
     # Copyright / agency markers such as (C)TOSHI TAKEYA（SOCCER DIGEST）.
-    r"|^\([Cc]\)[^<>。！？!?]{1,80}$",
+    r"|^\([Cc]\)[^<>。！？!?]{1,80}$"
+    # Photographer credits glued to a caption tail, e.g. （Koyo KODAMA/GEKISAKA）
+    # — a latin "name/agency" pair wrapped in brackets. Anchored end-to-end and
+    # restricted to latin letters so ordinary bracketed notes that happen to
+    # contain a slash (（4年级=京都橘高中/C大阪内定）) are never matched.
+    r"|^[（(]\s*[A-Za-z][A-Za-z.\-' ]{0,40}/\s*[A-Za-z][A-Za-z.\-' ]{0,40}\s*[）)]$"
+    # Explicitly labelled photo credits, e.g. （撮影：山田）/（Photo by AFP）.
+    r"|^[（(]\s*(?:撮影|写真|摄影|图片来源|图源|Photo(?:\s+by)?)"
+    r"\s*[：:／/]?\s*[^）)\r\n]{0,40}[）)]$"
+    # 同样的署名还会不带外层括号、直接以标签开头贴在段尾，例如
+    # "图片：金子拓弥（足球文摘摄影部／JMPA代表拍摄）"。上面那条要求整个片段被
+    # 括号包住，命中不了这种"标签：内容"形态。端到端锚定、片段内不得出现句末
+    # 标点、长度上限 60，普通报道句不会以图片署名标签开头，因此不会误命中。
+    r"|^(?:图片来源|图片|照片|图源|摄影|撮影|写真|供图|图)"
+    r"\s*[：:=／/]\s*[^。！？!?\r\n]{1,60}$"
+    # Reporter contact residue glued to a paragraph tail, e.g.
+    # "/reccos23@osen.co.kr" or "记者 hong@news.co.kr" — a byline email left by
+    # the source feed. Anchored end-to-end so the fragment must be nothing but
+    # an optional byline marker plus one address; an ordinary reporting sentence
+    # that merely mentions an email is never matched.
+    r"|^[/／|｜·・\-—]?\s*(?:记者|記者|글|文|撰文|报道|報道)?\s*[：:]?\s*"
+    r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63}){1,3}"
+    r"\s*[。．.！!]?$",
     re.IGNORECASE,
 )
 
@@ -632,16 +695,99 @@ def _is_edge_artifact_fragment(fragment: str) -> bool:
     )
 
 
-def _edge_fragment_removal(evidence: str, replacement: str) -> str | None:
+# 上面的形态白名单只能覆盖"已经见过"的残留写法，遇到新写法就会 fail-closed 转人工，
+# 这是一场打不完的地鼠游戏。下面这条结构化通道换一个抽象层级：不再追问"这个片段是不是
+# 我见过的那几种句式"，而是问"这个片段有没有指向一个外部实体或动作"。
+#
+# 上游残留的共同点是它一定要提到点什么外部的东西——平台名、图库名、社媒账号、网址，
+# 或者让读者去点/去关注；而普通的中文叙述句（"下半场再进两球"、"中场休息后节奏明显
+# 加快"）永远不会。这个判据是要素级的，新出现的写法只要还在提平台或喊行动就会命中。
+#
+# 在此之上仍保留三条排除项：片段不能长、不能含独立数字（比分、分钟数、日期），也不能
+# 含引语——这些都是新闻载荷。加上调用方强制的可删除问题类别、有效理由和置信度下限，
+# 以及修完必跑的完整质检，判断错了会被拦下来而不是发出去。
+_MAX_STRUCTURAL_REMOVAL_CHARS = 60
+# 品牌名里的数字（SPORT1、beIN）紧贴拉丁字母，不是事实数字；独立出现的数字才可能是
+# 比分、分钟数或日期，这种片段一律不走结构化通道。
+_FACTUAL_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])\d+(?![A-Za-z])")
+# 直接引语属于新闻载荷。书名号《》是作品名标记而非引语，不计入。
+_QUOTED_SPEECH_RE = re.compile(r"[“”\"「」『』]")
+# 拉丁字母串：中文体育正文里它几乎只来自平台名、图库名、账号或网址。
+_LATIN_RUN_RE = re.compile(r"[A-Za-z]{2,}")
+# 整个片段被括号包住——标注和署名的典型外形。
+_BRACKETED_FRAGMENT_RE = re.compile(r"^[（(\[【][^）)\]】]*[）)\]】][。．.]?$")
+# 括号标注里的来源类词，覆盖"（供图：X）"这类不含拉丁字母的署名。
+_SOURCE_LABEL_RE = re.compile(
+    r"供图|供图片|摄影|撮影|拍摄|图源|图片来源|视频来源|来源|版权|署名"
+    r"|photo|credit|courtesy",
+    re.IGNORECASE,
+)
+# 片段以拉丁串开头或结尾——"…庆祝胜利。Instagram/@x"、"…奖杯。Getty" 这类裸署名。
+_LATIN_EDGE_RE = re.compile(r"^[A-Za-z]|[A-Za-z][。．.]?$")
+# 引流/推广动作词。单独出现不足以删除（"想观看的球迷可以通过多个平台收看直播"没点名
+# 任何平台，无法核实），必须和拉丁串同时出现才算命中。
+_PROMOTION_VERB_RE = re.compile(
+    r"点击|关注|订阅|下载|扫码|扫描|转播|独播|播出|直播|收看|观看|跟踪|介绍|进入|前往"
+    r"|watch|follow|subscribe|download|click"
+)
+
+
+def _points_to_external_entity(text: str) -> bool:
+    """Return whether *text* references an outside platform, account or action."""
+
+    bracketed = bool(_BRACKETED_FRAGMENT_RE.match(text))
+    if bracketed and _SOURCE_LABEL_RE.search(text):
+        return True
+    if not _LATIN_RUN_RE.search(text):
+        return False
+    return bool(
+        bracketed
+        or _LATIN_EDGE_RE.search(text)
+        or _PROMOTION_VERB_RE.search(text)
+    )
+
+
+def _is_structurally_safe_removal(fragment: str) -> bool:
+    """Return whether *fragment* can be deleted on structure alone."""
+
+    text = _normalise_promotion_text(fragment)
+    if not text or len(text) > _MAX_STRUCTURAL_REMOVAL_CHARS:
+        return False
+    if _QUOTED_SPEECH_RE.search(text) or _FACTUAL_NUMBER_RE.search(text):
+        return False
+    return _points_to_external_entity(text)
+
+
+def _is_removable_fragment(fragment: str) -> bool:
+    """Return whether a removed fragment is safe to drop.
+
+    The shape whitelist is the fast path; the structural gate handles residue
+    shapes nobody has seen yet.
+    """
+
+    return _is_edge_artifact_fragment(fragment) or _is_structurally_safe_removal(fragment)
+
+
+def _edge_fragment_removal(
+    evidence: str,
+    replacement: str,
+    *,
+    require_whitelist: bool = True,
+) -> str | None:
     """Return the removed edge fragment(s) when *replacement* strips dirty ends.
 
     The kept text (``replacement``) must equal ``evidence`` with a leading
     fragment, a trailing fragment, or both removed — i.e. it is a contiguous
-    prefix, suffix, or infix of the evidence.  Every non-empty removed side must
-    look like template/ad residue and the remaining news text must stay
+    prefix, suffix, or infix of the evidence.  The remaining news text must stay
     substantial.  Returns the removed fragment text on success (both sides joined
     by a space when two ends are stripped) or ``None`` when the edit is not a safe
     edge removal.
+
+    With *require_whitelist* (the default) every removed side must also look
+    like known template/ad residue.  Callers that verify information loss
+    independently pass ``require_whitelist=False`` to get the shape check only:
+    the edit is still proven to be a verbatim deletion, but what the fragment
+    *means* is decided outside this function.
     """
 
     original = _plain_text(evidence)
@@ -659,17 +805,25 @@ def _edge_fragment_removal(evidence: str, replacement: str) -> str | None:
     trailing = original[index + len(kept):]
     if not leading.strip() and not trailing.strip():
         return None
-    if len(kept.strip()) < _MIN_EDGE_REMOVAL_REMAINDER_CHARS:
-        return None
     removed_parts: list[str] = []
     for side in (leading, trailing):
         core = side.strip()
         if not core:
             continue
-        if not _is_edge_artifact_fragment(core):
+        if require_whitelist and not _is_removable_fragment(core):
             return None
         removed_parts.append(core)
     if not removed_parts:
+        return None
+    # 只有逐字命中确定性形态白名单时才放宽剩余长度下限；结构化通道是启发式判断，
+    # 不足以支撑把正文删到只剩几个字，仍走 15 字的严格下限。
+    whitelisted = all(_is_edge_artifact_fragment(part) for part in removed_parts)
+    minimum = (
+        _MIN_WHITELISTED_REMOVAL_REMAINDER_CHARS
+        if whitelisted
+        else _MIN_EDGE_REMOVAL_REMAINDER_CHARS
+    )
+    if len(kept.strip()) < minimum:
         return None
     return " ".join(removed_parts)
 
@@ -684,16 +838,24 @@ _SENTENCE_SEPARATOR_RE = re.compile(r"([。！？!?])")
 _MIN_WHOLE_SENTENCE_CHARS = 6
 
 
-def _whole_sentence_removal(evidence: str, replacement: str) -> str | None:
+def _whole_sentence_removal(
+    evidence: str,
+    replacement: str,
+    *,
+    require_whitelist: bool = True,
+) -> str | None:
     """Return removed whole sentences when *replacement* strips dirt sentences.
 
     An AI ``replace_text`` plan may delete one or more *complete* sentences from
-    the middle of a paragraph when every removed sentence is itself an
-    unambiguous promotion / template artefact (checked by the same
-    ``_is_edge_artifact_fragment`` probe).  The remaining sentences must keep
-    their original order and be joined exactly as they appear in the evidence,
-    so no character is rewritten and no sentence is spliced.  Returns the
-    removed sentence text joined by a space, or ``None``.
+    the middle of a paragraph.  The remaining sentences must keep their original
+    order and be joined exactly as they appear in the evidence, so no character
+    is rewritten and no sentence is spliced.  Returns the removed sentence text
+    joined by a space, or ``None``.
+
+    With *require_whitelist* every removed sentence must additionally look like
+    a known promotion / template artefact (the ``_is_removable_fragment``
+    probe).  Callers that verify information loss independently pass
+    ``require_whitelist=False``; the deletion shape is still proven here.
     """
 
     original = _plain_text(evidence)
@@ -737,7 +899,7 @@ def _whole_sentence_removal(evidence: str, replacement: str) -> str | None:
         sentence = sentences[index].strip()
         if len(sentence) < _MIN_WHOLE_SENTENCE_CHARS:
             return None
-        if not _is_edge_artifact_fragment(sentence):
+        if require_whitelist and not _is_removable_fragment(sentence):
             return None
         removed_sentences.append(sentence)
     if not removed_sentences:
@@ -747,6 +909,305 @@ def _whole_sentence_removal(evidence: str, replacement: str) -> str | None:
     if len(kept_target) < _MIN_EDGE_REMOVAL_REMAINDER_CHARS:
         return None
     return " ".join(removed_sentences)
+
+
+# A removed infix fragment (a promotion pointer wedged between two kept
+# sentences, e.g. "…夺冠。（见下方视频）不过，这场…") must be at least this long so
+# a single stray character can never be silently dropped.
+_MIN_INFIX_REMOVAL_CHARS = 4
+
+
+def _infix_fragment_removal(
+    evidence: str,
+    replacement: str,
+    *,
+    require_whitelist: bool = True,
+) -> str | None:
+    """Return the removed middle fragment when *replacement* drops one infix.
+
+    A media pointer such as "（见下方视频）" is sometimes glued *between* two
+    complete sentences rather than at a paragraph edge, so ``replacement`` keeps
+    a contiguous prefix and a contiguous suffix of ``evidence`` with exactly one
+    fragment deleted from the middle.  The kept prefix and suffix must appear
+    verbatim and adjacent in ``evidence`` (no character is rewritten) and the
+    remaining news text must stay substantial.  Returns the removed fragment or
+    ``None``.
+
+    With *require_whitelist* the removed fragment must also look like known
+    template/ad residue; independent verification callers pass
+    ``require_whitelist=False``.
+    """
+
+    original = _plain_text(evidence)
+    kept = _plain_text(replacement)
+    if not original or not kept or kept == original or len(kept) >= len(original):
+        return None
+    # Find the longest common prefix and suffix; whatever sits between them in
+    # the original is the single removed infix.
+    prefix_len = 0
+    max_prefix = min(len(original), len(kept))
+    while prefix_len < max_prefix and original[prefix_len] == kept[prefix_len]:
+        prefix_len += 1
+    suffix_len = 0
+    max_suffix = min(len(original) - prefix_len, len(kept) - prefix_len)
+    while (
+        suffix_len < max_suffix
+        and original[len(original) - 1 - suffix_len] == kept[len(kept) - 1 - suffix_len]
+    ):
+        suffix_len += 1
+    # The kept text must be exactly prefix + suffix (a single contiguous cut).
+    if prefix_len + suffix_len != len(kept):
+        return None
+    removed = original[prefix_len:len(original) - suffix_len].strip()
+    if len(removed) < _MIN_INFIX_REMOVAL_CHARS:
+        return None
+    # Both kept sides must be non-empty: an edge removal is handled elsewhere.
+    if not original[:prefix_len].strip() or not original[len(original) - suffix_len:].strip():
+        return None
+    if len(kept.strip()) < _MIN_EDGE_REMOVAL_REMAINDER_CHARS:
+        return None
+    if require_whitelist and not _is_removable_fragment(removed):
+        return None
+    return removed
+
+
+def delete_only_replacement(
+    evidence: str,
+    replacement: str,
+    *,
+    require_whitelist: bool = False,
+) -> tuple[str | None, str | None]:
+    """Return ``(removed_fragment, shape)`` for a verbatim-deletion replacement.
+
+    A single entry point for the three deletion shapes a ``replace_text`` plan
+    can take: stripping a paragraph edge, deleting whole interior sentences, or
+    cutting one fragment wedged between two kept sentences.  All three guarantee
+    the kept text is assembled verbatim from the evidence, so the edit provably
+    adds and rewrites nothing.  Returns ``(None, None)`` when the replacement is
+    not a pure deletion.
+    """
+
+    for detector, shape in (
+        (_edge_fragment_removal, "ai_edge_fragment_removal"),
+        (_whole_sentence_removal, "ai_whole_sentence_removal"),
+        (_infix_fragment_removal, "ai_infix_fragment_removal"),
+    ):
+        removed = detector(evidence, replacement, require_whitelist=require_whitelist)
+        if removed is not None:
+            return removed, shape
+    return None, None
+
+
+def plans_from_dirty_targets(
+    body_html: str | None,
+    targets: Any,
+) -> list[dict[str, Any]]:
+    """Build bounded delete-only plans from verbatim dirt locations.
+
+    The quality model reliably says *where* the dirt is but often declines to
+    also emit a repair plan ("无法定位" even when the block is right there in
+    the prompt), which used to send the article straight to review.  Deriving
+    the plan here removes that dependency: the action is chosen mechanically
+    from how the quoted text sits in the document, and the result still has to
+    pass :func:`apply_repair_plan`'s verbatim validation plus the caller's
+    information-preservation verifier.
+    """
+
+    if isinstance(targets, dict):
+        targets = [targets]
+    if not isinstance(targets, list) or not targets:
+        return []
+    body = str(body_html or "")
+    blocks = content_blocks(body)
+    by_block = {str(item["block_id"]): item for item in blocks}
+    by_segment = {
+        str(segment["segment_id"]): (item, segment)
+        for item in blocks
+        for segment in (item.get("segments") or [])
+    }
+    plans: list[dict[str, Any]] = []
+    # 同一块上可能有多条脏内容目标。逐条生成会产出证据相同或范围重叠的计划，被
+    # apply_repair_plan 整份否决，所以先按块归并：整块删除优先，其次是块内不同行，
+    # 最后把同一块内的多个片段合并成一条 replace_text 一次性删掉。
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for target in targets[:MAX_AI_REPAIR_PLANS]:
+        if not isinstance(target, dict):
+            continue
+        evidence = _plain_text(str(target.get("evidence") or ""))
+        if not evidence:
+            continue
+        segment_id = str(target.get("segment_id") or "").strip().lower()
+        block_id = str(target.get("block_id") or "").strip().lower()
+        pair = by_segment.get(segment_id)
+        block = None
+        if pair is not None and evidence in pair[1]["text"]:
+            block = pair[0]
+        elif block_id in by_block and evidence in by_block[block_id]["text"]:
+            block = by_block[block_id]
+        else:
+            block = next((item for item in blocks if evidence in item["text"]), None)
+        if block is None:
+            continue
+        key = str(block["block_id"])
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append({
+            "target": target,
+            "evidence": evidence,
+            "block": block,
+            "segment": pair[1] if pair is not None and block is pair[0] else None,
+        })
+
+    for key in order:
+        items = grouped[key]
+        block = items[0]["block"]
+        block_text = str(block["text"])
+        segments = block.get("segments") or []
+        base = _synthesized_plan_base(items[0]["target"])
+        if any(item["evidence"] == block_text for item in items):
+            plans.append({
+                **base,
+                "block_id": key,
+                "action": "remove_block",
+                "evidence": block_text,
+            })
+            continue
+        line_items = [
+            item for item in items
+            if item["segment"] is not None and item["evidence"] == item["segment"]["text"]
+        ]
+        if len(segments) >= 2 and len(line_items) == len(items):
+            seen_segments: set[str] = set()
+            for item in line_items:
+                segment_id = str(item["segment"]["segment_id"])
+                if segment_id in seen_segments:
+                    continue
+                seen_segments.add(segment_id)
+                plans.append({
+                    **_synthesized_plan_base(item["target"]),
+                    "block_id": key,
+                    "segment_id": segment_id,
+                    "action": "remove_text_line",
+                    "evidence": item["evidence"],
+                })
+            continue
+        remainder = block_text
+        removed_any = False
+        for evidence in sorted({item["evidence"] for item in items}, key=len, reverse=True):
+            if evidence in remainder:
+                remainder = remainder.replace(evidence, "", 1)
+                removed_any = True
+        if not removed_any or not remainder.strip():
+            continue
+        plans.append({
+            **base,
+            "block_id": key,
+            "action": "replace_text",
+            "evidence": block_text,
+            "after": remainder,
+        })
+    return plans
+
+
+def _synthesized_plan_base(target: dict[str, Any]) -> dict[str, Any]:
+    """Shared plan fields derived from one dirt target."""
+
+    issue_type = _normalized_issue_type(target)
+    if issue_type not in (_AI_GENERAL_REMOVAL_ISSUE_TYPES | _AI_PROMOTION_ISSUE_TYPES):
+        issue_type = "extraneous_content"
+    reason = re.sub(r"\s+", " ", str(target.get("reason") or "")).strip()
+    if not 4 <= len(reason) <= 500:
+        reason = f"质检定位为可删除的{issue_type}内容，删除后不影响新闻事实"
+    return {
+        "issue_type": issue_type,
+        "reason": reason,
+        "confidence": MIN_AI_REPAIR_CONFIDENCE,
+        "synthesized_from_dirty_target": True,
+    }
+
+
+# 形态词典是为"段首段尾一小截残留"设计的，其中若干模式故意不锚定（例如"观看…直播"、
+# "点击…视频"），这在短片段上是安全的，用到整段新闻上就会误命中：一条提到"观看直播"
+# 的新闻导语会被当成引流残留。合成计划的删除目标可能是整块，因此免检只对短片段开放，
+# 超过这个长度一律交给信息保全核验裁决。
+MAX_FAST_PATH_REMOVAL_CHARS = 80
+
+
+def removal_matches_known_artifact(text: str) -> bool:
+    """Return whether a *short* fragment matches a deterministic residue shape.
+
+    The public fast path in front of the information-preservation verifier: a
+    fragment the fixed rules already recognise needs no model call.  A miss is
+    not a verdict — it only means the decision moves to the verifier.  Long
+    targets never qualify because the shape rules are not anchored and would
+    misfire on ordinary reporting text.
+    """
+
+    value = _normalise_promotion_text(text)
+    if not value or len(value) > MAX_FAST_PATH_REMOVAL_CHARS:
+        return False
+    return _is_removable_fragment(value)
+
+
+def removal_is_duplicated(removed_text: str, body_html: str | None) -> bool:
+    """Return whether *removed_text* still exists elsewhere in the body.
+
+    The mechanical half of the information-preservation check: when the exact
+    substantive text appears at least twice in the article, deleting one copy
+    cannot lose a fact, so no model call is needed to authorise it.
+    """
+
+    fragment = _substantive_text(removed_text)
+    if len(fragment) < _MIN_DUPLICATE_PREFIX_CHARS:
+        return False
+    return _substantive_text(_plain_text(str(body_html or ""))).count(fragment) >= 2
+
+
+# A plain-text URL glued to a platform/label, e.g. "关西电视台DOGA：https://…" or
+# "TVer：https://tver.jp/…". The model often mislabels these standalone lines as
+# links (action=remove_link) even though the source has no <a> anchor, so the
+# structured link lookup finds nothing. We only downgrade to a text removal when
+# the segment is unambiguously such a URL line, never for a factual sentence.
+_PLAINTEXT_URL_LINE_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+
+
+def _link_plan_fallback_segment_id(
+    evidence: str,
+    segments_by_id: dict[str, Any],
+) -> str | None:
+    """Locate the segment a failed ``remove_link`` plan really targets.
+
+    When the source has no ``<a>`` anchor the model still sometimes emits
+    ``remove_link`` for a plain-text URL line (e.g. ``关西电视台DOGA：https://…``)
+    with ``evidence`` holding only the platform label. Return the ``segment_id``
+    of the single segment that both contains that label *and* is a standalone
+    URL line, so the caller can downgrade the plan to ``remove_text_line``.
+    Returns ``None`` when the target is ambiguous or is not a URL line.
+    """
+
+    probe = _plain_text(evidence)
+    if not probe:
+        return None
+    matches: list[str] = []
+    for segment_id, pair in segments_by_id.items():
+        segment = pair[1]
+        segment_text = _plain_text(str(segment.get("text") or ""))
+        if not segment_text or probe not in segment_text:
+            continue
+        # The segment must be a bare URL line: the label plus a URL and nothing
+        # resembling a news clause, so a factual sentence is never deleted.
+        if not _PLAINTEXT_URL_LINE_RE.search(segment_text):
+            continue
+        remainder = _PLAINTEXT_URL_LINE_RE.sub("", segment_text)
+        remainder = remainder.replace(probe, "").strip(" ：:·、，,。.-—　")
+        if remainder:
+            continue
+        matches.append(segment_id)
+    if len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def _numeric_expressions(value: str) -> list[str]:
@@ -768,7 +1229,7 @@ _TAIL_AFTER_BLOCK_RE = re.compile(
 )
 
 _PHOTO_CREDIT_RE = re.compile(
-    r"\[\s*(?:照片|写真)\s*\]\s*[=＝]\s*(?P<source>[^<>\[\]\r\n]{1,120}?)\s*$",
+    r"\[\s*(?:照片|写真|图片)\s*\]\s*[=＝]\s*(?P<source>[^<>\[\]\r\n]{1,120}?)\s*$",
     re.IGNORECASE,
 )
 
@@ -1251,6 +1712,7 @@ def apply_repair_plan(
     body_html: str | None,
     plan: Any,
     *,
+    verifier: Callable[[dict[str, Any]], bool] | None = None,
     _allow_partial: bool = False,
 ) -> tuple[str, list[dict[str, Any]], str | None]:
     """Apply only an exact, text-block AI plan.
@@ -1258,6 +1720,12 @@ def apply_repair_plan(
     No HTML is accepted in replacement text.  Every operation must identify a
     known block and include matching evidence, otherwise the complete plan is
     rejected and the original body is returned unchanged.
+
+    *verifier* is the escape hatch from pattern whitelists.  A ``replace_text``
+    edit that is provably a verbatim deletion but whose removed fragment does
+    not match any known residue shape is offered to the verifier, which decides
+    whether the deletion preserves every news fact.  Without a verifier the
+    function keeps its original fail-closed behaviour.
     """
 
     body = str(body_html or "")
@@ -1294,6 +1762,7 @@ def apply_repair_plan(
             _, _, item_error = apply_repair_plan(
                 body,
                 item,
+                verifier=verifier,
                 _allow_partial=True,
             )
             if item_error:
@@ -1302,6 +1771,7 @@ def apply_repair_plan(
                     _, _, relocated_error = apply_repair_plan(
                         body,
                         relocated,
+                        verifier=verifier,
                         _allow_partial=True,
                     )
                     if relocated_error is None:
@@ -1315,6 +1785,7 @@ def apply_repair_plan(
         cleaned, applied, combined_error = apply_repair_plan(
             body,
             valid_plans,
+            verifier=verifier,
             _allow_partial=True,
         )
         if combined_error:
@@ -1359,37 +1830,55 @@ def apply_repair_plan(
             link_id = str(item.get("link_id") or "").strip().lower()
             link = links_by_id.get(link_id)
             if link is None:
-                return body, [], "AI 修复目标链接不存在"
-            evidence = _plain_text(str(item.get("evidence") or item.get("before") or ""))
-            expected_link_text = str(link.get("text") or "")
-            if evidence != expected_link_text or (not evidence and not int(link.get("image_count") or 0)):
-                return body, [], "AI 修复证据与目标链接文字不一致"
-            raw_confidence = item.get("confidence")
-            if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
-                return body, [], "AI 修复置信度缺失或格式错误"
-            confidence = float(raw_confidence)
-            if not math.isfinite(confidence) or confidence < MIN_AI_REPAIR_CONFIDENCE or confidence > 1:
-                return body, [], "AI 修复置信度不足"
-            fragment = body[int(link["start"]):int(link["end"])]
-            # Reuse the submission boundary's exact anchor semantics: remove
-            # linked text and wrapper, while retaining any linked images.
-            replacement = remove_clickable_links(fragment)
-            operations.append({
-                "action": action,
-                "start": int(link["start"]),
-                "end": int(link["end"]),
-                "replacement": replacement,
-                "evidence": evidence,
-                "item": item,
-                "block_id": None,
-                "segment_id": None,
-                "link_id": link_id,
-                "keep_target_id": None,
-                "tag": "a",
-                "validation": "structured_link_target",
-                "whole_node": True,
-            })
-            continue
+                # The source has no <a> anchor for this target: the model
+                # mislabeled a plain-text URL line (e.g. "关西电视台DOGA：https://…")
+                # as a link. Downgrade to a segment-level text removal when the
+                # evidence unambiguously points at one such URL line, then fall
+                # through to the remove_text_line validation below.
+                fallback_segment_id = _link_plan_fallback_segment_id(
+                    str(item.get("evidence") or item.get("before") or ""),
+                    segments_by_id,
+                )
+                if fallback_segment_id is None:
+                    return body, [], "AI 修复目标链接不存在"
+                item["action"] = "remove_text_line"
+                item["segment_id"] = fallback_segment_id
+                item.pop("link_id", None)
+                item["evidence"] = _plain_text(
+                    str(segments_by_id[fallback_segment_id][1].get("text") or "")
+                )
+                action = "remove_text_line"
+            else:
+                evidence = _plain_text(str(item.get("evidence") or item.get("before") or ""))
+                expected_link_text = str(link.get("text") or "")
+                if evidence != expected_link_text or (not evidence and not int(link.get("image_count") or 0)):
+                    return body, [], "AI 修复证据与目标链接文字不一致"
+                raw_confidence = item.get("confidence")
+                if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, (int, float)):
+                    return body, [], "AI 修复置信度缺失或格式错误"
+                confidence = float(raw_confidence)
+                if not math.isfinite(confidence) or confidence < MIN_AI_REPAIR_CONFIDENCE or confidence > 1:
+                    return body, [], "AI 修复置信度不足"
+                fragment = body[int(link["start"]):int(link["end"])]
+                # Reuse the submission boundary's exact anchor semantics: remove
+                # linked text and wrapper, while retaining any linked images.
+                replacement = remove_clickable_links(fragment)
+                operations.append({
+                    "action": action,
+                    "start": int(link["start"]),
+                    "end": int(link["end"]),
+                    "replacement": replacement,
+                    "evidence": evidence,
+                    "item": item,
+                    "block_id": None,
+                    "segment_id": None,
+                    "link_id": link_id,
+                    "keep_target_id": None,
+                    "tag": "a",
+                    "validation": "structured_link_target",
+                    "whole_node": True,
+                })
+                continue
         if action == "remove_empty_block":
             empty_id = str(item.get("empty_block_id") or "").strip().lower()
             empty = next(
@@ -1573,7 +2062,25 @@ def apply_repair_plan(
             ):
                 return body, [], "AI 文本替换内容为空或包含 HTML"
             if photo_match is not None:
-                if _plain_text(replacement) != _plain_text(photo_match["after"]):
+                # 两种结果都可接受：改写成规范化的"（图片来源：X）"，或按 AI 的
+                # 判断整段删除署名只保留图注。删除分支同样要求逐字保留图注，
+                # 且需要一个可删除的问题类别和有效理由。
+                normalized_after = _plain_text(photo_match["after"])
+                caption_only = _plain_text(photo_match.get("caption") or "")
+                plain_replacement = _plain_text(replacement)
+                if plain_replacement == normalized_after:
+                    pass
+                elif (
+                    caption_only
+                    and plain_replacement == caption_only
+                    and issue_type in (
+                        _AI_GENERAL_REMOVAL_ISSUE_TYPES | _AI_PROMOTION_ISSUE_TYPES
+                    )
+                    and _has_valid_ai_reason(item)
+                ):
+                    edge_removed_fragment = _plain_text(photo_match["before"])[len(caption_only):].strip()
+                    validation_mode = "ai_photo_credit_removal"
+                else:
                     return body, [], "图片署名替换内容与规范化结果不一致"
             elif (edge_removed_fragment := _edge_fragment_removal(evidence, replacement)) is not None:
                 # Phase-1 plan B: strip a dirty fragment glued to the start or
@@ -1600,6 +2107,44 @@ def apply_repair_plan(
                 ):
                     return body, [], "AI 段中整句删除不是可验证的局部修复"
                 validation_mode = "ai_whole_sentence_removal"
+            elif (edge_removed_fragment := _infix_fragment_removal(evidence, replacement)) is not None:
+                # Infix removal: a single promotion/template fragment wedged
+                # between two kept sentences (e.g. "（见下方视频）"). The same
+                # residue probe plus a removal issue type guard against cutting a
+                # factual clause out of the middle of a paragraph.
+                if (
+                    issue_type not in (_AI_GENERAL_REMOVAL_ISSUE_TYPES | _AI_PROMOTION_ISSUE_TYPES)
+                    or not _has_valid_ai_reason(item)
+                ):
+                    return body, [], "AI 段中片段删除不是可验证的局部修复"
+                validation_mode = "ai_infix_fragment_removal"
+            elif (
+                generic_removal := delete_only_replacement(evidence, replacement)
+            )[0] is not None:
+                # 快路径没命中：这条编辑已经被证明是逐字删除——保留文字全部原样来自
+                # evidence，不新增也不改写任何一个字——但被删片段不属于任何已知的残留
+                # 形态。此前这里直接 fail-closed，于是每出现一种新写法就得补一条正则，
+                # 永远追不上上游。改为把"这段文字是什么类别"换成"删掉它会不会丢新闻
+                # 事实"，交给调用方的核验器回答；核验不通过或核验不可用时仍然转人工。
+                edge_removed_fragment, removal_shape = generic_removal
+                if (
+                    issue_type
+                    not in (_AI_GENERAL_REMOVAL_ISSUE_TYPES | _AI_PROMOTION_ISSUE_TYPES)
+                    or not _has_valid_ai_reason(item)
+                    or verifier is None
+                ):
+                    return body, [], "AI 文本替换不是可验证的轻微局部修复"
+                verdict = verifier({
+                    "removed_text": edge_removed_fragment,
+                    "evidence": evidence,
+                    "replacement": replacement,
+                    "issue_type": issue_type,
+                    "reason": str(item.get("reason") or "")[:500],
+                    "shape": removal_shape,
+                })
+                if verdict is not True:
+                    return body, [], "AI 删除内容未通过信息保全核验"
+                validation_mode = "ai_verified_removal"
             elif (
                 issue_type not in _AI_REPLACEMENT_ISSUE_TYPES
                 or not _has_valid_ai_reason(item)
@@ -1614,15 +2159,20 @@ def apply_repair_plan(
                 return body, [], "AI 文本替换不是可验证的轻微局部修复"
         operations.append({
             "action": action,
-            "start": int(block["start"]),
-            "end": int(block["end"]),
+            # A segment-scoped replace_text (evidence matched one line inside a
+            # multi-line block) must only touch that line's plain-text span, not
+            # the whole block. The span is plain text, so replace it verbatim via
+            # whole_node instead of the block's ">...<" HTML rewrite.
+            "start": int(segment["start"]) if segment is not None else int(block["start"]),
+            "end": int(segment["end"]) if segment is not None else int(block["end"]),
             "replacement": replacement,
             "evidence": evidence,
             "item": item,
             "block_id": block_id,
-            "segment_id": None,
+            "segment_id": target_id if segment is not None else None,
             "keep_target_id": keep_target_id,
             "edge_removed_fragment": edge_removed_fragment,
+            "whole_node": segment is not None,
             "tag": str(block.get("tag") or "p"),
             "validation": (
                 validation_mode
