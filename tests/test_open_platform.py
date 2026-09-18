@@ -622,7 +622,6 @@ def test_create_article_marks_http_502_as_result_unknown(app, monkeypatch):
             dqd_open_appid="appid-test",
             dqd_open_appsecret="secret-test",
             dqd_open_enname="hongsiqin",
-            dqd_open_idempotency_enabled=True,
         )
         client = DqdOpenClient(cfg)
 
@@ -710,7 +709,7 @@ def test_create_article_marks_non_json_response_as_result_unknown(app, monkeypat
     assert raised.value.diagnostics["response_text"] == "upstream gateway error"
 
 
-def test_create_article_submits_configured_idempotency_field(app, monkeypatch):
+def test_create_article_never_submits_client_request_id(app, monkeypatch):
     class FakeResponse:
         status_code = 200
 
@@ -721,45 +720,6 @@ def test_create_article_submits_configured_idempotency_field(app, monkeypatch):
             dqd_open_appid="appid-test",
             dqd_open_appsecret="secret-test",
             dqd_open_enname="hongsiqin",
-            dqd_open_idempotency_enabled=True,
-            dqd_open_idempotency_field="external_request_id",
-        )
-        client = DqdOpenClient(cfg)
-
-        def post_signed(**kwargs):
-            submitted.update(kwargs)
-            return (
-                FakeResponse(),
-                {"code": 0, "data": {"archive_id": 6141888}},
-                "https://platform.dongqiudi.com/open/v1/do",
-            )
-
-        monkeypatch.setattr(client.open_platform, "post_signed", post_signed)
-        tab = {"backend_tab_id": 1}
-        article = {"title_final": "demo", "body_html": '<p><img src="x.jpg"></p>'}
-        draft = client.create_article(
-            article,
-            tab,
-            client_request_id="draft-request-2",
-        )
-
-    assert ("external_request_id", "draft-request-2") in submitted["data"]
-    assert draft.diagnostics["client_request_id"] == "draft-request-2"
-    assert draft.diagnostics["idempotency_field"] == "external_request_id"
-
-
-def test_create_article_omits_idempotency_field_until_enabled(app, monkeypatch):
-    class FakeResponse:
-        status_code = 200
-
-    submitted = {}
-    with app.app_context():
-        cfg = replace(
-            app.extensions["app_config"],
-            dqd_open_appid="appid-test",
-            dqd_open_appsecret="secret-test",
-            dqd_open_enname="hongsiqin",
-            dqd_open_idempotency_enabled=False,
         )
         client = DqdOpenClient(cfg)
 

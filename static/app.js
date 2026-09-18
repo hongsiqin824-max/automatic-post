@@ -323,6 +323,7 @@
         source_display_name: String(rule.source_display_name || rule.source_name || ""),
         publish_mode_override: rawPublishMode === 0 || rawPublishMode === 1 || rawPublishMode === 2 ? rawPublishMode : null,
         sample_source: rule.sample_source || "",
+        ai_guard_enabled: Boolean(rule.ai_guard_enabled),
         enabled: Boolean(rule.enabled),
       };
     }
@@ -332,6 +333,11 @@
       if (value === 0) return "创建草稿";
       if (value === 2) return "放弃";
       return "跟随原配置";
+    }
+
+    function ruleTargetMeta(rule) {
+      const action = publishActionLabel(rule.publish_mode_override);
+      return rule.ai_guard_enabled ? `${action} · AI 归属校验` : action;
     }
 
     function sourceScopeLabel(rule) {
@@ -373,6 +379,7 @@
       row.dataset.publishModeOverride = rule.publish_mode_override == null
         ? ""
         : String(rule.publish_mode_override);
+      row.dataset.aiGuardEnabled = String(rule.ai_guard_enabled);
       row.dataset.enabled = String(rule.enabled);
       row.dataset.pending = String(pending);
       row.dataset.searchText = [
@@ -394,12 +401,12 @@
       if (pending) {
         target.append(
           node("strong", "pending-text", "待配置"),
-          node("small", "", `沿用来源原栏目 · ${publishActionLabel(rule.publish_mode_override)}`),
+          node("small", "", `沿用来源原栏目 · ${ruleTargetMeta(rule)}`),
         );
       } else {
         target.append(
           node("strong", "", rule.tab_name || "栏目已删除"),
-          node("small", "", `后台栏目 ID：${rule.backend_tab_id ?? "未知"} · ${publishActionLabel(rule.publish_mode_override)}`),
+          node("small", "", `后台栏目 ID：${rule.backend_tab_id ?? "未知"} · ${ruleTargetMeta(rule)}`),
         );
       }
 
@@ -467,6 +474,7 @@
       form.elements.tab_id.value = row.dataset.tabId || "";
       form.elements.source_code.value = row.dataset.sourceCode || "";
       form.elements.publish_mode_override.value = row.dataset.publishModeOverride || "";
+      form.elements.ai_guard_enabled.checked = row.dataset.aiGuardEnabled === "true";
       form.elements.enabled.checked = row.dataset.enabled === "true";
       $('[data-competition-rule-dialog-title]', dialog).textContent = `编辑 ${row.dataset.markerCode}`;
       dialog.showModal();
@@ -536,6 +544,7 @@
             tab_id: form.elements.tab_id.value ? Number(form.elements.tab_id.value) : null,
             source_code: form.elements.source_code.value || null,
             publish_mode_override: publishModeValue === "" ? null : Number(publishModeValue),
+            ai_guard_enabled: form.elements.ai_guard_enabled.checked,
             enabled: form.elements.enabled.checked,
           };
           if (payload.publish_mode_override === 1

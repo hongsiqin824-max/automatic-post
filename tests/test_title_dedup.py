@@ -42,13 +42,114 @@ def test_user_examples_pass_the_recall_gate(left, right) -> None:
     assert title_dedup.is_recall_hit(score, dice_min=0.25, lcs_min=4)
 
 
-def test_conflicting_numbers_veto_candidate() -> None:
-    assert title_dedup.has_conflicting_numbers(
-        "西甲第3轮：皇马2-0击败塞维利亚", "西甲第4轮：皇马3-1击败塞维利亚"
+def test_recall_keeps_candidates_whose_numbers_differ() -> None:
+    """写法差异与细节补充不得被挡在召回之外，是否同一事件由 LLM 判。
+
+    这些标题的数字序列并不相等（U-20/U20、八强/8强、多出「替补4分钟」），
+    早先的数字硬过滤会把它们直接丢弃，导致同一事件被反复发布。
+    """
+
+    articles = [
+        _article(1, "韩媒：韩国U-20女足1-0阿根廷，时隔12年进八强", [100]),
+        _article(2, "韩媒：全北2-1逆转柏太阳神，伊塔洛制胜", [100]),
+    ]
+    selected = title_dedup.select_candidates(
+        "韩媒：韩国U20女足1-0阿根廷，时隔12年进8强",
+        articles,
+        candidate_id=5,
+        channels=[100],
+        dice_min=0.25,
+        lcs_min=4,
+        limit=3,
     )
-    assert not title_dedup.has_conflicting_numbers(
-        "西甲第3轮：皇马2-0击败塞维利亚", "西甲皇马取胜后主帅出席发布会"
+    assert 1 in [item["article"]["id"] for item in selected]
+
+    selected = title_dedup.select_candidates(
+        "韩媒：全北2-1逆转柏太阳神，伊塔洛替补4分钟制胜",
+        articles,
+        candidate_id=5,
+        channels=[100],
+        dice_min=0.25,
+        lcs_min=4,
+        limit=3,
     )
+    assert 2 in [item["article"]["id"] for item in selected]
+
+
+def test_same_tab_recalls_when_channels_do_not_overlap() -> None:
+    """标签无交集但同栏目且词面高度相似时必须入围。
+
+    同一事件的稿件常被路由规则打上完全不同的标签（真实案例：同一场亚运比赛
+    分别落在国际栏目与 K 联赛栏目），只靠标签交集会整组漏掉。
+    """
+
+    articles = [
+        {**_article(1, "韩媒：韩国裁判协会就判罚争议道歉", [999]), "tab_id": 3},
+    ]
+    selected = title_dedup.select_candidates(
+        "韩媒：韩国裁判协会就判罚争议道歉并整改",
+        articles,
+        candidate_id=5,
+        channels=[100],          # 与候选的 [999] 无交集
+        dice_min=0.25,
+        lcs_min=4,
+        limit=3,
+        tab_id=3,
+        tab_dice_min=0.6,
+    )
+    assert [item["article"]["id"] for item in selected] == [1]
+    assert selected[0]["matched_by"] == "tab"
+    assert selected[0]["shared_channels"] == []
+
+
+def test_same_tab_requires_higher_similarity_than_shared_channel() -> None:
+    """仅靠同栏目入围时，低于 tab_dice_min 的低相似候选必须被挡掉。"""
+
+    # 词面有重叠（能过 lcs_min），但 bigram dice 远低于 0.6
+    articles = [
+        {**_article(1, "韩媒：韩国裁判协会公布本季度执法安排与培训计划", [999]), "tab_id": 3},
+    ]
+    kwargs = dict(
+        candidate_id=5, dice_min=0.25, lcs_min=4, limit=3, tab_id=3,
+    )
+    low = title_dedup.select_candidates(
+        "韩媒：韩国裁判协会就判罚争议道歉", articles, channels=[100],
+        tab_dice_min=0.6, **kwargs,
+    )
+    assert low == []
+
+    # 同一对候选，若标签有交集则仍按原本较宽的门槛入围
+    shared = title_dedup.select_candidates(
+        "韩媒：韩国裁判协会就判罚争议道歉", articles, channels=[999],
+        tab_dice_min=0.6, **kwargs,
+    )
+    assert [item["article"]["id"] for item in shared] == [1]
+    assert shared[0]["matched_by"] == "channels"
+
+
+def test_same_tab_gate_disabled_without_threshold() -> None:
+    """未配置 tab_dice_min 时行为与改动前一致：同栏目不构成入围理由。"""
+
+    articles = [
+        {**_article(1, "韩媒：韩国裁判协会就判罚争议道歉", [999]), "tab_id": 3},
+    ]
+    selected = title_dedup.select_candidates(
+        "韩媒：韩国裁判协会就判罚争议道歉并整改",
+        articles,
+        candidate_id=5,
+        channels=[100],
+        dice_min=0.25,
+        lcs_min=4,
+        limit=3,
+        tab_id=3,
+        tab_dice_min=None,
+    )
+    assert selected == []
+
+
+def test_match_scope_label_distinguishes_channel_and_tab() -> None:
+    assert title_dedup.match_scope_label({"shared_channels": [104, 1568]}) == "共同标签 [104, 1568]"
+    assert title_dedup.match_scope_label({"shared_channels": []}) == "同一栏目"
 
 
 def test_select_candidates_requires_shared_channel_and_older_id() -> None:

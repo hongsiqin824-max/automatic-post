@@ -119,6 +119,10 @@ def _apply_title_dedup(article_id: int, current: dict[str, Any], config: AppConf
     mode = title_dedup.direct_publish_mode(article_id, current, connection)
     if mode != 1:
         return None
+
+    # 不在这里等待同批次的并发质检：质检本身要几十秒，短暂 sleep 等不到对方进入
+    # 候选池状态；而且先完成的那篇会留在池子里，后完成的那篇查重时照样能看见它，
+    # 同一对稿件仍会被拦住一篇。
     candidates = repo.list_title_dedup_candidates(
         title_dedup.dedup_window_since(config.title_dedup_hours),
         article_id,
@@ -136,7 +140,7 @@ def _apply_title_dedup(article_id: int, current: dict[str, Any], config: AppConf
             event_type="TITLE_DUPLICATE_DETECTED",
             message=(
                 f"与文章 #{matched.get('id')}《{matched.get('title')}》标题高度相似"
-                f"（共同标签 {result['shared_channels']}），已取消自动发布"
+                f"（{title_dedup.match_scope_label(result)}），已取消自动发布"
             ),
             payload=result,
         )
@@ -1971,6 +1975,48 @@ def _run_once_locked(config: AppConfig, *, database_path: str | None = None) -> 
             ):
                 if int(retry_article["id"]) in scheduled_ids and int(retry_article["id"]) not in seen_ids:
                     pending.append(retry_article)
+
+        # Scan for orphaned RECEIVED articles that were never processed
+        # (e.g., due to LLM timeout or other transient failures during initial ingestion)
+        try:
+            last_orphan_scan = repo.get_setting("last_orphan_scan_at", default=None, connection=conn)
+            now_utc = datetime.now(timezone.utc)
+            should_scan = False
+            if not last_orphan_scan:
+                should_scan = True
+            else:
+                try:
+                    last_scan_time = datetime.fromisoformat(last_orphan_scan.replace("Z", "+00:00"))
+                    elapsed = (now_utc - last_scan_time).total_seconds()
+                    if elapsed > 600:  # 10 minutes
+                        should_scan = True
+                except (ValueError, AttributeError):
+                    should_scan = True
+
+            if should_scan:
+                seen_ids = {int(article["id"]) for article in pending if article.get("id")}
+                orphan_candidates = repo.list_articles(conn, status="RECEIVED", limit=200)
+                stale_orphans = []
+                for art in orphan_candidates:
+                    art_id = int(art["id"])
+                    if art_id in seen_ids:
+                        continue
+                    # Only retry articles that have been stuck for more than 10 minutes
+                    try:
+                        updated_at = datetime.fromisoformat(art["updated_at"].replace("Z", "+00:00"))
+                        if (now_utc - updated_at).total_seconds() > 600:
+                            stale_orphans.append(art)
+                    except (ValueError, AttributeError, KeyError):
+                        continue
+
+                if stale_orphans:
+                    logger.info(f"发现 {len(stale_orphans)} 篇历史遗留的 RECEIVED 文章，加入处理队列")
+                    pending.extend(stale_orphans)
+
+                repo.set_setting("last_orphan_scan_at", now_utc.isoformat(), connection=conn)
+        except Exception:  # noqa: BLE001 - orphan scanning is best-effort
+            logger.exception("历史遗留文章扫描失败")
+
         for _article_id, state, failed in _process_articles(
             pending, config, database_path, conn, workers=config.quality_workers
         ):

@@ -15,18 +15,26 @@ from . import title_dedup
 from .dqd_open_client import DqdOpenClient, DqdOpenClientError
 from .open_platform import build_draft_url
 from .quality import (
-    LEAGUE_GUARD_MIN_CONFIDENCE,
     LLMCallError,
     LLMService,
     analyze_body_language,
     check_league_membership,
+    classify_article_tab,
     should_check_fallback_tab,
 )
 
 
 logger = logging.getLogger(__name__)
 PUBLISHING_STALE_SECONDS = 10 * 60
-CONFIRMATION_DELAYS_SECONDS = (15, 60, 180, 600, 1800)
+
+# 这些状态说明另一个发布轮次已经接管了同一篇文章，重复领取属于无害竞态。
+_DOWNSTREAM_CLAIMED_STATUSES = frozenset({
+    "PUBLISHING",
+    "DRAFT_CONFIRMING",
+    "DRAFT_CREATED",
+    "PUBLISHED",
+    "ALREADY_PUBLISHED",
+})
 
 
 class DraftClaimSkipped(RuntimeError):
@@ -35,6 +43,10 @@ class DraftClaimSkipped(RuntimeError):
 
 class PublishModeConflict(ValueError):
     """Raised when one article maps to tabs with different publish modes."""
+
+
+class ManualReconcileRequired(RuntimeError):
+    """Raised when retrying could duplicate an article that upstream may already hold."""
 
 
 def _utc_now() -> str:
@@ -58,18 +70,6 @@ def _parse_utc(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _confirmation_at(attempt: int) -> str | None:
-    """Return the next automatic check time, or None after the retry budget."""
-
-    index = max(0, int(attempt))
-    if index >= len(CONFIRMATION_DELAYS_SECONDS):
-        return None
-    return (
-        datetime.now(timezone.utc)
-        + timedelta(seconds=CONFIRMATION_DELAYS_SECONDS[index])
-    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
 def _retry_at(delay_seconds: int) -> str:
     return (
         datetime.now(timezone.utc) + timedelta(seconds=max(1, int(delay_seconds)))
@@ -79,13 +79,21 @@ def _retry_at(delay_seconds: int) -> str:
 def _initial_confirmation_schedule(
     config: AppConfig,
     error: DqdOpenClientError,
+    publish_mode: int,
 ) -> tuple[str | None, str]:
-    if config.dqd_open_idempotency_enabled:
-        return _confirmation_at(0), "创建请求结果暂不可确认，已进入自动结果确认"
-    if config.dqd_open_502_retry_enabled and error.status_code == 502:
-        delay = config.dqd_open_502_retry_delay_seconds
-        return _retry_at(delay), f"创建接口返回 HTTP 502，将在 {delay} 秒后自动重试一次"
-    return None, "创建请求结果暂不可确认，已停止直接重发"
+    """Decide whether exactly one automatic retry is safe.
+
+    上游既没有幂等请求键也没有查询接口，重发等于赌「上一次其实没成功」。只有创建
+    草稿值得赌：重复草稿留在后台且能人工删除。直接发布的重复对读者可见，一律不
+    重发，宁可落人工核对。
+    """
+
+    if not config.dqd_open_502_retry_enabled or error.status_code != 502:
+        return None, "创建请求结果暂不可确认，已停止直接重发"
+    if publish_mode:
+        return None, "直接发布结果暂不可确认，为避免读者看到重复文章，不再自动重发"
+    delay = config.dqd_open_502_retry_delay_seconds
+    return _retry_at(delay), f"创建接口返回 HTTP 502，将在 {delay} 秒后自动重试一次"
 
 
 def _upstream_request_id(diagnostics: Any) -> str | None:
@@ -95,27 +103,24 @@ def _upstream_request_id(diagnostics: Any) -> str | None:
     return str(value).strip()[:200] if value not in (None, "") else None
 
 
-def _create_article_with_stable_key(
+def _submit_article(
     client: DqdOpenClient,
-    config: AppConfig,
     article: dict[str, Any],
     tabs: dict[str, Any] | list[dict[str, Any]],
     publish_account: dict[str, Any] | None,
     client_request_id: str,
     status: int | None = None,
 ):
-    """Call the client while preserving compatibility with older test clients.
+    """Submit one article to the open platform.
 
-    The request key is sent only after the upstream idempotency capability is
-    explicitly enabled. Persisting it locally is still useful for diagnostics
-    and for a future reconciliation call when the capability is disabled.
+    ``client_request_id`` 只进本地诊断，不会作为表单字段发给上游——开放平台没有
+    幂等请求键。保留它是为了把本地记录和上游返回的 request_id 对上，排查重复
+    发布时能追溯到是哪一次提交。
     """
 
-    kwargs: dict[str, Any] = {}
+    kwargs: dict[str, Any] = {"client_request_id": client_request_id}
     if publish_account is not None:
         kwargs["publish_account"] = publish_account
-    if config.dqd_open_idempotency_enabled:
-        kwargs["client_request_id"] = client_request_id
     if status is not None:
         kwargs["status"] = status
     return client.create_article(article, tabs, **kwargs)
@@ -175,6 +180,11 @@ def _current_tabs(article: dict[str, Any]) -> list[dict[str, Any]]:
     Non-publishable columns (「精选」/「法甲」) are dropped here so a legacy
     mapping left on an article ingested before those columns stopped being
     routed can never be sent to the backend.
+
+    Switched-off columns are kept: pausing a column stops its articles from
+    being published, not from being filed. They are submitted as drafts
+    instead, which the mode resolver enforces by forcing mode 0 whenever any
+    mapped column is switched off.
     """
 
     tabs = article.get("tabs") or []
@@ -351,22 +361,39 @@ def _apply_ai_league_guard(
 ) -> tuple[int, dict[str, Any]]:
     """Upgrade a fallback-column draft to direct publish when AI confirms it fits.
 
-    Only runs when the article would otherwise be a draft (mode 0), has an empty
-    league marker, and reached a column with the guard enabled. A source set to
-    direct publish (mode 1) is trusted as-is and never triggers the AI check.
-    Only a positive, high-confidence verdict upgrades the article to publish; any
-    negative, low-confidence, or model failure keeps it as a draft (fail closed).
+    Only runs when the article would otherwise be a draft (mode 0) and reached a
+    column with the guard enabled. A source set to direct publish (mode 1) is
+    trusted as-is and never triggers the AI check. Only a positive,
+    high-confidence verdict upgrades the article to publish; any negative,
+    low-confidence, or model failure keeps it as a draft (fail closed).
+
+    A resolved league short code normally means the column is already known, so
+    those articles skip the check — unless their routing rule opted in via
+    ``event_tab_rules.ai_guard_enabled``. That switch exists for catch-all short
+    codes such as ``intl``, whose routed column is a guess rather than a fact.
 
     Cascade fallback: when the article does not belong to the guard column and
     that column configures ``ai_fallback_tab_ids``, the candidates are checked
     in order and the first positive, high-confidence verdict wins. A keyword
     prefilter gates each extra call. The article is then moved into that
     candidate column and upgraded to publish.
+
+    Classifier mode (``league_guard_classifier_enabled``, default on) replaces
+    that cascade once the article is rejected by the guard column: a single call
+    picks one column out of every candidate returned by
+    :func:`repository.list_guard_candidate_tabs`, so coverage no longer depends
+    on an operator having filled in ``ai_fallback_tab_ids`` — roughly half the
+    live guard columns leave it empty, which is why articles used to pile up as
+    drafts after a correct "does not belong" verdict. Whether a reassigned
+    article is published or stays a draft follows
+    ``league_guard_reassign_publish_mode``.
     """
 
     if int(configured_mode) != 0:
         return int(configured_mode), article
-    if str(article.get("route_league") or "").strip():
+    if str(article.get("route_league") or "").strip() and not repo.event_tab_rule_allows_ai_guard(
+        article.get("route_rule_id"), connection
+    ):
         return int(configured_mode), article
     guard_tab = next(
         (tab for tab in tabs if int(tab.get("ai_league_guard_enabled") or 0) == 1),
@@ -383,7 +410,10 @@ def _apply_ai_league_guard(
     fallback_verdict: dict[str, Any] | None = None
     fallback_tab_name: str | None = None
     fallback_tab_id: int | None = None
+    fallback_publish_mode: int | None = None
+    fallback_tab_active: bool = True
     fallback_candidates: list[str] = []
+    classifier_result: dict[str, Any] | None = None
     llm = _make_league_guard_llm(config)
     if llm is None:
         keep_reason = "AI 归属校验未配置模型，维持创建草稿"
@@ -401,13 +431,70 @@ def _apply_ai_league_guard(
         else:
             if (
                 verdict["belongs"] is True
-                and verdict["confidence"] >= LEAGUE_GUARD_MIN_CONFIDENCE
+                and verdict["confidence"] >= config.league_guard_min_confidence
             ):
                 upgrade_reason = (
                     f"AI 判断本篇属于「{tab_name or '兜底栏目'}」"
                     f"（confidence={verdict['confidence']:.2f}），"
                     f"已升级为直接发布：{verdict['reason']}"
                 )
+            elif config.league_guard_classifier_enabled:
+                # 分类模式：不再逐个追问预配候选，一次调用就在全部候选栏目里选一个。
+                # 覆盖面因此与 tabs.ai_fallback_tab_ids 配过没有无关——线上近半数
+                # 栏目该字段为空，正是「AI 答完不属于就无处可去」的根因。
+                article_title = str(
+                    article.get("title_final") or article.get("title") or ""
+                )
+                article_body = str(article.get("body_html") or "")
+                choices = [
+                    row
+                    for row in repo.list_guard_candidate_tabs(connection)
+                    if int(row.get("id") or 0) != int(guard_tab.get("id") or 0)
+                ]
+                fallback_candidates = [str(row.get("name") or "") for row in choices]
+                try:
+                    classifier_result = classify_article_tab(
+                        article_title, article_body, choices, llm
+                    )
+                except LLMCallError as exc_classify:
+                    keep_reason = (
+                        f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」，"
+                        f"栏目分类调用失败，维持创建草稿：{exc_classify}"
+                    )
+                else:
+                    routed_id = classifier_result.get("tab_id")
+                    routed_confidence = float(classifier_result.get("confidence") or 0.0)
+                    routed_reason = str(classifier_result.get("reason") or "")
+                    routed_row = (
+                        repo.get_tab(int(routed_id), connection)
+                        if routed_id is not None
+                        else None
+                    )
+                    if routed_row is None:
+                        keep_reason = (
+                            f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」，"
+                            f"也不属于任何候选栏目，维持创建草稿：{routed_reason}"
+                        )
+                    elif routed_confidence < config.league_guard_min_confidence:
+                        keep_reason = (
+                            f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」，"
+                            f"分类到「{routed_row.get('name')}」但置信度不足"
+                            f"（confidence={routed_confidence:.2f}），维持创建草稿：{routed_reason}"
+                        )
+                    else:
+                        fallback_tab_id = int(routed_row["id"])
+                        fallback_tab_name = str(routed_row.get("name") or "")
+                        fallback_publish_mode = int(routed_row.get("publish_mode") or 0)
+                        fallback_tab_active = repo.is_active_tab(routed_row)
+                        fallback_verdict = classifier_result
+                        upgrade_reason = (
+                            f"AI 判断本篇不属于「{tab_name}」，分类到"
+                            f"「{fallback_tab_name}」"
+                            f"（confidence={routed_confidence:.2f}），"
+                            f"已改挂该栏目"
+                            + ("" if fallback_tab_active else "（该栏目已停用，只创建草稿）")
+                            + f"：{routed_reason}"
+                        )
             else:
                 # Cascade: the article does not fit this column, so walk the
                 # column's configured candidates (tabs.ai_fallback_tab_ids) in
@@ -445,16 +532,23 @@ def _apply_ai_league_guard(
                         continue
                     if (
                         candidate_verdict["belongs"] is True
-                        and candidate_verdict["confidence"] >= LEAGUE_GUARD_MIN_CONFIDENCE
+                        and candidate_verdict["confidence"] >= config.league_guard_min_confidence
                     ):
                         fallback_tab_id = int(candidate_row["id"])
                         fallback_tab_name = candidate_name
+                        fallback_publish_mode = int(candidate_row.get("publish_mode") or 0)
+                        fallback_tab_active = repo.is_active_tab(candidate_row)
                         fallback_verdict = candidate_verdict
                         upgrade_reason = (
                             f"AI 判断本篇不属于「{tab_name}」，但属于「{candidate_name}」"
                             f"（confidence={candidate_verdict['confidence']:.2f}），"
-                            f"已归属到「{candidate_name}」并升级为直接发布："
-                            f"{candidate_verdict['reason']}"
+                            f"已归属到「{candidate_name}」"
+                            + (
+                                "并升级为直接发布"
+                                if fallback_tab_active
+                                else "（该栏目已停用，只创建草稿）"
+                            )
+                            + f"：{candidate_verdict['reason']}"
                         )
                         break
                     rejected.append(
@@ -480,15 +574,28 @@ def _apply_ai_league_guard(
                         + f"，维持创建草稿：{verdict['reason']}"
                     )
 
-    effective_mode = 1 if upgrade_reason else int(configured_mode)
+    # 目标栏目停用时只归档不发布——这是 enabled 的统一语义，压过 reassign 配置和
+    # 「确认属于当前栏目」的升级意图。栏目仍然要改对，方便之后栏目恢复或扩展。
+    if fallback_tab_id is not None:
+        if not fallback_tab_active:
+            effective_mode = 0
+        elif config.league_guard_reassign_publish_mode == "always_direct":
+            effective_mode = 1
+        else:
+            effective_mode = int(fallback_publish_mode or 0)
+    elif upgrade_reason:
+        effective_mode = 1 if repo.is_active_tab(guard_tab) else 0
+    else:
+        effective_mode = int(configured_mode)
     final_tab_id = guard_tab.get("id")
     final_tab_name = tab_name
 
-    # If cascade fallback succeeded, move the article into the fallback column.
-    # This rewrites the event column in article_tabs (keeping the generic 「精选」
-    # column); ``channels`` are DQD content tags, not columns, and must not be
-    # touched here.
-    if upgrade_reason and fallback_tab_id is not None:
+    # Move the article into the column the AI picked. This rewrites the event
+    # column in article_tabs (keeping the generic 「精选」 column); ``channels``
+    # are DQD content tags, not columns, and must not be touched here.
+    # 改挂与发布在这里是解耦的：目标栏目停用、或 target 模式下目标栏目本就是草稿
+    # 配置时，栏目要纠正过来，但文章仍然留在草稿。
+    if fallback_tab_id is not None:
         final_tab_id = fallback_tab_id
         final_tab_name = fallback_tab_name or ""
         article = repo.reassign_article_event_tab(
@@ -503,7 +610,13 @@ def _apply_ai_league_guard(
         "configured_publish_mode": int(configured_mode),
         "effective_publish_mode": effective_mode,
         "upgraded_to_publish": effective_mode != int(configured_mode),
-        "min_confidence": LEAGUE_GUARD_MIN_CONFIDENCE,
+        "reassigned_tab_id": fallback_tab_id,
+        "reassigned_tab_active": fallback_tab_active if fallback_tab_id is not None else None,
+        "classifier_used": classifier_result is not None,
+        "actual_competition": (
+            (classifier_result or {}).get("actual_competition") or None
+        ),
+        "min_confidence": config.league_guard_min_confidence,
         "verdict": verdict,
         "fallback_verdict": fallback_verdict,
         "fallback_tab_name": fallback_tab_name,
@@ -814,7 +927,13 @@ def _create_draft_attempt(
             f"该文章与本地文章 #{duplicate_of['id']} 的来源文章 ID 相同，已自动拦截{detail}"
         )
     if current.get("status") not in allowed_statuses:
-        raise ValueError(f"当前状态为 {current.get('status_label') or current.get('status') or '未知'}，不能创建草稿")
+        label = current.get("status_label") or current.get("status") or "未知"
+        if current.get("status") in _DOWNSTREAM_CLAIMED_STATUSES:
+            # 批量发布轮次会先列出待发文章，再逐篇处理；标题查重要调大模型，期间
+            # 另一个轮次可能已经把同一篇推进到提交中或已发布。这是无害竞态，必须
+            # 走 skipped 通道，否则会被计成 failed 并打 ERROR，把真故障淹没掉。
+            raise DraftClaimSkipped(f"当前状态为 {label}，已由其他发布轮次处理")
+        raise ValueError(f"当前状态为 {label}，不能创建草稿")
 
     archive_id = int(current.get("dqd_archive_id") or 0)
     if archive_id > 0:
@@ -955,9 +1074,8 @@ def _create_draft_attempt(
 
     try:
         selected_tabs = tabs[0] if len(tabs) == 1 else tabs
-        draft = _create_article_with_stable_key(
+        draft = _submit_article(
             client,
-            config,
             current,
             selected_tabs,
             publish_account,
@@ -1060,30 +1178,53 @@ def _create_draft_attempt(
                 status=recovered_status,
             )
         if duplicate_request:
-            # Duplicate accepted upstream but no local archive_id yet: treat
-            # as result_unknown so the confirmation flow can fetch it back.
-            exc.result_unknown = True
-            payload["result_unknown"] = True
+            # 上游已按自己的去重规则接受过这次提交，但本地没拿到 archive_id。
+            # 上游既没有幂等键也没有查询接口，重发有可能被当成新请求而产生第二篇。
+            # 这里不重发，直接落人工可见的失败态并写清处置指引。
+            payload["duplicate_request"] = True
+            repo.transition_status(
+                article_id,
+                "PUBLISH_FAILED",
+                connection,
+                from_status="PUBLISHING",
+                event_type=failure_event_type,
+                message="上游判定为重复请求但本地没有 archive_id，请到懂球帝后台按标题核对是否已有草稿",
+                payload={**payload, "retry_mode": "none", "needs_manual_reconcile": True},
+            )
+            raise
 
         if exc.result_unknown:
             request_id = _upstream_request_id(exc.diagnostics)
-            next_confirm_at, message = _initial_confirmation_schedule(config, exc)
-            repo.mark_draft_result_unknown(
-                article_id,
-                connection,
-                request_id=request_id,
-                next_confirm_at=next_confirm_at,
-                schedule_confirmation=next_confirm_at is not None,
-                message=message,
-                payload={
-                    **payload,
-                    "retry_mode": (
-                        "idempotent_confirmation"
-                        if config.dqd_open_idempotency_enabled
-                        else ("single_502_retry" if next_confirm_at else "none")
-                    ),
-                },
+            next_confirm_at, message = _initial_confirmation_schedule(
+                config, exc, publish_mode
             )
+            if next_confirm_at is None:
+                # 不变量：DRAFT_CONFIRMING 必须带确认排期。认领确认任务的查询要求
+                # draft_next_confirm_at IS NOT NULL，没有排期就进这个状态等于承诺了
+                # 自动确认却永不执行，文章会无声卡死。宁可落人工可见的失败态。
+                repo.transition_status(
+                    article_id,
+                    "PUBLISH_FAILED",
+                    connection,
+                    from_status="PUBLISHING",
+                    event_type=failure_event_type,
+                    message=f"{message}：{str(exc)[:200]}",
+                    payload={
+                        **payload,
+                        "retry_mode": "none",
+                        "unschedulable_confirmation": True,
+                        "needs_manual_reconcile": True,
+                    },
+                )
+            else:
+                repo.mark_draft_result_unknown(
+                    article_id,
+                    connection,
+                    request_id=request_id,
+                    next_confirm_at=next_confirm_at,
+                    message=message,
+                    payload={**payload, "retry_mode": "single_502_retry"},
+                )
         else:
             repo.transition_status(
                 article_id,
@@ -1150,32 +1291,25 @@ def recover_stale_publishing_articles(
             if updated is not None:
                 recovered += 1
             continue
-        auto_confirm = bool(config and config.dqd_open_idempotency_enabled)
+        # 请求已经发出但结果未知，上游可能已经建好文章。没有幂等键也没有查询
+        # 接口，重发只会制造第二篇，因此直接落人工可见的失败态等人核对，绝不
+        # 留在「确认中」——那个状态没有排期就永远不会被认领。
         updated = repo.transition_status_if_current(
             int(article["id"]),
-            "DRAFT_CONFIRMING",
+            "PUBLISH_FAILED",
             conn,
             allowed_from={"PUBLISHING"},
             current_updated_at=article.get("updated_at"),
             event_type="PUBLISHING_TIMED_OUT",
-            message="创建草稿请求超时，结果暂不可确认，已停止直接重发",
+            message="创建草稿请求超时，结果不可确认，请到懂球帝后台按标题核对是否已创建",
             payload={
                 "reason": "publishing_timeout",
-                "auto_confirmation_enabled": auto_confirm,
+                "retry_mode": "none",
+                "needs_manual_reconcile": True,
             },
         )
         if updated is not None:
             timed_out += 1
-            if auto_confirm:
-                repo.mark_draft_result_unknown(
-                    int(article["id"]),
-                    conn,
-                    next_confirm_at=_confirmation_at(0),
-                    schedule_confirmation=True,
-                    message="创建草稿请求超时，已进入自动结果确认",
-                    allowed_from={"DRAFT_CONFIRMING"},
-                    payload={"reason": "publishing_timeout"},
-                )
     return {"recovered": recovered, "timed_out": timed_out, "checked": len(articles)}
 
 
@@ -1185,17 +1319,13 @@ def confirm_due_draft_results(
     *,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Process due ambiguous-create jobs.
+    """Run the one-time HTTP 502 retry for drafts whose result is unknown.
 
-    Idempotent mode retains the existing confirmation schedule. Without an
-    idempotency contract, only the explicitly enabled one-time HTTP 502 retry
-    is eligible; it is never scheduled a second time.
+    上游没有幂等键也没有查询接口，所以这里唯一被允许的动作是「创建草稿」的单次
+    502 重试。重试仍不成功就落 PUBLISH_FAILED，绝不开第三次请求。
     """
 
-    confirmation_enabled = (
-        config.dqd_open_idempotency_enabled or config.dqd_open_502_retry_enabled
-    )
-    if not config.publisher_enabled or not confirmation_enabled:
+    if not config.publisher_enabled or not config.dqd_open_502_retry_enabled:
         return {
             "checked": 0,
             "confirmed": 0,
@@ -1236,9 +1366,8 @@ def confirm_due_draft_results(
             if not tabs:
                 raise ValueError("来源尚未绑定后台栏目，无法确认草稿结果")
 
-            draft = _create_article_with_stable_key(
+            draft = _submit_article(
                 DqdOpenClient(config),
-                config,
                 claimed,
                 selected_tabs,
                 account,
@@ -1254,20 +1383,12 @@ def confirm_due_draft_results(
                 request_id=request_id,
                 expected_updated_at=expected_updated_at,
                 claim_token=claim_token,
-                message=(
-                    f"自动核对确认{_success_label(publish_mode)}成功，archive_id={draft.archive_id}"
-                    if config.dqd_open_idempotency_enabled
-                    else f"HTTP 502 后自动重试{_success_label(publish_mode)}成功，archive_id={draft.archive_id}"
-                ),
+                message=f"HTTP 502 后自动重试{_success_label(publish_mode)}成功，archive_id={draft.archive_id}",
                 payload={
                     "diagnostics": draft.diagnostics,
                     "client_request_id": request_key,
                     "publish_mode": publish_mode,
-                    "retry_mode": (
-                        "idempotent_confirmation"
-                        if config.dqd_open_idempotency_enabled
-                        else "single_502_retry"
-                    ),
+                    "retry_mode": "single_502_retry",
                 },
             )
             if updated is not None:
@@ -1289,63 +1410,31 @@ def confirm_due_draft_results(
                 "client_request_id": request_key,
                 "diagnostics": exc.diagnostics,
             }
-            if config.dqd_open_idempotency_enabled and exc.result_unknown:
-                next_at = _confirmation_at(int(claimed.get("draft_confirm_attempts") or 0))
-                updated = repo.record_draft_confirmation_result(
-                    article_id,
-                    connection,
-                    outcome="PENDING",
-                    request_id=request_id,
-                    next_confirm_at=next_at,
-                    schedule_confirmation=next_at is not None,
-                    expected_updated_at=expected_updated_at,
-                    claim_token=claim_token,
-                    message="自动核对仍未得到 archive_id，暂不重发",
-                    payload=event_payload,
-                )
-                pending += 1
-                if next_at is None:
-                    exhausted += 1
-                items.append({
-                    "article_id": article_id,
-                    "error": str(exc)[:300],
-                    "pending": True,
-                    "exhausted": next_at is None,
-                })
-            elif config.dqd_open_idempotency_enabled:
-                repo.record_draft_confirmation_result(
-                    article_id,
-                    connection,
-                    outcome="FAILED",
-                    request_id=request_id,
-                    expected_updated_at=expected_updated_at,
-                    claim_token=claim_token,
-                    message=str(exc)[:300],
-                    payload=event_payload,
-                )
-                failed += 1
-            else:
-                # The first 502 may already have created a remote draft. A
-                # non-idempotent retry must therefore never open a third POST.
-                repo.record_draft_confirmation_result(
-                    article_id,
-                    connection,
-                    outcome="PENDING",
-                    request_id=request_id,
-                    schedule_confirmation=False,
-                    expected_updated_at=expected_updated_at,
-                    claim_token=claim_token,
-                    message="HTTP 502 后已自动重试一次，结果仍未确认，已停止继续重试",
-                    payload={**event_payload, "retry_mode": "single_502_retry"},
-                )
-                pending += 1
-                exhausted += 1
-                items.append({
-                    "article_id": article_id,
-                    "error": str(exc)[:300],
-                    "pending": True,
-                    "exhausted": True,
-                })
+            # 第一次 502 可能已经在上游建好文章，这次重试仍未确认结果，绝不
+            # 再开第三次请求。落 PUBLISH_FAILED 交人工核对。
+            repo.record_draft_confirmation_result(
+                article_id,
+                connection,
+                outcome="PENDING",
+                request_id=request_id,
+                schedule_confirmation=False,
+                expected_updated_at=expected_updated_at,
+                claim_token=claim_token,
+                message="HTTP 502 后已自动重试一次，结果仍未确认，请到懂球帝后台按标题核对是否已创建",
+                payload={
+                    **event_payload,
+                    "retry_mode": "single_502_retry",
+                    "needs_manual_reconcile": True,
+                },
+            )
+            pending += 1
+            exhausted += 1
+            items.append({
+                "article_id": article_id,
+                "error": str(exc)[:300],
+                "pending": True,
+                "exhausted": True,
+            })
             continue
         except PublishModeConflict as exc:
             repo.record_draft_confirmation_result(
@@ -1360,45 +1449,23 @@ def confirm_due_draft_results(
             failed += 1
             continue
         except Exception as exc:  # noqa: BLE001 - preserve uncertain remote outcomes
-            if isinstance(exc, ValueError) and config.dqd_open_idempotency_enabled:
-                repo.record_draft_confirmation_result(
-                    article_id,
-                    connection,
-                    outcome="FAILED",
-                    expected_updated_at=expected_updated_at,
-                    claim_token=claim_token,
-                    message=str(exc)[:300],
-                    payload={"error": str(exc), "client_request_id": request_key},
-                )
-                failed += 1
-                continue
-            next_at = (
-                _confirmation_at(int(claimed.get("draft_confirm_attempts") or 0))
-                if config.dqd_open_idempotency_enabled
-                else None
-            )
             repo.record_draft_confirmation_result(
                 article_id,
                 connection,
                 outcome="PENDING",
-                next_confirm_at=next_at,
-                schedule_confirmation=next_at is not None,
+                schedule_confirmation=False,
                 expected_updated_at=expected_updated_at,
                 claim_token=claim_token,
-                message=(
-                    "自动核对请求异常，暂不重发"
-                    if config.dqd_open_idempotency_enabled
-                    else "HTTP 502 后的单次自动重试异常，已停止继续重试"
-                ),
+                message="HTTP 502 后的单次自动重试异常，已停止继续重试",
                 payload={
                     "error": str(exc),
                     "exception_type": type(exc).__name__,
                     "client_request_id": request_key,
+                    "needs_manual_reconcile": True,
                 },
             )
             pending += 1
-            if next_at is None:
-                exhausted += 1
+            exhausted += 1
             items.append({"article_id": article_id, "error": str(exc)[:300], "pending": True})
 
     return {
@@ -1421,11 +1488,7 @@ class DraftConfirmationController:
         self._running = False
 
     def start(self) -> bool:
-        confirmation_enabled = (
-            self.config.dqd_open_idempotency_enabled
-            or self.config.dqd_open_502_retry_enabled
-        )
-        if not self.config.publisher_enabled or not confirmation_enabled:
+        if not self.config.publisher_enabled or not self.config.dqd_open_502_retry_enabled:
             return False
         with self._lock:
             if self._running:
@@ -1562,7 +1625,7 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
                     event_type="TITLE_DUPLICATE_DETECTED",
                     message=(
                         f"与文章 #{matched.get('id')}《{matched.get('title')}》标题高度相似"
-                        f"（共同标签 {dedup_result['shared_channels']}），已取消自动发布"
+                        f"（{title_dedup.match_scope_label(dedup_result)}），已取消自动发布"
                     ),
                     payload=dedup_result,
                 )
@@ -1643,10 +1706,14 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
             })
         except DqdOpenClientError as exc:
             if exc.result_unknown:
+                # 结果未知已排期自动确认，属于预期分支，用 ERROR 会把真故障淹没。
                 confirming += 1
+                logger.warning(
+                    "创建草稿结果未知，已进入自动确认 article_id=%s: %s", article_id, exc
+                )
             else:
                 failed += 1
-            logger.exception("创建草稿失败 article_id=%s", article_id)
+                logger.exception("创建草稿失败 article_id=%s", article_id)
             result_items.append({
                 "article_id": article_id,
                 "source": current.get("source"),
@@ -1762,7 +1829,13 @@ class PublishController:
                 self._running = False
 
 
-def create_draft_for_article(config: AppConfig, connection, article_id: int) -> dict[str, Any]:
+def create_draft_for_article(
+    config: AppConfig,
+    connection,
+    article_id: int,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
     if not config.publisher_enabled:
         raise ValueError("发布 worker 未启用，无法创建草稿")
     if not config.dqd_open_configured:
@@ -1772,6 +1845,13 @@ def create_draft_for_article(config: AppConfig, connection, article_id: int) -> 
         raise ValueError("article not found")
     if not _retry_eligible(current):
         raise ValueError(f"当前状态为 {current.get('status_label') or current.get('status') or '未知'}，不能重新创建草稿")
+    if not force and repo.draft_needs_manual_reconcile(article_id, connection):
+        # 上一次提交结果不可确认，上游可能已经有这篇了。没有幂等键，重发就可能
+        # 变成两篇，所以必须先人工核对后再显式确认重试。
+        raise ManualReconcileRequired(
+            "上一次提交的结果无法确认，上游可能已经创建过这篇文章。"
+            "请先到懂球帝后台按标题核对：若已存在请直接关联或放弃，确认不存在后再强制重试。"
+        )
     return _create_draft_attempt(
         config,
         connection,

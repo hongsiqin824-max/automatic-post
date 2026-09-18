@@ -5,6 +5,11 @@ default) and in-flight articles.  A cheap lexical pass recalls candidates and
 the configured LLM decides whether two titles report the same news fact, so
 reworded reports of one event are caught while same-topic but different-event
 titles (final squad versus preliminary squad) stay publishable.
+
+数字（轮次、比分、人数）的判断完全交给 LLM。召回阶段曾用「数字序列必须完全
+相等」做硬过滤，但它把写法差异（U-20/U20、八强/8强）和细节补充当成了事实
+冲突，反而把真重复挡在门外；而提示词里已有轮次与比分的反例，模型能区分半场
+与全场、初选与最终名单这类真冲突。
 """
 
 from __future__ import annotations
@@ -23,7 +28,6 @@ from .quality import LLMCallError, LLMService
 
 logger = logging.getLogger(__name__)
 _NORMALIZED_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
-_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 _MIN_TITLE_CHARS = 8
 # Same transport-level categories that trigger the quality-check degradation.
 _FALLBACK_CATEGORIES = frozenset({"timeout", "connection", "rate_limit", "http_error"})
@@ -85,20 +89,6 @@ def normalize_title(title: Any) -> str:
     return _NORMALIZED_RE.sub("", value)
 
 
-def number_sequences(title: Any) -> list[str]:
-    return _NUMBER_RE.findall(unicodedata.normalize("NFKC", str(title or "")))
-
-
-def has_conflicting_numbers(left: Any, right: Any) -> bool:
-    """Treat differing number sequences (rounds, scores, counts) as distinct."""
-
-    left_numbers = number_sequences(left)
-    right_numbers = number_sequences(right)
-    if not left_numbers or not right_numbers:
-        return False
-    return left_numbers != right_numbers
-
-
 def score_title_similarity(left: Any, right: Any) -> dict[str, Any]:
     a = normalize_title(left)
     b = normalize_title(right)
@@ -145,6 +135,17 @@ def shared_channels(left: Any, right: Any) -> list[int]:
     return sorted(left_ids & right_ids)
 
 
+def _same_tab(left: Any, right: Any) -> bool:
+    """True only when both sides carry the same concrete backend tab."""
+
+    if left in (None, "") or right in (None, ""):
+        return False
+    try:
+        return int(left) == int(right)
+    except (TypeError, ValueError):
+        return False
+
+
 def dedup_window_since(hours: int) -> str:
     since = datetime.now(timezone.utc) - timedelta(hours=max(1, int(hours)))
     return since.isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -159,8 +160,15 @@ def select_candidates(
     dice_min: float,
     lcs_min: int,
     limit: int,
+    tab_id: Any = None,
+    tab_dice_min: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Recall-pass shortlist: shared channel, recent-enough, lexical overlap."""
+    """Recall-pass shortlist: shared channel or same tab, recent, lexical overlap.
+
+    同一事件的稿件常被路由到不同标签，光靠标签交集会整组漏掉，所以同栏目也算
+    入围。但栏目比标签粗得多（单个栏目一天可达数百篇），仅靠同栏目入围时要求
+    更高的词面相似度 ``tab_dice_min``，避免把低相似候选灌进判定。
+    """
 
     ranked: list[dict[str, Any]] = []
     for index, article in enumerate(articles or []):
@@ -173,20 +181,22 @@ def select_candidates(
         if not title.strip():
             continue
         shared = shared_channels(channels, article.get("channels"))
-        if not shared:
-            continue
-        if has_conflicting_numbers(candidate_title, title):
+        same_tab = _same_tab(tab_id, article.get("tab_id"))
+        if not shared and not (same_tab and tab_dice_min is not None):
             continue
         score = score_title_similarity(candidate_title, title)
         if min(len(normalize_title(candidate_title)), len(normalize_title(title))) < _MIN_TITLE_CHARS:
             continue
         if not is_recall_hit(score, dice_min=dice_min, lcs_min=lcs_min):
             continue
+        if not shared and float(score.get("bigram_dice") or 0.0) < float(tab_dice_min):
+            continue
         ranked.append({
             "article": article,
             "score": score,
             "lexical_score": lexical_score(score),
             "shared_channels": shared,
+            "matched_by": "channels" if shared else "tab",
             "index": index,
         })
     ranked.sort(key=lambda item: (-item["lexical_score"], item["index"]))
@@ -257,6 +267,7 @@ def check_title_duplicate(
         "matched": None,
         "score": None,
         "shared_channels": [],
+        "matched_by": None,
         "reason": None,
         "error": None,
         "primary_error": None,
@@ -286,12 +297,14 @@ def check_title_duplicate(
         dice_min=config.title_dedup_dice_min,
         lcs_min=config.title_dedup_lcs_min,
         limit=config.title_dedup_max_candidates,
+        tab_id=article.get("tab_id"),
+        tab_dice_min=config.title_dedup_tab_dice_min,
     )
     base["checked"] = True
     base["candidate_count"] = len(candidates)
     if not candidates:
         base["outcome"] = "not_duplicate"
-        base["reason"] = "近窗口内无同标签相似标题"
+        base["reason"] = "近窗口内无同标签或同栏目的相似标题"
         return base
 
     exact = next((item for item in candidates if item["score"].get("exact")), None)
@@ -301,6 +314,7 @@ def check_title_duplicate(
             "matched": _matched_view(exact["article"]),
             "score": exact["score"],
             "shared_channels": exact["shared_channels"],
+            "matched_by": exact["matched_by"],
             "reason": "归一化标题完全一致",
         })
         return base
@@ -345,9 +359,19 @@ def check_title_duplicate(
         "matched": _matched_view(matched["article"]),
         "score": matched["score"],
         "shared_channels": matched["shared_channels"],
+        "matched_by": matched["matched_by"],
         "reason": decision["reason"] or "AI 判定为同一新闻事件",
     })
     return base
+
+
+def match_scope_label(result: dict[str, Any]) -> str:
+    """人类可读的命中范围，供事件消息使用。"""
+
+    shared = result.get("shared_channels") or []
+    if shared:
+        return f"共同标签 {shared}"
+    return "同一栏目"
 
 
 def _matched_view(article: dict[str, Any]) -> dict[str, Any]:

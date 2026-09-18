@@ -169,15 +169,7 @@ def build_create_article_form(
         # This is sent as a form field on every draft/publish submission.
         ("no_roll_recommend", "1"),
     ]
-    request_id = str(client_request_id or "").strip()
-    if request_id and getattr(config, "dqd_open_idempotency_enabled", False):
-        field_name = str(
-            getattr(config, "dqd_open_idempotency_field", "client_request_id")
-            or "client_request_id"
-        ).strip()
-        if not field_name:
-            raise DqdOpenClientError("开放平台幂等请求字段名不能为空")
-        fields.append((field_name, request_id))
+    # 上游没有幂等请求键，client_request_id 只做本地审计，绝不作为表单字段发送。
     fields.extend(_publish_account_fields(publish_account))
     fields.extend(("tabs[]", str(tab_id)) for tab_id in backend_tab_ids)
     channels = filter_blocked_channels(article.get("channels") or [])
@@ -315,7 +307,6 @@ def _request_diagnostics(
     payload: Mapping[str, Any],
     *,
     client_request_id: str | None = None,
-    idempotency_field: str | None = None,
 ) -> dict[str, Any]:
     diagnostics: dict[str, Any] = {"request_url": request_url, "form_fields": form}
     request_id = payload.get("request_id")
@@ -323,23 +314,7 @@ def _request_diagnostics(
         diagnostics["request_id"] = str(request_id)
     if client_request_id:
         diagnostics["client_request_id"] = client_request_id
-    if idempotency_field:
-        diagnostics["idempotency_field"] = idempotency_field
     return diagnostics
-
-
-def _idempotency_context(
-    config: AppConfig,
-    client_request_id: str | None,
-) -> tuple[str | None, str | None]:
-    request_id = str(client_request_id or "").strip()
-    if not request_id or not getattr(config, "dqd_open_idempotency_enabled", False):
-        return None, None
-    field_name = str(
-        getattr(config, "dqd_open_idempotency_field", "client_request_id")
-        or "client_request_id"
-    ).strip()
-    return request_id, field_name or None
 
 
 def _enrich_error_diagnostics(
@@ -347,7 +322,6 @@ def _enrich_error_diagnostics(
     *,
     payload: Any = None,
     client_request_id: str | None = None,
-    idempotency_field: str | None = None,
     exception: BaseException | None = None,
 ) -> dict[str, Any]:
     result = dict(diagnostics or {})
@@ -357,8 +331,6 @@ def _enrich_error_diagnostics(
             result["request_id"] = str(request_id)
     if client_request_id:
         result["client_request_id"] = client_request_id
-    if idempotency_field:
-        result["idempotency_field"] = idempotency_field
     if exception is not None:
         result["exception_type"] = type(exception).__name__
     return result
@@ -402,10 +374,8 @@ class DqdOpenClient:
             status,
         )
         submission_label = "直接发布" if dict(form).get("status") == "1" else "创建草稿"
-        idempotency_request_id, idempotency_field = _idempotency_context(
-            self.config,
-            client_request_id,
-        )
+        # 仅用于本地审计与排障，不会随请求发送给上游。
+        audit_request_id = str(client_request_id or "").strip() or None
         try:
             response, payload, request_url = self.open_platform.post_signed(data=form, require_login=True)
         except OpenPlatformAuthError as exc:
@@ -415,8 +385,7 @@ class DqdOpenClient:
                 diagnostics=_enrich_error_diagnostics(
                     exc.diagnostics,
                     payload=exc.payload,
-                    client_request_id=idempotency_request_id,
-                    idempotency_field=idempotency_field,
+                    client_request_id=audit_request_id,
                 ),
             ) from exc
         except OpenPlatformConfigError as exc:
@@ -430,8 +399,7 @@ class DqdOpenClient:
                 diagnostics=_enrich_error_diagnostics(
                     exc.diagnostics,
                     payload=exc.payload,
-                    client_request_id=idempotency_request_id,
-                    idempotency_field=idempotency_field,
+                    client_request_id=audit_request_id,
                 ),
                 result_unknown=result_unknown,
             ) from exc
@@ -440,8 +408,7 @@ class DqdOpenClient:
                 f"{submission_label}请求失败: {str(exc)[:500]}",
                 diagnostics=_enrich_error_diagnostics(
                     None,
-                    client_request_id=idempotency_request_id,
-                    idempotency_field=idempotency_field,
+                    client_request_id=audit_request_id,
                     exception=exc,
                 ),
                 result_unknown=True,
@@ -451,8 +418,7 @@ class DqdOpenClient:
                 f"{submission_label}请求失败: {str(exc)[:500]}",
                 diagnostics=_enrich_error_diagnostics(
                     None,
-                    client_request_id=idempotency_request_id,
-                    idempotency_field=idempotency_field,
+                    client_request_id=audit_request_id,
                     exception=exc,
                 ),
             ) from exc
@@ -461,8 +427,7 @@ class DqdOpenClient:
             request_url,
             form,
             payload,
-            client_request_id=idempotency_request_id,
-            idempotency_field=idempotency_field,
+            client_request_id=audit_request_id,
         )
         failure_message = _business_failure_message(payload)
         if failure_message:

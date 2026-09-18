@@ -4,6 +4,7 @@ from app.services.quality import (
     LLMCallError,
     LLMService,
     analyze_body_language,
+    classify_article_tab,
     evaluate,
     html_to_text,
     is_photo_credit_advisory_plan,
@@ -146,7 +147,7 @@ def test_unstripped_clickable_attributes_go_to_review():
 def test_truncated_title_without_llm_goes_to_review():
     result = evaluate(
         title="记者：球队将在",
-        body="<p>球队确认将在周末进行一场友谊赛，完整参赛名单和比赛地点已经公布。</p>",
+        body="<p>球队确认将在周末进行一场国家队，完整参赛名单和比赛地点已经公布。</p>",
         channels=[],
     )
     assert result["needs_review"] is True
@@ -427,7 +428,7 @@ class _TitleFixFailureLLM:
 def test_title_fix_failure_preserves_ai_diagnostics():
     result = evaluate(
         title="记者：球队将在",
-        body="<p>球队确认将在周末进行一场友谊赛，完整参赛名单和比赛地点已经公布。</p>",
+        body="<p>球队确认将在周末进行一场国家队，完整参赛名单和比赛地点已经公布。</p>",
         channels=[],
         llm=_TitleFixFailureLLM(),
     )
@@ -967,3 +968,98 @@ def test_verify_removal_uses_fallback_model_after_primary_failure() -> None:
     )
     assert result["safe"] is True
     assert fallback.prompts
+
+
+class _StubClassifierLLM:
+    configured = True
+    model = "test-model"
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.prompts: list[str] = []
+
+    def chat_json(self, prompt):
+        self.prompts.append(prompt)
+        return self.payload
+
+
+_TAB_CHOICES = [
+    {"id": 9, "name": "日职联", "ai_league_guard_definition": "日本J1联赛"},
+    {"id": 24, "name": "日职乙", "ai_league_guard_definition": "日本J2联赛"},
+]
+
+
+def test_classify_article_tab_returns_picked_column() -> None:
+    llm = _StubClassifierLLM({
+        "tab_id": 24, "confidence": 0.93, "reason": "秋田属于J2",
+        "actual_competition": "日本J2联赛",
+    })
+    result = classify_article_tab("秋田蓝闪电取胜", "<p>正文</p>", _TAB_CHOICES, llm)
+    assert result == {
+        "tab_id": 24, "confidence": 0.93, "reason": "秋田属于J2",
+        "actual_competition": "日本J2联赛",
+    }
+    # 每个候选的名称与定义都必须进提示词，否则模型只能靠栏目名猜。
+    assert "日职乙" in llm.prompts[0]
+    assert "日本J2联赛" in llm.prompts[0]
+    assert "id=24" in llm.prompts[0]
+
+
+def test_classify_article_tab_reports_competition_without_a_column() -> None:
+    """候选里没有对应栏目时，仍要报出真实赛事——这是发现该建哪些栏目的依据。"""
+
+    llm = _StubClassifierLLM({
+        "tab_id": None, "confidence": 0.96, "reason": "亚运会女足，无匹配栏目",
+        "actual_competition": "亚运会",
+    })
+    result = classify_article_tab("韩国女足6-0孟加拉国", "<p>正文</p>", _TAB_CHOICES, llm)
+    assert result["tab_id"] is None
+    assert result["actual_competition"] == "亚运会"
+    # 提示词必须要求这个字段，否则模型不会主动给。
+    assert "actual_competition" in llm.prompts[0]
+
+
+def test_classify_article_tab_accepts_null_as_no_match() -> None:
+    llm = _StubClassifierLLM({"tab_id": None, "confidence": 0.9, "reason": "转会新闻"})
+    result = classify_article_tab("梅西将成俱乐部股东", "<p>正文</p>", _TAB_CHOICES, llm)
+    assert result["tab_id"] is None
+    assert result["reason"] == "转会新闻"
+
+
+def test_classify_article_tab_rejects_column_that_was_not_offered() -> None:
+    """模型报了一个没被提供的栏目，只能当调用失败。
+
+    放行会把文章挂到未经校验的栏目上，比留草稿更糟，所以这里必须抛错让上层
+    fail closed。
+    """
+
+    llm = _StubClassifierLLM({"tab_id": 999, "confidence": 0.99, "reason": "凭空捏造"})
+    try:
+        classify_article_tab("标题", "<p>正文</p>", _TAB_CHOICES, llm)
+    except LLMCallError as exc:
+        assert "未提供的栏目 ID 999" in str(exc)
+    else:
+        raise AssertionError("未提供的栏目 ID 必须抛 LLMCallError")
+
+
+def test_classify_article_tab_rejects_missing_confidence() -> None:
+    llm = _StubClassifierLLM({"tab_id": 24, "reason": "缺少置信度"})
+    try:
+        classify_article_tab("标题", "<p>正文</p>", _TAB_CHOICES, llm)
+    except LLMCallError as exc:
+        assert exc.category == "invalid_response"
+    else:
+        raise AssertionError("缺少 confidence 必须抛 LLMCallError")
+
+
+def test_classify_article_tab_requires_candidates() -> None:
+    """没有可选栏目时不该白花一次调用。"""
+
+    llm = _StubClassifierLLM({"tab_id": None, "confidence": 1.0, "reason": ""})
+    try:
+        classify_article_tab("标题", "<p>正文</p>", [], llm)
+    except LLMCallError as exc:
+        assert exc.category == "configuration"
+    else:
+        raise AssertionError("空候选集必须抛 LLMCallError")
+    assert llm.prompts == []

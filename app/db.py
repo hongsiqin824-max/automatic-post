@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS event_tab_rules (
     marker_code     TEXT NOT NULL CHECK (length(trim(marker_code)) > 0),
     tab_id          INTEGER REFERENCES tabs(id) ON DELETE SET NULL,
     publish_mode_override INTEGER CHECK (publish_mode_override IN (0, 1, 2)),
+    ai_guard_enabled INTEGER NOT NULL DEFAULT 0 CHECK (ai_guard_enabled IN (0, 1)),
     enabled         INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     first_seen_at   TEXT,
     last_seen_at    TEXT,
@@ -984,13 +985,13 @@ _TAB_GUARD_SEEDS: dict[str, str] = {
         "3. 芬超球队参加杯赛时，只有核心报道对象仍是该芬超球队才收录。"
         "4. 正文信息不足以确认时，按“不属于”处理。"
     ),
-    "友谊赛": (
-        "本栏目收录以足球友谊赛/热身赛（包括俱乐部季前赛、国家队热身赛等非正式竞赛性比赛）为主要报道对象的文章。"
+    "国家队": (
+        "本栏目收录以足球国家队/热身赛（包括俱乐部季前赛、国家队热身赛等非正式竞赛性比赛）为主要报道对象的文章。"
         "判定要点："
         "1. 只看文章的主要报道对象，不做关键词匹配；仅顺带提及不算。"
         "2. 主要内容属于任何正式联赛、杯赛、洲际赛或世界大赛正赛的，不收录。"
-        "3. 一场明确定性为友谊赛/热身赛/表演赛的比赛才收录。"
-        "4. 正文信息不足以确认是否为友谊赛时，按“不属于”处理。"
+        "3. 一场明确定性为国家队/热身赛/表演赛的比赛才收录。"
+        "4. 正文信息不足以确认是否为国家队时，按“不属于”处理。"
     ),
     "世俱杯": (
         "本栏目收录以国际足联世俱杯（FIFA Club World Cup，世俱杯）为主要报道对象的文章，"
@@ -1075,6 +1076,24 @@ def _seed_tab_ai_league_guard(connection: sqlite3.Connection) -> None:
             )
 
 
+def _ensure_event_tab_rule_ai_guard_column(
+    connection: sqlite3.Connection, columns: set[str]
+) -> None:
+    """Add the per-rule AI guard switch to an existing table.
+
+    Defaults to 0 so upgrading never starts spending model calls on articles
+    that already resolve to a column through this rule.
+    """
+
+    if "ai_guard_enabled" in columns:
+        return
+    with connection:
+        connection.execute(
+            "ALTER TABLE event_tab_rules ADD COLUMN ai_guard_enabled "
+            "INTEGER NOT NULL DEFAULT 0 CHECK (ai_guard_enabled IN (0, 1))"
+        )
+
+
 def _migrate_event_tab_rule_scope(connection: sqlite3.Connection) -> None:
     """Upgrade legacy global rules to source-aware rules without changing IDs."""
 
@@ -1083,6 +1102,7 @@ def _migrate_event_tab_rule_scope(connection: sqlite3.Connection) -> None:
         for row in connection.execute("PRAGMA table_info(event_tab_rules)").fetchall()
     }
     if {"source_code", "publish_mode_override"}.issubset(columns):
+        _ensure_event_tab_rule_ai_guard_column(connection, columns)
         _ensure_event_tab_rule_indexes(connection)
         return
     if "source_code" in columns:
@@ -1091,6 +1111,7 @@ def _migrate_event_tab_rule_scope(connection: sqlite3.Connection) -> None:
                 "ALTER TABLE event_tab_rules ADD COLUMN publish_mode_override "
                 "INTEGER CHECK (publish_mode_override IN (0, 1))"
             )
+        _ensure_event_tab_rule_ai_guard_column(connection, columns)
         _ensure_event_tab_rule_indexes(connection)
         return
 
@@ -1115,6 +1136,7 @@ def _migrate_event_tab_rule_scope(connection: sqlite3.Connection) -> None:
                 marker_code     TEXT NOT NULL CHECK (length(trim(marker_code)) > 0),
                 tab_id          INTEGER REFERENCES tabs(id) ON DELETE SET NULL,
                 publish_mode_override INTEGER CHECK (publish_mode_override IN (0, 1, 2)),
+                ai_guard_enabled INTEGER NOT NULL DEFAULT 0 CHECK (ai_guard_enabled IN (0, 1)),
                 enabled         INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
                 first_seen_at   TEXT,
                 last_seen_at    TEXT,
@@ -1124,10 +1146,11 @@ def _migrate_event_tab_rule_scope(connection: sqlite3.Connection) -> None:
             );
             INSERT INTO event_tab_rules_v2
             (id, source_code, marker_type, marker_code, tab_id,
-             publish_mode_override, enabled, first_seen_at, last_seen_at,
+             publish_mode_override, ai_guard_enabled, enabled,
+             first_seen_at, last_seen_at,
              sample_source, created_at, updated_at)
             SELECT id, NULL, marker_type, marker_code, tab_id,
-                   NULL, enabled, first_seen_at, last_seen_at,
+                   NULL, 0, enabled, first_seen_at, last_seen_at,
                    sample_source, created_at, updated_at
             FROM event_tab_rules;
             DROP TABLE event_tab_rules;

@@ -36,6 +36,7 @@ from .services.dqd_open_client import DqdOpenClientError
 from .services.publisher import (
     DraftClaimSkipped,
     DraftConfirmationController,
+    ManualReconcileRequired,
     PublishController,
     create_draft_for_article,
 )
@@ -591,7 +592,6 @@ def _settings_view(app: Flask) -> dict:
         "llm_configured": cfg.llm_configured,
         "dqd_configured": cfg.dqd_configured,
         "dqd_open_configured": cfg.dqd_open_configured,
-        "dqd_open_idempotency_enabled": cfg.dqd_open_idempotency_enabled,
         "dqd_open_redirect_uri": open_redirect_uri,
         "open_platform_auth": open_auth,
         "publisher_enabled": cfg.publisher_enabled,
@@ -1097,6 +1097,13 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/api/articles/<int:article_id>/create-draft")
     def api_create_draft(article_id: int):
+        def _wants_force_retry() -> bool:
+            """强制重试必须由前端显式带上，避免误点直接造成重复发布。"""
+
+            payload = request.get_json(silent=True) or {}
+            raw = payload.get("force", request.args.get("force", ""))
+            return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
         cfg: AppConfig = app.extensions["app_config"]
         conn = get_db()
         current = _article_view(repo.get_article(article_id, conn))
@@ -1110,7 +1117,9 @@ def create_app(test_config: dict | None = None) -> Flask:
                 "article": current,
             }), 409
         try:
-            result = create_draft_for_article(cfg, conn, article_id)
+            result = create_draft_for_article(
+                cfg, conn, article_id, force=_wants_force_retry()
+            )
             article = _article_view(repo.get_article(article_id, conn))
             if article is not None and article.get("draft_confirming"):
                 message = (
@@ -1130,6 +1139,19 @@ def create_app(test_config: dict | None = None) -> Flask:
                 "result": result,
                 "article": article,
             })
+        except ManualReconcileRequired as exc:
+            article = _article_view(repo.get_article(article_id, conn))
+            return jsonify({
+                "success": False,
+                "error": str(exc),
+                "message": str(exc),
+                "result": {
+                    "skipped": True,
+                    "reason": "needs_manual_reconcile",
+                    "requires_confirmation": True,
+                },
+                "article": article,
+            }), 409
         except DraftClaimSkipped as exc:
             article = _article_view(repo.get_article(article_id, conn))
             return jsonify({
@@ -1380,6 +1402,9 @@ def create_app(test_config: dict | None = None) -> Flask:
                 )
             ):
                 raise ValueError("publish_mode_override 必须是 null、0（草稿）、1（直接发布）或 2（放弃）")
+            ai_guard_enabled = payload.get("ai_guard_enabled", False)
+            if not isinstance(ai_guard_enabled, bool):
+                raise ValueError("ai_guard_enabled 必须是 JSON boolean")
             rule = repo.create_event_tab_rule(
                 payload.get("marker_type"),
                 payload.get("marker_code"),
@@ -1387,6 +1412,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 enabled=enabled,
                 source_code=source_code,
                 publish_mode_override=publish_mode_override,
+                ai_guard_enabled=ai_guard_enabled,
                 connection=get_db(),
             )
             return jsonify({
@@ -1408,7 +1434,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             update_args: dict[str, Any] = {}
             for field in (
                 "marker_type", "marker_code", "tab_id", "source_code",
-                "publish_mode_override", "enabled",
+                "publish_mode_override", "ai_guard_enabled", "enabled",
             ):
                 if field in payload:
                     update_args[field] = payload[field]
@@ -1416,6 +1442,10 @@ def create_app(test_config: dict | None = None) -> Flask:
                 raise ValueError("至少提供一个需要更新的字段")
             if "enabled" in update_args and not isinstance(update_args["enabled"], bool):
                 raise ValueError("enabled 必须是 JSON boolean")
+            if "ai_guard_enabled" in update_args and not isinstance(
+                update_args["ai_guard_enabled"], bool
+            ):
+                raise ValueError("ai_guard_enabled 必须是 JSON boolean")
             if "source_code" in update_args:
                 source_code = update_args["source_code"]
                 if source_code is not None and not isinstance(source_code, str):
@@ -1458,8 +1488,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             "llm_configured": cfg.llm_configured,
             "dqd_session_configured": cfg.dqd_configured,
             "dqd_open_configured": cfg.dqd_open_configured,
-            "dqd_open_idempotency_enabled": cfg.dqd_open_idempotency_enabled,
-            "dqd_open_redirect_uri": cfg.dqd_open_redirect_uri,
+                "dqd_open_redirect_uri": cfg.dqd_open_redirect_uri,
             "publisher_enabled": cfg.publisher_enabled,
         })
 

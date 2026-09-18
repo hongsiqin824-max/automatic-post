@@ -1052,7 +1052,8 @@ def _event_rule_tab_id(value: Any, conn) -> Optional[int]:
 def create_event_tab_rule(marker_type: Any, marker_code: Any,
                           tab_id: Any = None, enabled: Any = True,
                           connection=None, *, source_code: Any = None,
-                          publish_mode_override: Any = None) -> dict:
+                          publish_mode_override: Any = None,
+                          ai_guard_enabled: Any = False) -> dict:
     conn = _conn(connection)
     normalized_type = _event_marker_type(marker_type)
     normalized_code = _event_marker_code(marker_code)
@@ -1060,17 +1061,18 @@ def create_event_tab_rule(marker_type: Any, marker_code: Any,
     enabled_value = _enabled_int(enabled)
     normalized_source = _event_rule_source_code(source_code, conn)
     publish_override = _event_rule_publish_mode(publish_mode_override)
+    guard_value = int(bool(ai_guard_enabled))
     now = _now()
     with conn:
         cursor = conn.execute(
             """
             INSERT INTO event_tab_rules
             (source_code, marker_type, marker_code, tab_id,
-             publish_mode_override, enabled, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?)
+             publish_mode_override, ai_guard_enabled, enabled, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
             """,
             (normalized_source, normalized_type, normalized_code, target_tab_id,
-             publish_override, enabled_value, now, now),
+             publish_override, guard_value, enabled_value, now, now),
         )
     result = get_event_tab_rule(cursor.lastrowid, conn)
     if result is None:  # pragma: no cover - row was just inserted
@@ -1082,7 +1084,8 @@ def update_event_tab_rule(rule_id: int, connection=None, *,
                           marker_type: Any = None, marker_code: Any = None,
                           tab_id: Any = _UNSET, enabled: Any = None,
                           source_code: Any = _UNSET,
-                          publish_mode_override: Any = _UNSET) -> dict:
+                          publish_mode_override: Any = _UNSET,
+                          ai_guard_enabled: Any = None) -> dict:
     conn = _conn(connection)
     current = get_event_tab_rule(rule_id, conn)
     if current is None:
@@ -1112,16 +1115,21 @@ def update_event_tab_rule(rule_id: int, connection=None, *,
         if publish_mode_override is _UNSET
         else _event_rule_publish_mode(publish_mode_override)
     )
+    guard_value = (
+        int(current.get("ai_guard_enabled") or 0)
+        if ai_guard_enabled is None
+        else int(bool(ai_guard_enabled))
+    )
     with conn:
         conn.execute(
             """
             UPDATE event_tab_rules
             SET source_code=?, marker_type=?, marker_code=?, tab_id=?,
-                publish_mode_override=?, enabled=?, updated_at=?
+                publish_mode_override=?, ai_guard_enabled=?, enabled=?, updated_at=?
             WHERE id=?
             """,
             (normalized_source, normalized_type, normalized_code, target_tab_id,
-             publish_override, enabled_value, _now(), current["id"]),
+             publish_override, guard_value, enabled_value, _now(), current["id"]),
         )
     result = get_event_tab_rule(current["id"], conn)
     if result is None:  # pragma: no cover - row was just updated
@@ -1544,6 +1552,51 @@ def is_publishable_tab(tab: Mapping[str, Any]) -> bool:
         return False
 
 
+def event_tab_rule_allows_ai_guard(rule_id: Any, connection=None) -> bool:
+    """Whether the rule that routed an article still wants an AI column check.
+
+    A league short code normally means the column is already known, so the
+    guard skips those articles. Some short codes are catch-alls though
+    (``intl`` collects every "other international" story and lands them in
+    「国家队」), and for those the routed column is a guess worth re-checking.
+    This switch is per rule so turning it on for one catch-all cannot start
+    spending model calls on every routed article.
+
+    Returns ``False`` when the rule id is missing or the rule was deleted:
+    without a rule there is nobody who could have opted in.
+    """
+
+    if rule_id in (None, ""):
+        return False
+    try:
+        numeric_rule_id = int(rule_id)
+    except (TypeError, ValueError):
+        return False
+    row = _conn(connection).execute(
+        "SELECT ai_guard_enabled FROM event_tab_rules WHERE id=?",
+        (numeric_rule_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    return int(row["ai_guard_enabled"] or 0) == 1
+
+
+def is_active_tab(tab: Mapping[str, Any]) -> bool:
+    """Return whether *tab* is still switched on.
+
+    Column mappings on an article are a snapshot taken at ingest time, so a
+    column switched off afterwards stays in ``article_tabs``. Publish-time reads
+    pair this with :func:`is_publishable_tab` rather than trusting the stored
+    mapping: an operator switching a column off expects its articles to stop
+    going out, not to keep flowing to a column that is no longer maintained.
+    """
+
+    try:
+        return int(tab.get("enabled") or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
 def _published_tab_names(article: Mapping[str, Any]) -> list[str]:
     """Return the column names to record for a published article.
 
@@ -1564,6 +1617,30 @@ def _published_tab_names(article: Mapping[str, Any]) -> list[str]:
         if is_publishable_tab(legacy):
             names = [str(article["tab_name"]).strip()]
     return names
+
+
+def list_guard_candidate_tabs(connection=None) -> list[dict]:
+    """Columns the AI column classifier may route an article into.
+
+    A judgement definition is required: without one the model has nothing but
+    the name to go on. The generic「精选」column is excluded because it is not an
+    event column — every article keeps it alongside its event column, so
+    offering it would let the classifier "reassign" an article to where it
+    already is.
+
+    Switched-off columns stay in the list on purpose. The classifier should be
+    able to say "this is a CBA story" even while CBA is paused; the article is
+    then filed under CBA as a draft instead of being published. Callers decide
+    that from ``enabled``, which is part of every returned row.
+    """
+
+    conn = _conn(connection)
+    return _rows(conn.execute(
+        "SELECT * FROM tabs "
+        "WHERE TRIM(COALESCE(ai_league_guard_definition,'')) <> '' "
+        "AND backend_tab_id <> ? ORDER BY id",
+        (GENERIC_SOURCE_BACKEND_TAB_ID,),
+    ).fetchall())
 
 
 def reassign_article_event_tab(
@@ -1648,7 +1725,16 @@ def resolve_article_publish_mode(article_id: int, connection=None) -> dict:
         if is_publishable_tab(tab)
     ]
     tab_ids = [int(tab["id"]) for tab in tabs]
-    tab_modes = [_publish_mode_int(tab.get("publish_mode", 0)) for tab in tabs]
+    # A switched-off column may still receive drafts, so it does not get a vote
+    # on which mode the operator wants — it only forces the outcome down to 0
+    # below. Leaving it out of the vote also stops a paused column from turning
+    # into a phantom mode conflict.
+    has_disabled_tab = any(not is_active_tab(tab) for tab in tabs)
+    tab_modes = [
+        _publish_mode_int(tab.get("publish_mode", 0))
+        for tab in tabs
+        if is_active_tab(tab)
+    ]
     unique_modes = sorted(set(tab_modes))
     tab_conflict = len(unique_modes) > 1
     if rule_override is not None:
@@ -1659,6 +1745,10 @@ def resolve_article_publish_mode(article_id: int, connection=None) -> dict:
         configured_mode = unique_modes[0] if len(unique_modes) == 1 else (
             0 if not tab_modes else None
         )
+    # 停用是一道强制降级闸门，压过栏目模式、来源覆盖和赛事规则：不能往一个已经
+    # 关掉的栏目里直发。放弃（2）不受影响——那是更强的终止意图。
+    if has_disabled_tab and configured_mode == 1:
+        configured_mode = 0
     snapshot = (
         None if row["publish_mode"] is None
         else _publish_mode_int(row["publish_mode"])
@@ -2020,7 +2110,7 @@ REPORT_TAB_NAMES = (
     "巴甲",
     "瑞典超",
     "德乙",
-    "友谊赛",
+    "国家队",
     "挪超",
     "美职联",
     "日职乙",
@@ -2102,7 +2192,7 @@ def list_title_dedup_candidates(since: str, exclude_id: int, connection=None) ->
 
     rows = _conn(connection).execute(
         """
-        SELECT id, title_final, channels_json, status, published_at, dqd_archive_id
+        SELECT id, title_final, channels_json, tab_id, status, published_at, dqd_archive_id
         FROM articles
         WHERE id <> ?
           AND (
@@ -2555,12 +2645,15 @@ def record_draft_confirmation_result(
         error = message or current.get("error")
         archive_value = current.get("dqd_archive_id")
     else:
-        target_status = "DRAFT_CONFIRMING"
         confirm_at = (
             _confirmation_next_at(next_confirm_at, now=now)
             if schedule_confirmation
             else None
         )
+        # 不变量：留在 DRAFT_CONFIRMING 必须带确认排期。认领确认任务的查询要求
+        # draft_next_confirm_at IS NOT NULL，没有排期还显示「确认中」等于放弃了
+        # 自动确认却假装还在处理，文章会无声卡死。改落人工可见的失败态。
+        target_status = "DRAFT_CONFIRMING" if confirm_at else "PUBLISH_FAILED"
         uncertain_since = current.get("draft_uncertain_since") or now
         error = message or current.get("error")
         archive_value = current.get("dqd_archive_id")
@@ -2987,6 +3080,29 @@ def manual_review_update(article_id: int, action: str, connection=None, *,
              _json(payload, {}), now),
         )
     return get_article(article_id, conn)
+
+
+def draft_needs_manual_reconcile(article_id: int, connection=None) -> bool:
+    """True when the latest attempt may already have created an upstream article.
+
+    上游既没有幂等请求键也没有查询接口，这类「结果不可确认」的提交无法自动判断
+    到底成功没有。再发一次就可能产生第二篇，所以人工重试前必须先去后台核对。
+    """
+
+    numeric_article_id = _positive_int(article_id, "article id")
+    row = _conn(connection).execute(
+        """
+        SELECT payload_json FROM article_events
+        WHERE article_id=?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (numeric_article_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    payload = _loads(row["payload_json"], {})
+    return bool(isinstance(payload, Mapping) and payload.get("needs_manual_reconcile"))
 
 
 def list_article_events(article_id: int, connection=None) -> list[dict]:

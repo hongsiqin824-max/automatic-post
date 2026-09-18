@@ -43,6 +43,11 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_choice(name: str, default: str, allowed: frozenset[str]) -> str:
+    value = (os.getenv(name) or "").strip().lower()
+    return value if value in allowed else default
+
+
 def _env_json_object(name: str) -> dict[str, str]:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -123,13 +128,9 @@ class AppConfig:
     dqd_open_status: int = _env_int("DQD_OPEN_STATUS", 0)
     dqd_open_timeout: int = max(5, _env_int("DQD_OPEN_TIMEOUT_SECONDS", 30))
     dqd_open_archive_level: str = os.getenv("DQD_OPEN_ARCHIVE_LEVEL", "B").strip().upper() or "B"
-    dqd_open_idempotency_enabled: bool = _env_bool(
-        "DQD_OPEN_IDEMPOTENCY_ENABLED", False
-    )
-    dqd_open_idempotency_field: str = (
-        os.getenv("DQD_OPEN_IDEMPOTENCY_FIELD", "client_request_id").strip()
-        or "client_request_id"
-    )
+    # 懂球帝开放平台没有幂等请求键，也没有查询接口，因此任何「结果未知后重发」
+    # 都可能创建出第二篇。只保留创建草稿的一次性 502 重试：草稿重复只落在后台
+    # 且可人工删除，而直接发布的重复对读者可见，一律不重发。
     dqd_open_502_retry_enabled: bool = _env_bool(
         "DQD_OPEN_502_RETRY_ENABLED", True
     )
@@ -181,8 +182,33 @@ class AppConfig:
     title_dedup_enabled: bool = _env_bool("AUTOMATIC_POST_TITLE_DEDUP_ENABLED", True)
     title_dedup_hours: int = max(1, min(72, _env_int("AUTOMATIC_POST_TITLE_DEDUP_HOURS", 24)))
     title_dedup_dice_min: float = max(0.0, min(1.0, _env_float("AUTOMATIC_POST_TITLE_DEDUP_DICE_MIN", 0.25)))
+    # 同一事件的稿件常被路由到不同标签，因此同栏目也纳入召回；但栏目比标签粗得多，
+    # 仅靠同栏目入围时要求更高的词面相似度，避免把低相似候选灌进 LLM 判定。
+    title_dedup_tab_dice_min: float = max(0.0, min(1.0, _env_float("AUTOMATIC_POST_TITLE_DEDUP_TAB_DICE_MIN", 0.6)))
     title_dedup_lcs_min: int = max(2, min(12, _env_int("AUTOMATIC_POST_TITLE_DEDUP_LCS_MIN", 4)))
     title_dedup_max_candidates: int = max(1, min(10, _env_int("AUTOMATIC_POST_TITLE_DEDUP_MAX_CANDIDATES", 3)))
+
+    # AI 栏目归属护栏。原实现只会逐个追问「是否属于某个预配候选栏目」
+    # （tabs.ai_fallback_tab_ids），近半数栏目没配候选，于是 AI 答完「不属于」
+    # 就无处可去、文章滞留草稿。开启分类模式后改为一次调用在全部候选栏目里选一个，
+    # 覆盖面不再取决于人工配置。关掉即回退到原级联行为。
+    league_guard_classifier_enabled: bool = _env_bool(
+        "AUTOMATIC_POST_LEAGUE_GUARD_CLASSIFIER", True
+    )
+    league_guard_min_confidence: float = max(
+        0.0, min(1.0, _env_float("AUTOMATIC_POST_LEAGUE_GUARD_MIN_CONFIDENCE", 0.9))
+    )
+    # 改挂到别的栏目后用哪个发布模式：
+    #   always_direct 一律升级为直接发布（默认，也是改造前的级联行为）
+    #   target        沿用目标栏目自己的 publish_mode
+    # 默认取 always_direct 而不是 target：32 个候选栏目里只有「瑞典超」「澳超」
+    # 配成直发，其余都是草稿，所以 target 会让绝大多数改挂结果停在草稿——纠偏挂
+    # 对了栏目却发不出去，等于把现有级联的收益也一起退掉。
+    league_guard_reassign_publish_mode: str = _env_choice(
+        "AUTOMATIC_POST_LEAGUE_GUARD_REASSIGN_MODE",
+        "always_direct",
+        frozenset({"target", "always_direct"}),
+    )
 
     # Concurrent quality workers per ingestion run; 1 keeps serial behavior.
     quality_workers: int = max(1, min(8, _env_int("AUTOMATIC_POST_QUALITY_WORKERS", 4)))

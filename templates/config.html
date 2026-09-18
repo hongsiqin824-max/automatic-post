@@ -65,7 +65,7 @@
     <div class="competition-rule-list" data-competition-rule-list>
       {% for rule in event_tab_rules|default([]) %}
       {% set rule_publish_mode = rule.publish_mode_override|default(none) %}
-      <div class="competition-rule-row" data-competition-rule-row data-id="{{ rule.id }}" data-marker-type="{{ rule.marker_type }}" data-marker-code="{{ rule.marker_code|e }}" data-tab-id="{{ rule.tab_id|default('', true) }}" data-source-code="{{ rule.source_code|default('', true)|e }}" data-publish-mode-override="{{ '' if rule_publish_mode is none else rule_publish_mode }}" data-enabled="{{ 'true' if rule.enabled else 'false' }}" data-pending="{{ 'false' if rule.tab_id else 'true' }}" data-search-text="{{ rule.marker_type|lower }} {{ rule.marker_code|lower }} {{ rule.tab_name|default('', true)|lower }} {{ rule.backend_tab_id|default('', true) }} {{ rule.source_code|default('全部来源', true)|lower }} {{ rule.source_display_name|default('', true)|lower }} {{ rule.sample_source|default('', true)|lower }}">
+      <div class="competition-rule-row" data-competition-rule-row data-id="{{ rule.id }}" data-marker-type="{{ rule.marker_type }}" data-marker-code="{{ rule.marker_code|e }}" data-tab-id="{{ rule.tab_id|default('', true) }}" data-source-code="{{ rule.source_code|default('', true)|e }}" data-publish-mode-override="{{ '' if rule_publish_mode is none else rule_publish_mode }}" data-ai-guard-enabled="{{ 'true' if rule.ai_guard_enabled else 'false' }}" data-enabled="{{ 'true' if rule.enabled else 'false' }}" data-pending="{{ 'false' if rule.tab_id else 'true' }}" data-search-text="{{ rule.marker_type|lower }} {{ rule.marker_code|lower }} {{ rule.tab_name|default('', true)|lower }} {{ rule.backend_tab_id|default('', true) }} {{ rule.source_code|default('全部来源', true)|lower }} {{ rule.source_display_name|default('', true)|lower }} {{ rule.sample_source|default('', true)|lower }}">
         <div class="competition-rule-marker">
           <span class="rule-type-badge rule-type-{{ rule.marker_type }}">{{ rule.marker_type }}</span>
           <div><strong><code>{{ rule.marker_code }}</code></strong><small>{% if rule.source_code %}来源：{{ rule.source_display_name|default(rule.source_code, true) }} · {{ rule.source_code }}{% else %}适用全部来源{% endif %}</small></div>
@@ -73,10 +73,10 @@
         <div class="competition-rule-target" data-competition-rule-target>
           {% if rule.tab_id %}
           <strong>{{ rule.tab_name|default('栏目已删除', true) }}</strong>
-          <small>后台栏目 ID：{{ rule.backend_tab_id|default('未知', true) }} · {{ '放弃' if rule_publish_mode == 2 else ('直接发布' if rule_publish_mode == 1 else ('创建草稿' if rule_publish_mode == 0 else '跟随原配置')) }}</small>
+          <small>后台栏目 ID：{{ rule.backend_tab_id|default('未知', true) }} · {{ '放弃' if rule_publish_mode == 2 else ('直接发布' if rule_publish_mode == 1 else ('创建草稿' if rule_publish_mode == 0 else '跟随原配置')) }}{% if rule.ai_guard_enabled %} · AI 归属校验{% endif %}</small>
           {% else %}
           <strong class="pending-text">待配置</strong>
-          <small>沿用来源原栏目 · {{ '放弃' if rule_publish_mode == 2 else ('直接发布' if rule_publish_mode == 1 else ('创建草稿' if rule_publish_mode == 0 else '跟随原配置')) }}</small>
+          <small>沿用来源原栏目 · {{ '放弃' if rule_publish_mode == 2 else ('直接发布' if rule_publish_mode == 1 else ('创建草稿' if rule_publish_mode == 0 else '跟随原配置')) }}{% if rule.ai_guard_enabled %} · AI 归属校验{% endif %}</small>
           {% endif %}
         </div>
         <div class="competition-rule-seen">
@@ -132,7 +132,7 @@
     <div class="setting-line"><div><strong>拉取周期</strong><span>系统会按此间隔请求已启用的来源</span></div><span class="setting-value">每 {{ settings.interval_minutes|default(10) }} 分钟</span></div>
     <div class="setting-line"><div><strong>默认文章等级</strong><span>当前所有文章进入系统时使用固定等级</span></div><span class="level-mark">B</span></div>
     <div class="setting-line"><div><strong>开放平台发布</strong><span>需同时配置开放平台并启用发布 worker</span></div><span class="setting-value">{{ '已启用' if settings.publisher_enabled and settings.dqd_open_configured else ('仅已配置' if settings.dqd_open_configured else '未配置') }}</span></div>
-    <div class="setting-line"><div><strong>草稿结果自动确认</strong><span>仅在上游支持 client_request_id 幂等后启用</span></div><span class="setting-value">{{ '已启用' if settings.dqd_open_idempotency_enabled else '安全模式：不自动重发' }}</span></div>
+    <div class="setting-line"><div><strong>结果未知时的处理</strong><span>上游无幂等键与查询接口，重发会产生重复文章</span></div><span class="setting-value">仅创建草稿做一次 502 重试，直接发布一律转人工核对</span></div>
   </section>
 
   <section class="panel scheduler-config">
@@ -210,6 +210,7 @@
     <label class="field"><span>目标栏目</span><select name="tab_id"><option value="">待配置（沿用来源原栏目）</option>{% for tab in tabs %}<option value="{{ tab.id }}" {% if not tab.enabled %}disabled{% endif %}>{{ tab.name }} · 后台 ID {{ tab.backend_tab_id }}{% if not tab.enabled %}（已停用）{% endif %}</option>{% endfor %}</select><small class="field-hint">清空或暂不选择栏目时，这类文章继续使用来源原栏目。</small></label>
     <label class="field"><span>适用来源</span><select name="source_code"><option value="">全部来源</option>{% for source in sources %}<option value="{{ source.code|e }}">{{ source.name|default(source.code) }} · {{ source.code }}</option>{% endfor %}</select><small class="field-hint">指定来源后只匹配该 source；选择全部来源时保持现有全局规则行为。</small></label>
     <label class="field"><span>发布动作</span><select name="publish_mode_override"><option value="">跟随原配置</option><option value="0">创建草稿</option><option value="1">直接发布</option><option value="2">放弃</option></select><small class="field-hint">跟随原配置时，继续按来源覆盖和栏目模式决定；直接发布会在文章首次提交后立即上线；放弃会让命中的新文章直接作废，不创建草稿也不发布。</small></label>
+    <label class="account-enabled-field"><span><strong>AI 归属校验</strong><small>命中本规则的文章，仍让 AI 判断真正该归属哪个栏目；判出别的启用栏目就改挂过去，判不出则维持创建草稿。适合 intl 这类「其他国际」兜底短码——它的目标栏目只是猜测。仅在发布动作为「创建草稿」时生效。</small></span><span class="switch"><input type="checkbox" name="ai_guard_enabled" aria-label="对命中本规则的文章做 AI 归属校验"><span></span></span></label>
     <label class="account-enabled-field"><span><strong>启用规则</strong><small>停用后视为未命中，文章继续沿用后续规则或来源原栏目。</small></span><span class="switch"><input type="checkbox" name="enabled" checked aria-label="启用赛事栏目规则"><span></span></span></label>
     <div class="modal-actions"><button class="button button-quiet" type="submit" formnovalidate value="cancel">取消</button><button class="button button-primary" type="submit" value="default"><i data-lucide="save"></i>保存规则</button></div>
   </form>
