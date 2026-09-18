@@ -607,6 +607,11 @@ def _apply_ai_league_guard(
     guard_record = {
         "tab_id": final_tab_id,
         "tab_name": final_tab_name,
+        # 被校验的原栏目。``tab_name`` 记的是最终落点，改挂成功后两者不同，
+        # 于是「这篇原本挂在哪」只剩 reason 里的自然语言可查——按栏目统计护栏
+        # 效果时会把改挂走的文章算到目标栏目名下。单独留一列结构化的原栏目。
+        "guard_tab_id": guard_tab.get("id"),
+        "guard_tab_name": tab_name,
         "configured_publish_mode": int(configured_mode),
         "effective_publish_mode": effective_mode,
         "upgraded_to_publish": effective_mode != int(configured_mode),

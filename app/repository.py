@@ -1322,6 +1322,9 @@ def upsert_material(material: Mapping[str, Any], connection=None) -> dict:
 
     Re-fetching an existing key refreshes content and ``last_seen_at`` but does
     not reset workflow status or overwrite manually edited final content.
+    ``updated_at`` only moves while the article is still ``RECEIVED``/``ERROR``:
+    once it is in flight that column means "how long the local state has been
+    stuck", which several recovery paths depend on.
     """
 
     conn = _conn(connection)
@@ -1455,7 +1458,15 @@ def upsert_material(material: Mapping[str, Any], connection=None) -> dict:
                     THEN ? ELSE litpic END,
                 channels_json=CASE WHEN status IN ('RECEIVED','ERROR')
                     THEN ? ELSE channels_json END,
-                raw_json=?, updated_at=?, last_seen_at=?
+                raw_json=?,
+                -- 只有还没进入处理流程的稿件才算「被改动过」。已经在流转的稿件
+                -- 被上游重复返回时只刷新 last_seen_at：updated_at 是判断本地
+                -- 状态停滞多久的依据（PUBLISHING 回收、NEEDS_REVIEW 重检、
+                -- 状态转换的乐观锁都读它），让上游的重复推送去刷新它，会让这些
+                -- 判断永远看到「刚刚才动过」，卡住的稿件因此再也回收不了。
+                updated_at=CASE WHEN status IN ('RECEIVED','ERROR')
+                    THEN ? ELSE updated_at END,
+                last_seen_at=?
             WHERE id=?
             """,
             (item["upstream_archive_id"], item["title_original"], item["title_final"],

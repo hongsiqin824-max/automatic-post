@@ -1107,6 +1107,66 @@ def test_publishing_timeout_lands_in_manual_state(app):
     assert events[-1]["payload"]["needs_manual_reconcile"] is True
 
 
+def test_repeated_upstream_fetch_must_not_hide_a_stuck_article(app):
+    """上游重复推送同一条素材，不得把卡住的稿件藏过回收窗口。
+
+    线上真实故障：拉取周期与 ``PUBLISHING_STALE_SECONDS`` 都是 600 秒，而
+    ``upsert_material`` 当时会无条件刷新 ``updated_at``。于是每轮先把卡住稿件的
+    ``updated_at`` 刷成「现在」，同一轮的回收再判断「停滞是否超过 600 秒」，永远
+    不成立——两篇稿件因此在 PUBLISHING 卡了三个多小时。``updated_at`` 表示本地
+    状态停滞多久，只有 last_seen_at 该跟着上游走。
+    """
+
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_source("marca", tab_id=tab["id"], enabled=True, connection=conn)
+        material = _ready_article()
+        article = repo.upsert_material(material, conn)["article"]
+        repo.transition_status(article["id"], "PUBLISHING", conn)
+        stale = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        with conn:
+            conn.execute("UPDATE articles SET updated_at=? WHERE id=?", (stale, article["id"]))
+
+        # 上游又推了一遍同一条素材，和线上每 600 秒一轮的行为一致。
+        refetched = repo.upsert_material(material, conn)["article"]
+        result = recover_stale_publishing_articles(conn)
+        updated = repo.get_article(article["id"], conn)
+
+    assert refetched["updated_at"] == stale
+    assert refetched["last_seen_at"] > stale
+    assert result["timed_out"] == 1
+    assert updated["status"] == "PUBLISH_FAILED"
+
+
+def test_upsert_still_refreshes_updated_at_before_processing_starts(app):
+    """还没开始处理的稿件被重新拉取时，``updated_at`` 仍要跟着内容一起走。
+
+    上一个测试锁的是「在途稿件不受上游刷新影响」，这里锁住边界的另一侧：
+    RECEIVED 阶段内容本来就会被覆盖，此时 ``updated_at`` 必须照常更新，否则
+    「最近更新」列表会停在入库那一刻。
+    """
+
+    with app.app_context():
+        conn = get_db()
+        material = _ready_article()
+        created = repo.upsert_material(material, conn)["article"]
+        stale = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        with conn:
+            conn.execute("UPDATE articles SET updated_at=? WHERE id=?", (stale, created["id"]))
+
+        material["translate_title"] = "马卡：球队改口，安排全部推迟"
+        refetched = repo.upsert_material(material, conn)["article"]
+
+    assert refetched["status"] == "RECEIVED"
+    assert refetched["title_final"] == "马卡：球队改口，安排全部推迟"
+    assert refetched["updated_at"] > stale
+
+
 def test_manual_retry_blocked_until_reconciled_then_allowed_with_force(app, monkeypatch):
     """Retrying an unconfirmed submission needs an explicit force flag."""
 
@@ -2131,6 +2191,11 @@ def test_classifier_reassigns_without_configured_fallback_candidates(app, monkey
     assert guard["classifier_used"] is True
     assert guard["reassigned_tab_id"] == j2_tab["id"]
     assert guard["fallback_tab_name"] == "日职乙"
+    # 改挂成功后 tab_name 指向落点，被校验的原栏目单独留一列，否则按栏目统计
+    # 护栏效果时会把改挂走的文章算到目标栏目名下。
+    assert guard["tab_name"] == "日职乙"
+    assert guard["guard_tab_name"] == "日职联"
+    assert guard["guard_tab_id"] == j1_tab["id"]
 
 
 def test_classifier_files_into_disabled_column_as_draft(app, monkeypatch):
