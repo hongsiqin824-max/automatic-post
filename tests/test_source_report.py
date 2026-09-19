@@ -94,6 +94,38 @@ def test_report_text_identifies_sources_that_share_a_display_name():
     assert "韩媒(naversp)" in text
 
 
+def test_every_normal_source_is_listed_without_folding():
+    """正常来源不折叠：被省略的来源等于没监控，看不出它本期是什么状况。"""
+
+    stats = [_stats(f"src{index:02d}", 30 - index) for index in range(30)]
+    anomalies = detect_anomalies(compare_periods(stats, stats), period_hours=8)
+    assert len(anomalies["normal"]) == 30
+
+    text = build_report_text(
+        "2026-09-18T03:00:00.000Z", "2026-09-18T11:00:00.000Z",
+        generate_summary([]), anomalies,
+    )
+    assert "📋 正常（共30个）" in text
+    assert "另有" not in text
+    for index in range(30):
+        assert f"src{index:02d}" in text
+    assert "30. " in text
+
+
+def test_disabled_sources_are_summarised_in_one_line():
+    """停用来源不参与统计，但要报个数：否则列表变短时分不清是关掉了还是挂了。"""
+
+    anomalies = detect_anomalies(compare_periods([_stats("a", 5)], []), period_hours=8)
+    args = ("2026-09-18T03:00:00.000Z", "2026-09-18T11:00:00.000Z",
+            generate_summary([]), anomalies)
+
+    assert "（另有 72 个来源已停用，不计入统计）" in build_report_text(
+        *args, disabled_sources=72
+    )
+    # 一个都没停用时不该冒出这行。
+    assert "已停用" not in build_report_text(*args)
+
+
 def test_missing_baseline_does_not_become_thirty_new_source_alerts():
     """首期没有昨日同期快照时，全员标「新增」会让第一条消息变成 30 条假预警。"""
 

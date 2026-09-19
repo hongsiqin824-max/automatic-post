@@ -3282,6 +3282,20 @@ def source_period_stats(
     ).fetchall())
 
 
+def count_disabled_sources(connection=None) -> int:
+    """How many sources are switched off, so the alert can say so in one line.
+
+    Disabled sources are excluded from :func:`source_period_stats`, which would
+    otherwise report them as silent forever. Their count is still worth showing:
+    without it a shrinking source list looks like nothing changed.
+    """
+
+    row = _conn(connection).execute(
+        "SELECT COUNT(*) AS total FROM sources WHERE enabled = 0"
+    ).fetchone()
+    return int(row["total"]) if row else 0
+
+
 def save_source_period_snapshot(
     period_start: str,
     period_end: str,

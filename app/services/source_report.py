@@ -25,9 +25,6 @@ logger = logging.getLogger(__name__)
 BEIJING = ZoneInfo("Asia/Shanghai")
 DELIVERY_TABLE = "source_report_deliveries"
 
-# 正常/优秀那一段只列前几个，来源有 30 个，全列出来消息会长到没人看。
-_NORMAL_PREVIEW_LIMIT = 8
-
 
 class SourceReportResultUnknown(RuntimeError):
     """The request may have reached Feishu, so automatic retry is unsafe."""
@@ -118,6 +115,8 @@ def build_report_text(
     period_end: str,
     summary: dict[str, Any],
     anomalies: dict[str, list[dict[str, Any]]],
+    *,
+    disabled_sources: int = 0,
 ) -> str:
     """Render one period's alert message.
 
@@ -162,13 +161,14 @@ def build_report_text(
 
     normal = anomalies.get("normal") or []
     if normal:
+        # 正常来源一个都不折叠：判断某个来源是不是出问题，靠的就是看到它本期的
+        # 篇数和环比，被省略掉的来源等于没监控。三十来个来源的全量清单也就一千
+        # 多字节，离飞书文本消息的上限差得远。
         lines += ["", f"📋 正常（共{len(normal)}个）"]
-        for index, item in enumerate(normal[:_NORMAL_PREVIEW_LIMIT], start=1):
+        for index, item in enumerate(normal, start=1):
             current = int((item.get("current") or {}).get("total_count") or 0)
             change = (item.get("change") or {}).get("display") or "-"
             lines.append(f"{index}. {_source_label(item)} - {current}篇 ({change})")
-        if len(normal) > _NORMAL_PREVIEW_LIMIT:
-            lines.append(f"…另有 {len(normal) - _NORMAL_PREVIEW_LIMIT} 个来源正常")
 
     if not (anomalies.get("critical") or anomalies.get("warning")):
         lines += ["", "✅ 本期无异常"]
@@ -180,6 +180,10 @@ def build_report_text(
         # 首期（或中断后第一期）没有昨日同期快照，本期数字照旧有用，但任何环比
         # 判断都还谈不上。说清楚这一点，免得被当成「一切正常」。
         lines += ["ℹ️ 本期无昨日同期数据，仅记录现状，下一期起开始环比"]
+    if disabled_sources:
+        # 停用来源不参与统计，但数量要报出来：否则来源列表变短时，看不出是被
+        # 关掉了还是抓取挂了。
+        lines += [f"（另有 {disabled_sources} 个来源已停用，不计入统计）"]
     return "\n".join(lines)
 
 
@@ -270,7 +274,13 @@ def send_due_source_report(
             comparison, period_hours=period_hours(period_start, period_end)
         )
         summary = generate_summary(comparison)
-        message = build_report_text(period_start, period_end, summary, anomalies)
+        message = build_report_text(
+            period_start,
+            period_end,
+            summary,
+            anomalies,
+            disabled_sources=repo.count_disabled_sources(conn),
+        )
 
         try:
             response = send_source_report(config, message)
