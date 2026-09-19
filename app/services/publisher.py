@@ -20,6 +20,7 @@ from .quality import (
     analyze_body_language,
     check_league_membership,
     classify_article_tab,
+    normalize_competition_name,
     should_check_fallback_tab,
 )
 
@@ -604,6 +605,13 @@ def _apply_ai_league_guard(
             connection,
         )
 
+    # 归一化只在落库时做一次：展示和聚合读的是同一个字段，各自清洗会让同一赛事
+    # 重新分叉成几种写法。原文另存一列，既能回溯模型实际写了什么，也是补别名表
+    # 的依据。栏目名一并交给归一化，已有栏目的写法优先。
+    raw_competition = (classifier_result or {}).get("actual_competition") or None
+    normalized_competition = normalize_competition_name(
+        raw_competition, [*fallback_candidates, tab_name]
+    )
     guard_record = {
         "tab_id": final_tab_id,
         "tab_name": final_tab_name,
@@ -618,9 +626,8 @@ def _apply_ai_league_guard(
         "reassigned_tab_id": fallback_tab_id,
         "reassigned_tab_active": fallback_tab_active if fallback_tab_id is not None else None,
         "classifier_used": classifier_result is not None,
-        "actual_competition": (
-            (classifier_result or {}).get("actual_competition") or None
-        ),
+        "actual_competition": normalized_competition or None,
+        "actual_competition_raw": raw_competition,
         "min_confidence": config.league_guard_min_confidence,
         "verdict": verdict,
         "fallback_verdict": fallback_verdict,

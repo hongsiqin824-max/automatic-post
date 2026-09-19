@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from app.services.quality import (
+    NON_COMPETITION_LABEL,
     LLMCallError,
     LLMService,
     analyze_body_language,
+    check_league_membership,
     classify_article_tab,
     evaluate,
     html_to_text,
     is_photo_credit_advisory_plan,
+    normalize_competition_name,
     plan_local_repair,
     verify_removal_keeps_facts,
 )
@@ -1017,6 +1020,72 @@ def test_classify_article_tab_reports_competition_without_a_column() -> None:
     assert result["actual_competition"] == "亚运会"
     # 提示词必须要求这个字段，否则模型不会主动给。
     assert "actual_competition" in llm.prompts[0]
+
+
+def test_classify_prompt_defers_non_match_content_to_the_column_definition() -> None:
+    """非比赛内容的归属交给栏目定义，不能在提示词里一刀切说「不属于任何栏目」。
+
+    联赛型栏目的定义收录「各参赛俱乐部的相关新闻」，瑞典超球员的续约本就在范围
+    内；写死的排除规则会把这类文章压成草稿。
+    """
+
+    llm = _StubClassifierLLM({
+        "tab_id": 24, "confidence": 0.95, "reason": "秋田在役球员续约",
+        "actual_competition": "日职乙",
+    })
+    classify_article_tab("秋田后卫续约一年", "<p>正文</p>", _TAB_CHOICES, llm)
+    prompt = llm.prompts[0]
+    assert "一律以栏目定义为准" in prompt
+    assert "转入方" in prompt
+    # 旧的一刀切规则必须消失，否则它会压过上面那条。
+    assert "非赛事内容不属于任何赛事栏目" not in prompt
+
+
+def test_membership_prompt_shares_the_non_match_content_rule() -> None:
+    """二分类与多分类必须同口径，否则一个判「不属于」、另一个又挑回同类栏目。"""
+
+    llm = _StubClassifierLLM({"belongs": True, "confidence": 0.95, "reason": "巴甲球队续约"})
+    check_league_membership("弗拉门戈续约主帅", "<p>正文</p>", "巴甲", "巴甲定义", llm)
+    assert "一律以栏目定义为准" in llm.prompts[0]
+
+
+def test_normalize_competition_name_aligns_with_an_existing_column() -> None:
+    """已有栏目的写法优先——操作者认的是栏目名。"""
+
+    assert normalize_competition_name("日职乙J2联赛", ["日职联", "日职乙"]) == "日职乙"
+
+
+def test_normalize_competition_name_collapses_known_spellings() -> None:
+    assert normalize_competition_name("南美解放者杯") == "解放者杯"
+    assert normalize_competition_name("2026赛季解放者杯半决赛") == "解放者杯"
+    assert normalize_competition_name("POWER WORK CUP") == "POWER WORK杯"
+
+
+def test_normalize_competition_name_does_not_split_a_stage_word() -> None:
+    """「总决赛」必须整词清掉：先匹配「决赛」会留下一个「总」字挂在赛事名后面。"""
+
+    assert normalize_competition_name("NBA总决赛", ["NBA", "CBA"]) == "NBA"
+    assert normalize_competition_name("欧冠1/8决赛") == "欧冠"
+
+
+def test_normalize_competition_name_treats_any_non_event_wording_the_same() -> None:
+    """模型偶尔写成「非赛事（转会）」，那仍然是对不上任何联赛，不能当赛事名展示。"""
+
+    assert normalize_competition_name("非赛事（转会）") == NON_COMPETITION_LABEL
+
+
+def test_normalize_competition_name_keeps_qualifiers_that_change_the_event() -> None:
+    """「预选赛」不是阶段词：去掉它世界杯预选赛就变成了世界杯，那是另一项赛事。"""
+
+    assert normalize_competition_name("2026世界杯预选赛") == "世界杯预选赛"
+    assert normalize_competition_name(NON_COMPETITION_LABEL) == NON_COMPETITION_LABEL
+    assert normalize_competition_name("  ") == ""
+
+
+def test_normalize_competition_name_keeps_ambiguous_prefix_unresolved() -> None:
+    """「亚冠」同时是两个栏目的前缀，猜哪个都可能挂错，保留原文交给人看。"""
+
+    assert normalize_competition_name("亚冠", ["亚冠精英", "亚冠2"]) == "亚冠"
 
 
 def test_classify_article_tab_accepts_null_as_no_match() -> None:

@@ -3227,6 +3227,130 @@ def set_setting(key: str, value: Any, connection=None) -> Any:
     return value
 
 
+# 两个飞书机器人各有一张投递表，抢占/重试/幂等逻辑完全相同，所以表名做成参数
+# 而不是把这几百行复制一遍。只接受白名单里的值——表名要拼进 SQL 字符串，不能
+# 让调用方传任意文本。
+_DELIVERY_TABLES = frozenset({"report_deliveries", "source_report_deliveries"})
+
+
+def _delivery_table(name: str) -> str:
+    if name not in _DELIVERY_TABLES:
+        raise ValueError(f"未知的投递记录表：{name}")
+    return name
+
+
+def source_period_stats(
+    period_start: str,
+    period_end: str,
+    connection=None,
+) -> list[dict]:
+    """Per-source article counts for one half-open ``[start, end)`` window.
+
+    ``articles.created_at`` is stored in UTC, so the window bounds are compared
+    as UTC strings. The previous implementation matched ``DATE(created_at)``
+    against a Beijing date, which actually counted 08:00–08:00 Beijing and
+    pushed every article filed after midnight into the previous day.
+
+    Enabled sources with zero articles are still returned (LEFT JOIN): a source
+    whose crawler died is exactly what the alert exists for, and dropping its
+    row would hide it.
+    """
+
+    conn = _conn(connection)
+    return _rows(conn.execute(
+        """
+        SELECT
+            s.code AS source_code,
+            s.display_name AS source_name,
+            COUNT(a.id) AS total_count,
+            COUNT(CASE WHEN a.status='PUBLISHED' THEN 1 END) AS published_count,
+            COUNT(CASE WHEN a.status='DRAFT_CREATED' THEN 1 END) AS draft_count,
+            COUNT(CASE WHEN a.status='NEEDS_REVIEW' THEN 1 END) AS review_count,
+            COUNT(CASE WHEN a.status='ABANDONED' THEN 1 END) AS abandoned_count,
+            COUNT(CASE WHEN a.duplicate_of_article_id IS NOT NULL THEN 1 END)
+                AS duplicate_count
+        FROM sources s
+        LEFT JOIN articles a
+            ON a.source = s.code
+           AND a.created_at >= ?
+           AND a.created_at < ?
+        WHERE s.enabled = 1
+        GROUP BY s.code, s.display_name
+        ORDER BY total_count DESC, s.display_name ASC
+        """,
+        (str(period_start), str(period_end)),
+    ).fetchall())
+
+
+def save_source_period_snapshot(
+    period_start: str,
+    period_end: str,
+    stats: Iterable[Mapping[str, Any]],
+    connection=None,
+) -> int:
+    """Store one period's per-source counts, replacing any existing rows.
+
+    A replay of the same period overwrites rather than duplicating so a retried
+    send cannot double-count. The snapshot is what the next day's comparison
+    reads, so it has to survive independently of the send succeeding.
+    """
+
+    conn = _conn(connection)
+    rows = [
+        (
+            str(period_start),
+            str(period_end),
+            str(item.get("source_code") or ""),
+            str(item.get("source_name") or ""),
+            int(item.get("total_count") or 0),
+            int(item.get("published_count") or 0),
+            int(item.get("draft_count") or 0),
+            int(item.get("review_count") or 0),
+            int(item.get("abandoned_count") or 0),
+            int(item.get("duplicate_count") or 0),
+        )
+        for item in stats
+        if str(item.get("source_code") or "")
+    ]
+    if not rows:
+        return 0
+    with conn:
+        conn.executemany(
+            """
+            INSERT INTO source_period_stats
+            (period_start, period_end, source_code, source_name, total_count,
+             published_count, draft_count, review_count, abandoned_count,
+             duplicate_count)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(period_end, source_code) DO UPDATE SET
+                period_start=excluded.period_start,
+                source_name=excluded.source_name,
+                total_count=excluded.total_count,
+                published_count=excluded.published_count,
+                draft_count=excluded.draft_count,
+                review_count=excluded.review_count,
+                abandoned_count=excluded.abandoned_count,
+                duplicate_count=excluded.duplicate_count
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def get_source_period_snapshot(period_end: str, connection=None) -> list[dict]:
+    """Read a stored period snapshot, empty when that period was never run."""
+
+    return _rows(_conn(connection).execute(
+        """
+        SELECT source_code, source_name, total_count, published_count,
+               draft_count, review_count, abandoned_count, duplicate_count
+        FROM source_period_stats
+        WHERE period_end = ?
+        """,
+        (str(period_end),),
+    ).fetchall())
+
+
 def claim_report_delivery(
     period_start: str,
     period_end: str,
@@ -3234,24 +3358,26 @@ def claim_report_delivery(
     *,
     retry_after_seconds: int = 300,
     stale_after_seconds: int = 900,
+    table: str = "report_deliveries",
 ) -> dict[str, Any] | None:
     """Claim one report period so only one process sends it."""
 
+    table = _delivery_table(table)
     conn = _conn(connection)
     now = datetime.now(timezone.utc)
     now_text = now.isoformat(timespec="seconds").replace("+00:00", "Z")
     token = uuid.uuid4().hex
     with conn:
         conn.execute(
-            """
-            INSERT OR IGNORE INTO report_deliveries
+            f"""
+            INSERT OR IGNORE INTO {table}
             (period_start, period_end, status, next_attempt_at, created_at, updated_at)
             VALUES (?, ?, 'PENDING', ?, ?, ?)
             """,
             (str(period_start), str(period_end), now_text, now_text, now_text),
         )
         row = conn.execute(
-            "SELECT * FROM report_deliveries WHERE period_start=? AND period_end=?",
+            f"SELECT * FROM {table} WHERE period_start=? AND period_end=?",
             (str(period_start), str(period_end)),
         ).fetchone()
         if row is None:
@@ -3271,8 +3397,8 @@ def claim_report_delivery(
         if row["status"] in {"PENDING", "FAILED"} and not due:
             return None
         cursor = conn.execute(
-            """
-            UPDATE report_deliveries
+            f"""
+            UPDATE {table}
             SET status='SENDING', attempts=attempts+1, claim_token=?, claimed_at=?,
                 next_attempt_at=?, error=NULL, updated_at=?
             WHERE id=? AND (
@@ -3293,7 +3419,7 @@ def claim_report_delivery(
         if cursor.rowcount != 1:
             return None
         claimed = conn.execute(
-            "SELECT * FROM report_deliveries WHERE id=?", (int(row["id"]),)
+            f"SELECT * FROM {table} WHERE id=?", (int(row["id"]),)
         ).fetchone()
     return _row(claimed)
 
@@ -3339,8 +3465,10 @@ def next_report_period(
     return str(latest_period_start), str(latest_period_end)
 
 
-def has_report_deliveries(connection=None) -> bool:
-    row = _conn(connection).execute("SELECT 1 FROM report_deliveries LIMIT 1").fetchone()
+def has_report_deliveries(connection=None, *, table: str = "report_deliveries") -> bool:
+    row = _conn(connection).execute(
+        f"SELECT 1 FROM {_delivery_table(table)} LIMIT 1"
+    ).fetchone()
     return row is not None
 
 
@@ -3350,13 +3478,15 @@ def finish_report_delivery(
     connection=None,
     *,
     response: Any = None,
+    table: str = "report_deliveries",
 ) -> bool:
+    table = _delivery_table(table)
     conn = _conn(connection)
     now = _now()
     with conn:
         cursor = conn.execute(
-            """
-            UPDATE report_deliveries
+            f"""
+            UPDATE {table}
             SET status='SENT', sent_at=?, updated_at=?, response_json=?, error=NULL
             WHERE id=? AND status='SENDING' AND claim_token=?
             """,
@@ -3373,7 +3503,9 @@ def fail_report_delivery(
     *,
     retry_after_seconds: int = 300,
     response: Any = None,
+    table: str = "report_deliveries",
 ) -> bool:
+    table = _delivery_table(table)
     conn = _conn(connection)
     now = datetime.now(timezone.utc)
     now_text = now.isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -3381,8 +3513,8 @@ def fail_report_delivery(
         .isoformat(timespec="seconds").replace("+00:00", "Z")
     with conn:
         cursor = conn.execute(
-            """
-            UPDATE report_deliveries
+            f"""
+            UPDATE {table}
             SET status='FAILED', next_attempt_at=?, updated_at=?, response_json=?, error=?
             WHERE id=? AND status='SENDING' AND claim_token=?
             """,
@@ -3403,21 +3535,95 @@ def mark_report_delivery_unknown(
     claim_token: str,
     error: str,
     connection=None,
+    *,
+    table: str = "report_deliveries",
 ) -> bool:
     """Keep an ambiguous request claimed so it is never sent automatically again."""
 
+    table = _delivery_table(table)
     conn = _conn(connection)
     now = _now()
     with conn:
         cursor = conn.execute(
-            """
-            UPDATE report_deliveries
+            f"""
+            UPDATE {table}
             SET updated_at=?, next_attempt_at=NULL, error=?
             WHERE id=? AND status='SENDING' AND claim_token=?
             """,
             (now, str(error or "发送结果未知")[:1000], int(delivery_id), str(claim_token)),
         )
     return cursor.rowcount == 1
+
+
+def claim_source_report_delivery(
+    period_start: str,
+    period_end: str,
+    connection=None,
+    *,
+    retry_after_seconds: int = 300,
+    stale_after_seconds: int = 900,
+) -> dict[str, Any] | None:
+    """Claim one source-alert period; see :func:`claim_report_delivery`."""
+
+    return claim_report_delivery(
+        period_start,
+        period_end,
+        connection,
+        retry_after_seconds=retry_after_seconds,
+        stale_after_seconds=stale_after_seconds,
+        table="source_report_deliveries",
+    )
+
+
+def finish_source_report_delivery(
+    delivery_id: int,
+    claim_token: str,
+    connection=None,
+    *,
+    response: Any = None,
+) -> bool:
+    return finish_report_delivery(
+        delivery_id,
+        claim_token,
+        connection,
+        response=response,
+        table="source_report_deliveries",
+    )
+
+
+def fail_source_report_delivery(
+    delivery_id: int,
+    claim_token: str,
+    error: str,
+    connection=None,
+    *,
+    retry_after_seconds: int = 300,
+    response: Any = None,
+) -> bool:
+    return fail_report_delivery(
+        delivery_id,
+        claim_token,
+        error,
+        connection,
+        retry_after_seconds=retry_after_seconds,
+        response=response,
+        table="source_report_deliveries",
+    )
+
+
+def mark_source_report_delivery_unknown(
+    delivery_id: int,
+    claim_token: str,
+    error: str,
+    connection=None,
+) -> bool:
+    return mark_report_delivery_unknown(
+        delivery_id,
+        claim_token,
+        error,
+        connection,
+        table="source_report_deliveries",
+    )
 
 
 # Friendly aliases used by route/worker code.

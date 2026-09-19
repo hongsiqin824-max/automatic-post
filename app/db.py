@@ -220,24 +220,47 @@ CREATE TABLE IF NOT EXISTS report_deliveries (
 CREATE INDEX IF NOT EXISTS idx_report_deliveries_status_retry
     ON report_deliveries(status, next_attempt_at);
 
-CREATE TABLE IF NOT EXISTS source_daily_stats (
+CREATE TABLE IF NOT EXISTS source_report_deliveries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_start    TEXT NOT NULL,
+    period_end      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'PENDING'
+                    CHECK (status IN ('PENDING', 'SENDING', 'SENT', 'FAILED')),
+    attempts        INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    claim_token     TEXT,
+    claimed_at      TEXT,
+    next_attempt_at TEXT,
+    sent_at         TEXT,
+    response_json   TEXT NOT NULL DEFAULT '{}',
+    error           TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (period_start, period_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_report_deliveries_status_retry
+    ON source_report_deliveries(status, next_attempt_at);
+
+-- 一天多期，所以快照按「期结束时刻」存而不是按日期存：同一天的 11:00 与 19:00
+-- 是两条独立记录，环比要拿「昨天的同一个 period_end」来比，日期粒度存不下。
+CREATE TABLE IF NOT EXISTS source_period_stats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    stat_date TEXT NOT NULL,
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
     source_code TEXT NOT NULL,
     source_name TEXT NOT NULL DEFAULT '',
     total_count INTEGER NOT NULL,
     published_count INTEGER NOT NULL,
     draft_count INTEGER NOT NULL,
-    rejected_count INTEGER NOT NULL,
+    review_count INTEGER NOT NULL DEFAULT 0,
     abandoned_count INTEGER NOT NULL DEFAULT 0,
     duplicate_count INTEGER NOT NULL DEFAULT 0,
-    is_source_enabled INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE(stat_date, source_code)
+    UNIQUE(period_end, source_code)
 );
 
-CREATE INDEX IF NOT EXISTS idx_source_daily_stats_date
-    ON source_daily_stats(stat_date DESC);
+CREATE INDEX IF NOT EXISTS idx_source_period_stats_end
+    ON source_period_stats(period_end DESC);
 
 CREATE TABLE IF NOT EXISTS open_platform_auth (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -320,6 +343,7 @@ def init_db(database: Optional[PathLike] = None) -> None:
     try:
         connection.executescript(SCHEMA_SQL)
         _migrate_event_tab_rule_scope(connection)
+        _migrate_drop_source_daily_stats(connection)
         _migrate_article_origin_identity(connection)
         _migrate_article_publish_assignment(connection)
         _migrate_article_draft_confirmation(connection)
@@ -370,6 +394,18 @@ def init_db(database: Optional[PathLike] = None) -> None:
     finally:
         if owns_connection:
             connection.close()
+
+
+def _migrate_drop_source_daily_stats(connection: sqlite3.Connection) -> None:
+    """Drop the per-day source snapshot replaced by ``source_period_stats``.
+
+    The old table keyed snapshots by Beijing date while counting UTC dates, and
+    its ``draft_count``/``rejected_count`` columns were always zero because they
+    matched statuses this project never writes. Keeping it around would only
+    invite reading those wrong numbers.
+    """
+
+    connection.execute("DROP TABLE IF EXISTS source_daily_stats")
 
 
 def _migrate_article_origin_identity(connection: sqlite3.Connection) -> None:

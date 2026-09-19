@@ -5,7 +5,7 @@ from dataclasses import replace
 from app import repository as repo
 from app.db import get_db
 from app.services.dqd_open_client import DqdOpenClientError, DqdOpenDraftResult
-from app.web import _event_view, format_beijing_time
+from app.web import _article_view, _event_view, format_beijing_time
 
 
 def test_format_beijing_time_converts_utc_and_handles_invalid_values():
@@ -642,6 +642,193 @@ def test_event_view_tolerates_invalid_payload_and_does_not_invent_quality_result
     event = _event_view({"event_type": "QUALITY_RESULT", "payload_json": "{not-json"})
     assert event["payload"] == {}
     assert event["summary_rows"] == []
+
+
+def _league_guard_article(
+    guard: dict,
+    *,
+    publish_mode: int | None,
+    language_downgraded: bool = False,
+) -> dict:
+    quality: dict = {"league_guard": guard}
+    if language_downgraded:
+        quality["language_check"] = {"downgraded_to_draft": True}
+    return {
+        "id": 22815,
+        "status": "DRAFT_CREATED",
+        "publish_mode": publish_mode,
+        "title": "日媒：町田亚冠二级联赛2-0斯拜瑞恩",
+        "body_html": "<p>正文</p>",
+        "quality": quality,
+    }
+
+
+def _reassigned_guard(**overrides) -> dict:
+    # 改挂成功后 tab_name 记的是落点，被校验的原栏目在 guard_tab_name 里。
+    guard = {
+        "tab_name": "亚冠2",
+        "guard_tab_name": "日职联",
+        "configured_publish_mode": 0,
+        "effective_publish_mode": 0,
+        "reassigned_tab_id": 7,
+        "reassigned_tab_active": False,
+        "fallback_tab_name": "亚冠2",
+        "verdict": {"belongs": False, "confidence": 0.95, "reason": "不属于日职联"},
+        "fallback_verdict": {"tab_id": 7, "confidence": 0.95, "reason": "主要报道亚冠二级联赛"},
+        "reason": "AI 判断本篇不属于「日职联」，分类到「亚冠2」",
+    }
+    guard.update(overrides)
+    return guard
+
+
+def test_article_badge_names_the_checked_column_when_reassigned_to_disabled_tab(app):
+    # 徽章必须说「不属于原栏目」：读落点栏目会拼出「不属于「亚冠2」」，与紧随其后
+    # 的理由（正是在讲这篇属于亚冠2）自相矛盾。
+    article = _league_guard_article(_reassigned_guard(), publish_mode=0)
+    with app.app_context():
+        item = _article_view(article)
+
+    assert item["league_guard_state"] == "kept"
+    assert item["league_guard_label"] == "AI：不属于「日职联」已改挂「亚冠2」（栏目停用）仅草稿"
+    assert item["league_guard_reason"] == "主要报道亚冠二级联赛"
+
+
+def test_article_badge_reports_direct_publish_after_reassigning_to_active_tab(app):
+    guard = _reassigned_guard(
+        tab_name="欧联",
+        effective_publish_mode=1,
+        reassigned_tab_active=True,
+        fallback_tab_name="欧联",
+        fallback_verdict={"tab_id": 9, "confidence": 0.95, "reason": "报道欧联杯表现"},
+    )
+    article = _league_guard_article(guard, publish_mode=1)
+    with app.app_context():
+        item = _article_view(article)
+
+    assert item["league_guard_state"] == "upgraded"
+    assert item["league_guard_label"] == "AI：不属于「日职联」已改挂「欧联」直发"
+
+
+def test_article_badge_explains_language_downgrade_when_direct_publish_missed(app):
+    # 护栏算出直发后，语言护栏还能把发布模式压回草稿，且不会回写护栏记录。
+    guard = _reassigned_guard(
+        tab_name="欧联",
+        effective_publish_mode=1,
+        reassigned_tab_active=True,
+        fallback_tab_name="欧联",
+    )
+    article = _league_guard_article(guard, publish_mode=0, language_downgraded=True)
+    with app.app_context():
+        item = _article_view(article)
+
+    assert item["league_guard_state"] == "stale"
+    assert item["league_guard_label"] == "AI：不属于「日职联」已改挂「欧联」但正文非中文降级草稿"
+
+
+def test_article_badge_keeps_draft_wording_when_no_reassignment_happened(app):
+    guard = {
+        "tab_name": "日职联",
+        "guard_tab_name": "日职联",
+        "configured_publish_mode": 0,
+        "effective_publish_mode": 0,
+        "reassigned_tab_id": None,
+        "reassigned_tab_active": None,
+        "fallback_tab_name": None,
+        "verdict": {"belongs": False, "confidence": 0.95, "reason": "未涉及日职联赛事"},
+        "reason": "AI 判断本篇不属于「日职联」，也不属于任何候选栏目",
+    }
+    article = _league_guard_article(guard, publish_mode=0)
+    with app.app_context():
+        item = _article_view(article)
+
+    assert item["league_guard_state"] == "kept"
+    assert item["league_guard_label"] == "AI：不属于「日职联」维持草稿"
+    assert item["league_guard_reason"] == "未涉及日职联赛事"
+
+
+def test_article_badge_shows_the_real_competition_when_no_column_matched(app):
+    """「不属于日职联」只说了文章不该在哪，补上它真正属于哪个赛事。
+
+    这是判断该扩展哪个联赛的唯一线索——德甲一天出现三篇就说明值得建栏目。
+    """
+
+    guard = {
+        "tab_name": "日职联",
+        "guard_tab_name": "日职联",
+        "configured_publish_mode": 0,
+        "effective_publish_mode": 0,
+        "reassigned_tab_id": None,
+        "fallback_tab_name": None,
+        "actual_competition": "德甲",
+        "verdict": {"belongs": False, "confidence": 0.95, "reason": "报道的是拜仁"},
+    }
+    article = _league_guard_article(guard, publish_mode=0)
+    with app.app_context():
+        item = _article_view(article)
+
+    assert item["league_guard_label"] == "AI：不属于「日职联」维持草稿"
+    assert item["league_guard_competition"] == "德甲"
+
+
+def test_article_badge_hides_competition_when_it_carries_no_information(app):
+    """「非赛事」没有扩展价值；与原栏目同名会和「不属于」自相矛盾，都不显示。"""
+
+    base = {
+        "tab_name": "日职联",
+        "guard_tab_name": "日职联",
+        "configured_publish_mode": 0,
+        "effective_publish_mode": 0,
+        "reassigned_tab_id": None,
+        "fallback_tab_name": None,
+        "verdict": {"belongs": False, "confidence": 0.95, "reason": "不属于日职联"},
+    }
+    with app.app_context():
+        non_event = _article_view(
+            _league_guard_article({**base, "actual_competition": "非赛事"}, publish_mode=0)
+        )
+        same_column = _article_view(
+            _league_guard_article({**base, "actual_competition": "日职联"}, publish_mode=0)
+        )
+        reassigned = _article_view(
+            _league_guard_article(
+                _reassigned_guard(actual_competition="亚冠2"), publish_mode=0
+            )
+        )
+
+    assert non_event["league_guard_competition"] == ""
+    assert same_column["league_guard_competition"] == ""
+    # 改挂成功时落点栏目名已经说明了归属，再挂一个「实际」标签是重复信息。
+    assert reassigned["league_guard_competition"] == ""
+
+
+def test_article_badge_omits_checked_column_when_legacy_record_lacks_it(app):
+    # guard_tab_name 比 league_guard 本身晚引入，旧记录只有落点栏目。此时退回
+    # 落点会拼出「不属于「亚冠2」已改挂「亚冠2」」，所以宁可不点名原栏目。
+    guard = _reassigned_guard()
+    del guard["guard_tab_name"]
+    article = _league_guard_article(guard, publish_mode=0)
+    with app.app_context():
+        item = _article_view(article)
+
+    assert item["league_guard_state"] == "kept"
+    assert item["league_guard_label"] == "AI：已改挂「亚冠2」（栏目停用）仅草稿"
+
+
+def test_article_badge_falls_back_to_tab_name_for_legacy_record_without_reassignment(app):
+    # 没改挂时 tab_name 就是被校验的栏目，旧记录可以安全退回它。
+    guard = {
+        "tab_name": "日职联",
+        "configured_publish_mode": 0,
+        "effective_publish_mode": 0,
+        "reassigned_tab_id": None,
+        "fallback_tab_name": None,
+        "verdict": {"belongs": False, "confidence": 0.95, "reason": "未涉及日职联赛事"},
+    }
+    article = _league_guard_article(guard, publish_mode=0)
+    with app.app_context():
+        item = _article_view(article)
+
+    assert item["league_guard_label"] == "AI：不属于「日职联」维持草稿"
 
 
 def test_run_endpoint_is_non_blocking(client):

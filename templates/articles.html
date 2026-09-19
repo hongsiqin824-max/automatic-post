@@ -40,6 +40,7 @@
                 {{ article.tab_names|default(article.tab_name|default('未配置', true), true) }}
                 {% if article.league_guard_label %}
                 <span class="league-guard-badge league-guard-{{ article.league_guard_state }}">{{ article.league_guard_label }}</span>
+                {% if article.league_guard_competition %}<span class="league-guard-badge league-guard-competition">实际：{{ article.league_guard_competition }}</span>{% endif %}
                 {% if article.league_guard_reason %}<small class="league-guard-reason">{{ article.league_guard_reason }}</small>{% endif %}
                 {% endif %}
               </td>

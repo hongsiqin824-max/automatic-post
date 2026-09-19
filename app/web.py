@@ -41,7 +41,8 @@ from .services.publisher import (
     create_draft_for_article,
 )
 from .services.preview_html import sanitize_preview_html
-from .services.quality import html_to_text
+from .services.source_report import SourceReportController, SourceReportScheduler
+from .services.quality import NON_COMPETITION_LABEL, html_to_text
 from .statuses import STATUS_LABELS
 
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -209,6 +210,13 @@ def _source_view(source: dict) -> dict:
     return item
 
 
+def _publish_mode_value(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _article_view(article: dict | None) -> dict | None:
     if article is None:
         return None
@@ -237,33 +245,89 @@ def _article_view(article: dict | None) -> dict | None:
     item["league_guard"] = guard
     if guard:
         verdict = guard.get("verdict") if isinstance(guard.get("verdict"), dict) else {}
-        guard_tab_name = str(guard.get("tab_name") or "")
-        # 护栏结论写入 quality_json 与发布模式落定是两次独立写入，并发抢占失败的
-        # 那一次仍会留下 upgraded_to_publish=True。此时若文章实际以草稿落定，
-        # 必须显式提示升级未生效，否则列表会出现「已升级直发」与「草稿已创建」并存。
-        article_mode = article.get("publish_mode")
-        try:
-            article_mode = int(article_mode)
-        except (TypeError, ValueError):
-            article_mode = None
-        upgrade_applied = article_mode != 0
-        if guard.get("upgraded_to_publish") and upgrade_applied:
+        fallback_verdict = (
+            guard.get("fallback_verdict")
+            if isinstance(guard.get("fallback_verdict"), dict)
+            else {}
+        )
+        # ``tab_name`` 记的是最终落点：改挂成功后它已经是新栏目，拿它拼「不属于
+        # 「X」」会得到「不属于「亚冠2」已改挂「亚冠2」」这种自相矛盾的文案。被校验
+        # 的原栏目在 guard_tab_name 里，它比 league_guard 本身晚引入，旧记录没有，
+        # 所以未改挂时才可以退回 tab_name（两者此时同值），改挂过的旧记录只能不点名。
+        guard_tab_name = str(guard.get("guard_tab_name") or "")
+        reassigned_tab_name = str(guard.get("fallback_tab_name") or "")
+        reassigned = guard.get("reassigned_tab_id") is not None and bool(reassigned_tab_name)
+        if not guard_tab_name and not reassigned:
+            guard_tab_name = str(guard.get("tab_name") or "")
+        # 护栏只在原始发布模式为草稿（0）时运行，所以 effective_publish_mode 就是
+        # 「护栏算出来要不要直发」。upgraded_to_publish 是同一个值的差异写法，读它
+        # 得先知道「原始值恒为 0」这个前提，这里直接读终值。
+        guard_wants_direct = _publish_mode_value(guard.get("effective_publish_mode")) == 1
+        # 护栏之后还有一道语言护栏会把直发压回草稿，它只改发布模式快照、不回写护栏
+        # 记录。所以要拿 articles.publish_mode 核对一遍，否则列表会出现「已升级直发」
+        # 与「草稿已创建」并存。快照未落定（NULL）时按未生效处理，宁可少报直发。
+        direct_applied = _publish_mode_value(article.get("publish_mode")) == 1
+        language_check = quality.get("language_check") if isinstance(quality, dict) else None
+        language_downgraded = bool(
+            isinstance(language_check, dict) and language_check.get("downgraded_to_draft")
+        )
+        # 直发没落地时点明真实原因：几乎总是翻译没跑干净触发了语言护栏，笼统说
+        # 「未生效」看不出该做什么。兜底那句留给将来可能新增的降级关卡。
+        blocked_suffix = "但正文非中文降级草稿" if language_downgraded else "但直发未生效"
+        if reassigned:
+            # 改挂与发布模式解耦：目标栏目停用、或目标栏目自身配置为草稿时，栏目
+            # 纠正了但文章仍留在草稿。改挂要先于直发判断，否则这两种情况会被混进
+            # 「维持草稿」，看不出栏目其实已经改对了。
+            moved = (
+                f"AI：不属于「{guard_tab_name}」已改挂「{reassigned_tab_name}」"
+                if guard_tab_name
+                else f"AI：已改挂「{reassigned_tab_name}」"
+            )
+            if guard_wants_direct and direct_applied:
+                item["league_guard_state"] = "upgraded"
+                item["league_guard_label"] = f"{moved}直发"
+            elif guard_wants_direct:
+                item["league_guard_state"] = "stale"
+                item["league_guard_label"] = f"{moved}{blocked_suffix}"
+            else:
+                # 「为什么还是草稿」只有栏目停用值得点名。目标栏目自身配成草稿
+                # （reassign 模式为 target 时）不解释，避免说出一个错误的原因。
+                disabled = (
+                    "（栏目停用）" if guard.get("reassigned_tab_active") is False else ""
+                )
+                item["league_guard_state"] = "kept"
+                item["league_guard_label"] = f"{moved}{disabled}仅草稿"
+        elif guard_wants_direct and direct_applied:
             item["league_guard_state"] = "upgraded"
             item["league_guard_label"] = f"AI：属于「{guard_tab_name}」已升级直发"
-        elif guard.get("upgraded_to_publish"):
+        elif guard_wants_direct:
             item["league_guard_state"] = "stale"
-            item["league_guard_label"] = f"AI：属于「{guard_tab_name}」但升级未生效"
+            item["league_guard_label"] = f"AI：属于「{guard_tab_name}」{blocked_suffix}"
         elif verdict.get("belongs") is False:
             item["league_guard_state"] = "kept"
             item["league_guard_label"] = f"AI：不属于「{guard_tab_name}」维持草稿"
         else:
             item["league_guard_state"] = "kept"
             item["league_guard_label"] = f"AI 归属存疑「{guard_tab_name}」维持草稿"
-        item["league_guard_reason"] = str(verdict.get("reason") or guard.get("reason") or "")
+        # 理由要与徽章方向同向：改挂后讲「为什么是新栏目」的是分类器的理由，
+        # verdict.reason 只解释「为什么不属于原栏目」。
+        if reassigned:
+            reason = fallback_verdict.get("reason") or verdict.get("reason")
+        else:
+            reason = verdict.get("reason")
+        item["league_guard_reason"] = str(reason or guard.get("reason") or "")
+        # 「不属于原栏目」只说了文章不该在哪，补上它真正属于哪个赛事——这是判断
+        # 该扩展哪个联赛的唯一线索。改挂成功时不显示：落点栏目名已经说明了归属。
+        # 「非赛事」没有信息量，与原栏目同名的值会和「不属于」自相矛盾，都不显示。
+        competition = str(guard.get("actual_competition") or "").strip()
+        if reassigned or competition in {NON_COMPETITION_LABEL, guard_tab_name}:
+            competition = ""
+        item["league_guard_competition"] = competition
     else:
         item["league_guard_state"] = ""
         item["league_guard_label"] = ""
         item["league_guard_reason"] = ""
+        item["league_guard_competition"] = ""
     item["body_excerpt"] = html_to_text(item.get("body_html", ""))[:360]
     item["cover_url"] = cdn_url(item.get("litpic"))
     # Keep the stored material cover for list/quality views, but show the
@@ -689,6 +753,11 @@ def create_app(test_config: dict | None = None) -> Flask:
         feishu_report_controller,
         cfg.feishu_report_check_interval_seconds,
     )
+    source_report_controller = SourceReportController(cfg)
+    source_report_scheduler = SourceReportScheduler(
+        source_report_controller,
+        cfg.source_report_check_interval_seconds,
+    )
     # The independent publish worker drains READY_TO_PUBLISH on its own cadence
     # and already reconciles due draft confirmations, so it takes the scheduler's
     # maintenance slot when enabled. Turning it off falls back to the original
@@ -710,6 +779,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.extensions["publish_controller"] = publish_controller
     app.extensions["feishu_report_controller"] = feishu_report_controller
     app.extensions["feishu_report_scheduler"] = feishu_report_scheduler
+    app.extensions["source_report_controller"] = source_report_controller
+    app.extensions["source_report_scheduler"] = source_report_scheduler
     app.extensions["scheduler"] = scheduler
     with app.app_context():
         scheduler_enabled = bool(repo.get_setting("scheduler_enabled", cfg.scheduler_enabled))
@@ -717,6 +788,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         scheduler.start()
     if cfg.feishu_report_configured and not app.config.get("TESTING") and not test_config:
         feishu_report_scheduler.start()
+    if cfg.source_report_configured and not app.config.get("TESTING") and not test_config:
+        source_report_scheduler.start()
 
     app.jinja_env.globals["cdn_url"] = cdn_url
     app.jinja_env.globals["status_label"] = lambda value: STATUS_LABELS.get(value, value)

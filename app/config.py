@@ -43,6 +43,39 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _parse_boundaries(text: str) -> tuple[tuple[int, int], ...]:
+    """Parse ``"11:00,19:00"`` into sorted, de-duplicated (hour, minute) pairs.
+
+    Malformed entries are dropped rather than raising: a typo in the
+    environment should not stop the whole app from booting.
+    """
+
+    parsed: set[tuple[int, int]] = set()
+    for chunk in str(text or "").split(","):
+        stripped = chunk.strip()
+        if not stripped:
+            continue
+        hour_text, _, minute_text = stripped.partition(":")
+        try:
+            hour = int(hour_text)
+            minute = int(minute_text or 0)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            parsed.add((hour, minute))
+    return tuple(sorted(parsed))
+
+
+def _env_boundaries(name: str, default: str) -> tuple[tuple[int, int], ...]:
+    """Read report boundaries from the environment, falling back to *default*.
+
+    An unparseable value falls back instead of yielding an empty list: with no
+    boundary at all the reporter would silently never send anything.
+    """
+
+    return _parse_boundaries(os.getenv(name) or "") or _parse_boundaries(default)
+
+
 def _env_choice(name: str, default: str, allowed: frozenset[str]) -> str:
     value = (os.getenv(name) or "").strip().lower()
     return value if value in allowed else default
@@ -164,6 +197,29 @@ class AppConfig:
         15, min(3600, _env_int("FEISHU_REPORT_CHECK_INTERVAL_SECONDS", 30))
     )
 
+    # 来源抓取量预警，发给另一个飞书群机器人（与上面的发布统计是两个不同的
+    # webhook）。一天多期：每个边界发一次，统计的是「上一个边界到这个边界」，
+    # 所以边界列表既决定了发送时刻、也决定了统计区间的切分。
+    source_report_webhook_url: str = os.getenv(
+        "SOURCE_REPORT_WEBHOOK_URL", ""
+    ).strip()
+    source_report_enabled: bool = _env_bool("SOURCE_REPORT_ENABLED", True)
+    source_report_boundaries: tuple[tuple[int, int], ...] = _env_boundaries(
+        "SOURCE_REPORT_BOUNDARIES", "11:00,19:00"
+    )
+    source_report_timeout_seconds: int = max(
+        5, _env_int("SOURCE_REPORT_TIMEOUT_SECONDS", 10)
+    )
+    source_report_retry_seconds: int = max(
+        60, _env_int("SOURCE_REPORT_RETRY_SECONDS", 300)
+    )
+    source_report_stale_seconds: int = max(
+        300, _env_int("SOURCE_REPORT_STALE_SECONDS", 900)
+    )
+    source_report_check_interval_seconds: int = max(
+        15, min(3600, _env_int("SOURCE_REPORT_CHECK_INTERVAL_SECONDS", 30))
+    )
+
     # Open-platform article creation is a write operation, so it stays behind
     # an explicit flag even when credentials are present.
     publisher_enabled: bool = _env_bool("AUTOMATIC_POST_PUBLISHER", False)
@@ -253,6 +309,14 @@ class AppConfig:
     @property
     def feishu_report_configured(self) -> bool:
         return bool(self.feishu_report_enabled and self.feishu_report_webhook_url)
+
+    @property
+    def source_report_configured(self) -> bool:
+        return bool(
+            self.source_report_enabled
+            and self.source_report_webhook_url
+            and self.source_report_boundaries
+        )
 
 
 def ensure_instance_dir() -> None:

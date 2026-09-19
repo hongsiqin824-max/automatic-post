@@ -2286,6 +2286,38 @@ def test_classifier_records_competition_when_no_column_matches(app, monkeypatch)
     assert guard["actual_competition"] == "亚运会"
 
 
+def test_guard_stores_normalized_competition_and_keeps_the_raw_value(app, monkeypatch):
+    """同一赛事的多种写法要在落库时收敛，否则聚合会把它拆成好几行。"""
+
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    _reject_guard_column(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.classify_article_tab",
+        lambda *a, **k: {
+            "tab_id": None, "confidence": 0.96,
+            "reason": "解放者杯，现有栏目均不匹配",
+            "actual_competition": "2026赛季南美解放者杯半决赛",
+        },
+    )
+
+    with app.app_context():
+        conn = get_db()
+        _setup_classifier_tabs(conn)
+        article = repo.upsert_material(_ready_article(), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        guard = repo.get_article(article["id"], conn)["quality"]["league_guard"]
+
+    assert guard["actual_competition"] == "解放者杯"
+    # 原文另存：用来回溯模型实际写了什么，也是补别名表的依据。
+    assert guard["actual_competition_raw"] == "2026赛季南美解放者杯半决赛"
+
+
 def test_guard_does_not_publish_into_its_own_disabled_column(app, monkeypatch):
     """AI 确认属于当前栏目，但该栏目已停用时也不能升级为直发。"""
 
