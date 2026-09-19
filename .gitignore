@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 instance/*.sqlite3
 instance/*.sqlite3-*
+# 只忽略根目录下的散落数据库文件（app.db / articles.db / test.db 这类调试残留）
+/*.db
 *.log
 *.run.lock
 .DS_Store
