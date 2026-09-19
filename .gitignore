@@ -3,10 +3,12 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-instance/*.sqlite3
-instance/*.sqlite3-*
-# 只忽略根目录下的散落数据库文件（app.db / articles.db / test.db 这类调试残留）
-/*.db
+# 运行数据与备份：*.sqlite* 一并覆盖 .sqlite3-journal 和 .sqlite3.bak_20260919 这类快照
+instance/*.sqlite*
+instance/backup/
+instance/*.jsonl
+# 数据库文件一律不进仓库：根目录的调试残留和 app/ 下的本地配置库都算
+*.db
 *.log
 *.run.lock
 .DS_Store
