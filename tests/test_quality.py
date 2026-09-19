@@ -149,12 +149,33 @@ def test_unstripped_clickable_attributes_go_to_review():
 
 def test_truncated_title_without_llm_goes_to_review():
     result = evaluate(
-        title="记者：球队将在",
+        title="记者：球队将在周末迎战，",
         body="<p>球队确认将在周末进行一场国家队，完整参赛名单和比赛地点已经公布。</p>",
         channels=[],
     )
     assert result["needs_review"] is True
     assert result["title_fix_method"] == "manual_review_no_llm"
+
+
+def test_title_ending_in_an_ambiguous_single_word_is_not_truncated():
+    """「门将」「浦和」「阿尔艾因」都以曾被当作截断信号的单字收尾，但标题是完整的。
+
+    中文没有词边界，按单字后缀判截断分不清「将要」和「门将」；生产库里 48 次
+    命中全是这类误判，每一篇都被强制转人工。
+    """
+
+    body = "<p>球队确认将在周末进行一场国家队，完整参赛名单和比赛地点已经公布。</p>"
+    for title in (
+        "环球体育：迪达被视为克鲁塞罗队史最佳门将",
+        "阿莱首发首秀破门，广岛4-1浦和",
+        "韩媒：C罗掐脖子，胜利0-4惨败阿尔艾因",
+        "每体：佩德里父亲揭秘拒去特内里费原因",
+        "罗体：那不勒斯锋线引援悬念仍在",
+        "韩媒：春川市民队首次办集中体能评估，官兵参与",
+        "日媒：日本办韩国职业联赛观赛派对",
+    ):
+        issues = evaluate(title=title, body=body, channels=[])["issues"]["title_problems"]
+        assert issues == [], f"{title} -> {issues}"
 
 
 def test_html_to_text_removes_markup():

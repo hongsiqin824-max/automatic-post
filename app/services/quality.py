@@ -179,7 +179,12 @@ def _title_problems(title: str) -> list[str]:
         return issues
     if len(value) < 5:
         issues.append("标题过短，信息不完整")
-    if re.search(r"(?:[，,、:：]|\.{2,}|…|和|与|在|将|对|因|但)$", value):
+    # 只按标点判截断。这里原先还列了「和/与/在/将/对/因/但」，本意是接住
+    # 「巴萨将」这种被切掉后半句的标题，但中文没有词边界，单字后缀分不清
+    # 「将要」和「门将」：全库 48 次命中全是误判——32 篇「门将」，6 篇「浦和」，
+    # 5 篇「阿尔艾因」「原因」，其余是「面对」「存在」「参与」。真被截断的标题
+    # 仍有 AI 语义检查兜底（title_complete=false 一样会转人工）。
+    if re.search(r"(?:[，,、:：]|\.{2,}|…)$", value):
         issues.append("标题疑似截断")
     if re.fullmatch(r"[\W_]+", value):
         issues.append("标题只有符号")
