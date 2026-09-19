@@ -262,10 +262,45 @@ def test_send_due_source_report_is_idempotent_per_period(app, monkeypatch):
     assert second == {
         "sent": False,
         "skipped": True,
-        "reason": "already_sent_or_retry_not_due",
+        "reason": "already_sent",
         "period": ("2026-09-18T03:00:00.000Z", "2026-09-18T11:00:00.000Z"),
     }
     assert len(calls) == 1
+
+
+def test_send_due_source_report_stops_recomputing_once_the_period_is_sent(app, monkeypatch):
+    """已发出的期不再碰写入路径：30 秒一轮的重复聚合与快照覆盖会和抓取抢写锁。"""
+
+    from app.config import AppConfig
+
+    calls: list = []
+    _configure(app, monkeypatch, calls)
+    config = AppConfig()
+    object.__setattr__(config, "database_path", app.config["DATABASE"])
+    object.__setattr__(config, "source_report_enabled", True)
+    object.__setattr__(config, "source_report_webhook_url", "https://example.com/hook")
+    object.__setattr__(config, "source_report_boundaries", BOUNDARIES)
+
+    now = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    with app.app_context():
+        conn = get_db()
+        _seed_source(conn, "alert-src", ["2026-09-18T04:00:00.000Z"])
+        assert send_due_source_report(config, conn, now=now)["sent"] is True
+
+        touched: list[str] = []
+        monkeypatch.setattr(
+            repo, "source_period_stats", lambda *a, **k: touched.append("stats") or []
+        )
+        monkeypatch.setattr(
+            repo, "save_source_period_snapshot", lambda *a, **k: touched.append("write") or 0
+        )
+        monkeypatch.setattr(
+            repo, "claim_source_report_delivery", lambda *a, **k: touched.append("claim")
+        )
+        second = send_due_source_report(config, conn, now=now)
+
+    assert second["reason"] == "already_sent"
+    assert touched == []
 
 
 def test_send_due_source_report_saves_the_snapshot_even_when_sending_fails(app, monkeypatch):

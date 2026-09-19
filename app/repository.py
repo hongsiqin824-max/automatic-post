@@ -3555,6 +3555,30 @@ def mark_report_delivery_unknown(
     return cursor.rowcount == 1
 
 
+def source_report_delivery_sent(
+    period_start: str,
+    period_end: str,
+    connection=None,
+) -> bool:
+    """Whether this period's alert already went out — a read-only fast path.
+
+    The scheduler polls every 30s while a period lasts eight hours, so nearly
+    every call lands on a period that was delivered long ago. Answering those
+    here keeps them off the write path: claiming opens a write transaction even
+    when it ends up refusing, and this database runs in rollback-journal mode
+    where any write blocks the ingestion pipeline.
+    """
+
+    row = _conn(connection).execute(
+        f"""
+        SELECT status FROM {_delivery_table('source_report_deliveries')}
+        WHERE period_start = ? AND period_end = ?
+        """,
+        (str(period_start), str(period_end)),
+    ).fetchone()
+    return row is not None and str(row["status"]) == "SENT"
+
+
 def claim_source_report_delivery(
     period_start: str,
     period_end: str,

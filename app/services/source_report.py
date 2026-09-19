@@ -239,6 +239,12 @@ def send_due_source_report(
             return {"sent": False, "skipped": True, "reason": "no_completed_period"}
         period_start, period_end = period
 
+        # 已发出的期在这里就返回：一个八小时的期里，30 秒一轮的轮询绝大多数都落在
+        # 这个分支。放到抢占之后才判断的话，每一轮都要先对全量文章做一次聚合、再覆盖
+        # 写一遍快照，而这库用的是 rollback journal，写事务会挡住抓取管线。
+        if repo.source_report_delivery_sent(period_start, period_end, conn):
+            return {"sent": False, "skipped": True, "reason": "already_sent", "period": period}
+
         stats = repo.source_period_stats(period_start, period_end, conn)
         # 快照先落库再抢占：环比基准读的是快照，发送失败也不该让明天丢掉基准。
         repo.save_source_period_snapshot(period_start, period_end, stats, conn)
