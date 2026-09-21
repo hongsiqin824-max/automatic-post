@@ -247,10 +247,11 @@ class AppConfig:
     # （实测 0.13），只有按字符重合度才看得出是同一件事（0.49）。取 0.48 是因为
     # 同栏目随机配对的字符重合度 P99 只有 0.46，再低就会把无关稿件灌进候选。
     title_dedup_char_dice_min: float = max(0.0, min(1.0, _env_float("AUTOMATIC_POST_TITLE_DEDUP_CHAR_DICE_MIN", 0.48)))
-    # 同一事件常有五六家媒体各发一篇，上限 3 会把真正的孪生稿挤出送审名单：
-    # 实测一天 590 篇里有 180 篇的候选被截到 3，放到 5 之后降到 131。判定仍是
-    # 一次调用，放宽只是让 prompt 多带几个候选，不增加调用次数。
-    title_dedup_max_candidates: int = max(1, min(10, _env_int("AUTOMATIC_POST_TITLE_DEDUP_MAX_CANDIDATES", 5)))
+    # 同一事件常有五六家媒体各发一篇，上限太小会把真正的孪生稿挤出送审名单：
+    # 实测一天 590 篇里有 180 篇的候选被截到 3，放到 5 能降到 131。放宽不增加
+    # 调用次数（一次判定只是多带几个候选），但候选越多 LLM 越容易挑错，所以
+    # 先保守留在 3，要放宽用环境变量调，别忘了 .env 会覆盖这里。
+    title_dedup_max_candidates: int = max(1, min(10, _env_int("AUTOMATIC_POST_TITLE_DEDUP_MAX_CANDIDATES", 3)))
 
     # AI 栏目归属护栏。原实现只会逐个追问「是否属于某个预配候选栏目」
     # （tabs.ai_fallback_tab_ids），近半数栏目没配候选，于是 AI 答完「不属于」
