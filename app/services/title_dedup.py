@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import unicodedata
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -28,6 +29,8 @@ from .quality import LLMCallError, LLMService
 
 logger = logging.getLogger(__name__)
 _NORMALIZED_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+# 只认两位以内、两侧既不接数字也不接连字符的「A-B」，避开 2026-09-20 这类日期。
+_SCORE_RE = re.compile(r"(?<![\d-])(\d{1,2})\s*-\s*(\d{1,2})(?![\d-])")
 _MIN_TITLE_CHARS = 8
 # Same transport-level categories that trigger the quality-check degradation.
 _FALLBACK_CATEGORIES = frozenset({"timeout", "connection", "rate_limit", "http_error"})
@@ -84,8 +87,17 @@ def direct_publish_mode(article_id: int, current: dict[str, Any], connection) ->
     return 0
 
 
+def _sorted_score(match: re.Match[str]) -> str:
+    low, high = sorted((int(match.group(1)), int(match.group(2))))
+    return f"{low}-{high}"
+
+
 def normalize_title(title: Any) -> str:
     value = unicodedata.normalize("NFKC", str(title or "")).lower()
+    # 比分按升序写死：主队写在前面还是后面纯看媒体习惯，「町田2-4柏」和
+    # 「柏4-2町田」说的是同一个结果，但 24 和 42 连一个公共二元组都没有。
+    # 真正的比分冲突交给 LLM，它读到的是未归一化的原标题。
+    value = _SCORE_RE.sub(_sorted_score, value)
     return _NORMALIZED_RE.sub("", value)
 
 
@@ -93,7 +105,10 @@ def score_title_similarity(left: Any, right: Any) -> dict[str, Any]:
     a = normalize_title(left)
     b = normalize_title(right)
     if not a or not b:
-        return {"exact": False, "lcs_chars": 0, "lcs_shorter": 0.0, "lcs_longer": 0.0, "bigram_dice": 0.0}
+        return {
+            "exact": False, "lcs_chars": 0, "lcs_shorter": 0.0,
+            "lcs_longer": 0.0, "bigram_dice": 0.0, "char_dice": 0.0,
+        }
     match = difflib.SequenceMatcher(None, a, b, autojunk=False).find_longest_match(
         0, len(a), 0, len(b)
     )
@@ -104,28 +119,43 @@ def score_title_similarity(left: Any, right: Any) -> dict[str, Any]:
     right_bigrams = _bigrams(b)
     overlap = sum(min(count, right_bigrams.get(pair, 0)) for pair, count in left_bigrams.items())
     denominator = len(a) + len(b) - 2
+    # 字符重合度不看顺序，是上面两个指标的兜底：主客队调个位置就能让公共子串和
+    # 二元组同时崩掉，但两篇讲的还是同一场球，用到的字基本还是那些。
+    left_chars = Counter(a)
+    right_chars = Counter(b)
+    char_overlap = sum(min(count, right_chars.get(ch, 0)) for ch, count in left_chars.items())
     return {
         "exact": a == b,
         "lcs_chars": lcs,
         "lcs_shorter": lcs / shorter if shorter else 0.0,
         "lcs_longer": lcs / longer if longer else 0.0,
         "bigram_dice": (2 * overlap / denominator) if denominator > 0 else 0.0,
+        "char_dice": 2 * char_overlap / (len(a) + len(b)),
     }
 
 
 def lexical_score(score: dict[str, Any]) -> float:
+    # char_dice 也要计入排序，否则靠它召回进来的语序颠倒稿件会因为公共子串低
+    # 而排在末位，被 max_candidates 截断掉——召回了却送不进判定等于没召回。
     return (
-        0.4 * float(score.get("lcs_shorter") or 0.0)
-        + 0.3 * float(score.get("lcs_longer") or 0.0)
-        + 0.3 * float(score.get("bigram_dice") or 0.0)
+        0.35 * float(score.get("lcs_shorter") or 0.0)
+        + 0.25 * float(score.get("lcs_longer") or 0.0)
+        + 0.25 * float(score.get("bigram_dice") or 0.0)
+        + 0.15 * float(score.get("char_dice") or 0.0)
     )
 
 
-def is_recall_hit(score: dict[str, Any], *, dice_min: float, lcs_min: int) -> bool:
+def is_recall_hit(
+    score: dict[str, Any], *, dice_min: float, lcs_min: int, char_dice_min: float | None = None
+) -> bool:
     return (
         bool(score.get("exact"))
         or float(score.get("bigram_dice") or 0.0) >= dice_min
         or int(score.get("lcs_chars") or 0) >= lcs_min
+        or (
+            char_dice_min is not None
+            and float(score.get("char_dice") or 0.0) >= float(char_dice_min)
+        )
     )
 
 
@@ -133,6 +163,12 @@ def shared_channels(left: Any, right: Any) -> list[int]:
     left_ids = {int(item) for item in (left or []) if str(item).strip().lstrip("-").isdigit()}
     right_ids = {int(item) for item in (right or []) if str(item).strip().lstrip("-").isdigit()}
     return sorted(left_ids & right_ids)
+
+
+def _has_channels(value: Any) -> bool:
+    """Whether this article carries any usable tag at all."""
+
+    return any(str(item).strip().lstrip("-").isdigit() for item in (value or []))
 
 
 def _same_tab(left: Any, right: Any) -> bool:
@@ -162,6 +198,7 @@ def select_candidates(
     limit: int,
     tab_id: Any = None,
     tab_dice_min: float | None = None,
+    char_dice_min: float | None = None,
 ) -> list[dict[str, Any]]:
     """Recall-pass shortlist: shared channel or same tab, recent, lexical overlap.
 
@@ -187,9 +224,19 @@ def select_candidates(
         score = score_title_similarity(candidate_title, title)
         if min(len(normalize_title(candidate_title)), len(normalize_title(title))) < _MIN_TITLE_CHARS:
             continue
-        if not is_recall_hit(score, dice_min=dice_min, lcs_min=lcs_min):
+        if not is_recall_hit(
+            score, dice_min=dice_min, lcs_min=lcs_min, char_dice_min=char_dice_min
+        ):
             continue
-        if not shared and float(score.get("bigram_dice") or 0.0) < float(tab_dice_min):
+        # 加严门槛只针对「两边都打了标签、却没有一个对得上」——那才是内容不同的
+        # 证据。有一边压根没标签时什么都证明不了，上游漏给标签的比例并不低
+        # （某些来源三成以上），按不同类处理等于让这些稿件绕过查重。
+        tags_disagree = _has_channels(channels) and _has_channels(article.get("channels"))
+        if (
+            not shared
+            and tags_disagree
+            and float(score.get("bigram_dice") or 0.0) < float(tab_dice_min)
+        ):
             continue
         ranked.append({
             "article": article,
@@ -299,6 +346,7 @@ def check_title_duplicate(
         limit=config.title_dedup_max_candidates,
         tab_id=article.get("tab_id"),
         tab_dice_min=config.title_dedup_tab_dice_min,
+        char_dice_min=config.title_dedup_char_dice_min,
     )
     base["checked"] = True
     base["candidate_count"] = len(candidates)

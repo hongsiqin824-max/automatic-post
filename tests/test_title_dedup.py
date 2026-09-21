@@ -129,7 +129,6 @@ def test_same_tab_requires_higher_similarity_than_shared_channel() -> None:
 
 def test_same_tab_gate_disabled_without_threshold() -> None:
     """未配置 tab_dice_min 时行为与改动前一致：同栏目不构成入围理由。"""
-
     articles = [
         {**_article(1, "韩媒：韩国裁判协会就判罚争议道歉", [999]), "tab_id": 3},
     ]
@@ -145,6 +144,76 @@ def test_same_tab_gate_disabled_without_threshold() -> None:
         tab_dice_min=None,
     )
     assert selected == []
+
+
+def test_reversed_scoreline_is_recalled_as_the_same_match() -> None:
+    """主客队写反的同一场比赛必须能召回。
+
+    「町田2-4柏」和「柏4-2逆转町田」写的是同一个结果，但调换语序后公共子串
+    只剩 2 字、bigram 0.23 卡在门槛下，两篇都会原样发出去。比分归一化加上不看
+    顺序的字符重合度才接得住这一类。
+    """
+
+    articles = [
+        {**_article(1, "日媒：町田2-4不敌柏，开季8场不败终结", []), "tab_id": 9},
+    ]
+    kwargs = dict(
+        candidate_id=5, channels=[], dice_min=0.25, lcs_min=4,
+        limit=3, tab_id=9, tab_dice_min=0.6,
+    )
+    assert title_dedup.select_candidates(
+        "日媒：柏4-2逆转町田，町田首败失榜首", articles, **kwargs
+    ) == []
+    recalled = title_dedup.select_candidates(
+        "日媒：柏4-2逆转町田，町田首败失榜首", articles, char_dice_min=0.48, **kwargs
+    )
+    assert [item["article"]["id"] for item in recalled] == [1]
+
+
+def test_scoreline_order_does_not_change_the_normalized_title() -> None:
+    assert title_dedup.normalize_title("柏4-2町田") == title_dedup.normalize_title("柏2-4町田")
+    # 日期不是比分，不能被重排
+    assert "20260920" in title_dedup.normalize_title("2026-09-20 赛果")
+
+
+def test_missing_tags_do_not_trigger_the_stricter_tab_threshold() -> None:
+    """标签缺失不等于标签不同，不能因此套用更严的同栏目门槛。
+
+    上游有三成以上的稿件不带标签，把「没标签」当成「确定不同类」，这些稿件
+    就得跨过 0.6 才入围，等于整片绕过查重。
+    """
+
+    kwargs = dict(
+        candidate_id=5, dice_min=0.25, lcs_min=4, limit=3,
+        tab_id=14, tab_dice_min=0.6, char_dice_min=0.48,
+    )
+    title = "韩媒：孙兴慜战圣何塞，盼终结3场球荒"
+    candidate = "韩媒：孙兴慜先发，洛杉矶FC战圣何塞"  # 与上句 bigram 仅 0.467
+
+    # 池中稿没有标签：按普通门槛入围
+    untagged = [{**_article(1, title, []), "tab_id": 14}]
+    assert [
+        item["article"]["id"]
+        for item in title_dedup.select_candidates(candidate, untagged, channels=[1568], **kwargs)
+    ] == [1]
+
+    # 两边都带标签却没有交集：这才是内容不同的证据，仍按 0.6 挡掉
+    tagged = [{**_article(1, title, [999]), "tab_id": 14}]
+    assert title_dedup.select_candidates(candidate, tagged, channels=[1568], **kwargs) == []
+
+
+def test_char_dice_does_not_recall_unrelated_titles() -> None:
+    """语序无关的信号不能宽到把无关稿件也拉进来。"""
+
+    articles = [
+        {**_article(1, "德媒：拜仁续约凯恩，合同延长至2029年", []), "tab_id": 9},
+    ]
+    assert title_dedup.select_candidates(
+        "日媒：神户1-0大阪钢巴，埃里克89分钟绝杀",
+        articles,
+        candidate_id=5, channels=[], dice_min=0.25, lcs_min=4,
+        limit=3, tab_id=9, tab_dice_min=0.6, char_dice_min=0.48,
+    ) == []
 
 
 def test_match_scope_label_distinguishes_channel_and_tab() -> None:

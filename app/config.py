@@ -242,6 +242,11 @@ class AppConfig:
     # 仅靠同栏目入围时要求更高的词面相似度，避免把低相似候选灌进 LLM 判定。
     title_dedup_tab_dice_min: float = max(0.0, min(1.0, _env_float("AUTOMATIC_POST_TITLE_DEDUP_TAB_DICE_MIN", 0.6)))
     title_dedup_lcs_min: int = max(2, min(12, _env_int("AUTOMATIC_POST_TITLE_DEDUP_LCS_MIN", 4)))
+    # 语序无关的兜底信号。bigram 和最长公共子串都吃语序，而「町田2-4柏」和
+    # 「柏4-2逆转町田」写的是同一场球：跨越主客队顺序后两者几乎没有公共二元组
+    # （实测 0.13），只有按字符重合度才看得出是同一件事（0.49）。取 0.48 是因为
+    # 同栏目随机配对的字符重合度 P99 只有 0.46，再低就会把无关稿件灌进候选。
+    title_dedup_char_dice_min: float = max(0.0, min(1.0, _env_float("AUTOMATIC_POST_TITLE_DEDUP_CHAR_DICE_MIN", 0.48)))
     title_dedup_max_candidates: int = max(1, min(10, _env_int("AUTOMATIC_POST_TITLE_DEDUP_MAX_CANDIDATES", 3)))
 
     # AI 栏目归属护栏。原实现只会逐个追问「是否属于某个预配候选栏目」
