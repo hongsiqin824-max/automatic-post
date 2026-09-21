@@ -38,6 +38,7 @@ from .services.publisher import (
     DraftConfirmationController,
     ManualReconcileRequired,
     PublishController,
+    TitleDuplicateBlocked,
     create_draft_for_article,
 )
 from .services.preview_html import sanitize_preview_html
@@ -1223,6 +1224,16 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "reason": "needs_manual_reconcile",
                     "requires_confirmation": True,
                 },
+                "article": article,
+            }), 409
+        except TitleDuplicateBlocked as exc:
+            # 护栏把这篇升级成直接发布后才查出重复，文章已落 TITLE_DUPLICATE。
+            article = _article_view(repo.get_article(article_id, conn))
+            return jsonify({
+                "success": False,
+                "error": str(exc),
+                "message": str(exc),
+                "result": {"skipped": True, "reason": "title_duplicate"},
                 "article": article,
             }), 409
         except DraftClaimSkipped as exc:

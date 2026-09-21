@@ -50,6 +50,10 @@ class ManualReconcileRequired(RuntimeError):
     """Raised when retrying could duplicate an article that upstream may already hold."""
 
 
+class TitleDuplicateBlocked(RuntimeError):
+    """Raised when the post-guard dedup pass stops a draft that was already claimed."""
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -129,6 +133,14 @@ def _submit_article(
 
 def _publish_eligible(article: dict[str, Any]) -> bool:
     return article.get("status") == "READY_TO_PUBLISH"
+
+
+def _guard_upgraded_to_publish(article: dict[str, Any]) -> bool:
+    """Whether the league guard turned a draft-mode article into a direct publish."""
+
+    quality = article.get("quality")
+    guard = quality.get("league_guard") if isinstance(quality, dict) else None
+    return bool(guard.get("upgraded_to_publish")) if isinstance(guard, dict) else False
 
 
 def _title_dedup_gate(config: AppConfig, connection, current: dict[str, Any]) -> dict[str, Any] | None:
@@ -1038,6 +1050,50 @@ def _create_draft_attempt(
     # 却仍发到「日职联」）。改判失败时保留原栏目，不让提交因此落空。
     tabs = _current_tabs(current) or tabs
 
+    # 护栏还会把草稿配置的文章升级成直接发布，而两道标题查重关卡都只认
+    # publish_mode==1：质检那道运行时它还是草稿，提交前那道运行在护栏之前，
+    # 等升级落定时两道都已经错过。不在这里补一次，同一场比赛的多篇报道会原样
+    # 全部直发出去。此刻文章已被抢占为 PUBLISHING，所以终态按该状态做 CAS。
+    if publish_mode == 1 and _guard_upgraded_to_publish(current):
+        upgrade_dedup = title_dedup.check_title_duplicate(
+            config,
+            current,
+            repo.list_title_dedup_candidates(
+                title_dedup.dedup_window_since(config.title_dedup_hours),
+                article_id,
+                connection,
+            ),
+            publish_mode=publish_mode,
+        )
+        if upgrade_dedup["outcome"] == "duplicate":
+            matched = upgrade_dedup["matched"] or {}
+            blocked_message = (
+                f"与文章 #{matched.get('id')}《{matched.get('title')}》标题高度相似"
+                f"（{title_dedup.match_scope_label(upgrade_dedup)}），已取消自动发布"
+            )
+            repo.transition_status_if_current(
+                article_id,
+                "TITLE_DUPLICATE",
+                connection,
+                allowed_from={"PUBLISHING"},
+                event_type="TITLE_DUPLICATE_DETECTED",
+                message=blocked_message,
+                payload=upgrade_dedup,
+            )
+            raise TitleDuplicateBlocked(blocked_message)
+        if upgrade_dedup["outcome"] == "needs_review":
+            blocked_message = f"标题查重判定失败：{upgrade_dedup['error']}，转人工审核"
+            repo.transition_status_if_current(
+                article_id,
+                "NEEDS_REVIEW",
+                connection,
+                allowed_from={"PUBLISHING"},
+                event_type="TITLE_DUPLICATE_REVIEW",
+                message=blocked_message,
+                payload=upgrade_dedup,
+            )
+            raise TitleDuplicateBlocked(blocked_message)
+
     try:
         publish_account, current = _publish_account_for_attempt(current, connection)
     except ValueError as exc:
@@ -1710,6 +1766,17 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
             })
         except DraftClaimSkipped as exc:
             skipped += 1
+            result_items.append({
+                "article_id": article_id,
+                "source": current.get("source"),
+                "error": str(exc)[:300],
+                "skipped": True,
+            })
+        except TitleDuplicateBlocked as exc:
+            # 护栏升级后才查出的重复。拦截是正常结果，不能计成 failed，否则
+            # 真故障会被这类稿件淹没。
+            skipped += 1
+            title_duplicate_skipped += 1
             result_items.append({
                 "article_id": article_id,
                 "source": current.get("source"),

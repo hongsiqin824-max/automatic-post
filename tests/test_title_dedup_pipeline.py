@@ -217,3 +217,69 @@ def test_publisher_gate_blocks_duplicate_before_draft(app, monkeypatch) -> None:
         assert not updated["dqd_archive_id"]
     finally:
         conn.close()
+
+
+def test_guard_upgrade_to_direct_publish_still_runs_title_dedup(app, monkeypatch) -> None:
+    """被护栏升级为直接发布的稿件也要查重。
+
+    质检那道和提交前那道 gate 都只认 publish_mode==1，而护栏的升级发生在两者
+    之后：不在护栏之后补这一道，同一场比赛的多篇报道会原样全部直发出去。
+    """
+
+    database = app.config["DATABASE"]
+    conn = _connect(database)
+    try:
+        tab = repo.list_tabs(conn)[0]
+        # 栏目配的是草稿模式，所以前两道关卡都会以「非直接发布」为由跳过查重。
+        repo.update_tab(tab["id"], conn, publish_mode=0)
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True)
+    finally:
+        conn.close()
+
+    published_id = _publish_article(database, "a", TITLE_A, [100])
+    conn = _connect(database)
+    try:
+        article = repo.upsert_material(_item("b", TITLE_B, [100]), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+        article_id = int(article["id"])
+    finally:
+        conn.close()
+
+    def fake_resolve(article, tabs, connection, config):
+        """替身护栏：把草稿稿件判成直接发布，并留下和线上一致的升级痕迹。"""
+
+        quality = dict(article.get("quality") or {})
+        quality["league_guard"] = {"upgraded_to_publish": True, "tab_name": "日职联"}
+        return 1, repo.save_quality(int(article["id"]), quality, connection)
+
+    monkeypatch.setattr("app.services.publisher._resolve_publish_mode", fake_resolve)
+
+    def no_draft(self, *args, **kwargs):
+        raise AssertionError("查重拦截后不应调用开放平台")
+
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", no_draft)
+    prompts: list[str] = []
+
+    def fake_chat(self, prompt):
+        prompts.append(prompt)
+        return {"duplicate": True, "matched_id": str(published_id), "reason": "同一事件"}
+
+    monkeypatch.setattr(LLMService, "chat_json", fake_chat)
+
+    conn = _connect(database)
+    try:
+        result = publish_ready_articles(_open_config(database), conn)
+    finally:
+        conn.close()
+
+    assert prompts, "护栏升级后必须真的跑一次查重"
+    assert result["title_duplicate_skipped"] == 1
+    assert result["failed"] == 0  # 拦截是正常结果，不能计成失败
+    assert result["draft_created"] == 0
+    conn = _connect(database)
+    try:
+        updated = repo.get_article(article_id, conn)
+        assert updated["status"] == "TITLE_DUPLICATE"
+        assert not updated["dqd_archive_id"]
+    finally:
+        conn.close()
