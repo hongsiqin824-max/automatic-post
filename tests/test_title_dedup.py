@@ -176,6 +176,23 @@ def test_scoreline_order_does_not_change_the_normalized_title() -> None:
     assert "20260920" in title_dedup.normalize_title("2026-09-20 赛果")
 
 
+def test_exact_match_never_relies_on_the_scoreline_reordering() -> None:
+    """比分顺序相反的两场比赛不算字面一致。
+
+    exact 命中会直接判重且不经 LLM。比分升序归一化是为模糊匹配服务的，若让
+    它决定 exact，「柏4-2町田」和「柏2-4町田」这对主客场两回合就会被无声吞掉。
+    """
+
+    score = title_dedup.score_title_similarity("日媒：柏4-2町田", "日媒：柏2-4町田")
+    assert score["exact"] is False
+    # 但模糊指标照样认为两者高度相似，是否同一场比赛交给 LLM 去判
+    assert score["bigram_dice"] > 0.9
+
+    assert title_dedup.score_title_similarity("日媒：柏4-2町田", "日媒：柏4-2町田")["exact"] is True
+    # 仅标点和全角差异仍应算字面一致
+    assert title_dedup.score_title_similarity("日媒：柏4-2町田", "日媒 柏４-２町田")["exact"] is True
+
+
 def test_missing_tags_do_not_trigger_the_stricter_tab_threshold() -> None:
     """标签缺失不等于标签不同，不能因此套用更严的同栏目门槛。
 

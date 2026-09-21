@@ -92,13 +92,29 @@ def _sorted_score(match: re.Match[str]) -> str:
     return f"{low}-{high}"
 
 
-def normalize_title(title: Any) -> str:
+def strict_normalize_title(title: Any) -> str:
+    """字面归一化：只做 NFKC、小写、去标点，比分原样保留。
+
+    ``exact`` 必须用这一版判定。:func:`normalize_title` 会把比分按升序重排，
+    那是为模糊匹配服务的，但它同时会让「柏4-2町田」和「柏2-4町田」变得完全
+    一样——这是主客场两回合的两场比赛，而 exact 命中会直接判重且不经 LLM，
+    等于不问一声就吞掉一篇真新闻。
+    """
+
     value = unicodedata.normalize("NFKC", str(title or "")).lower()
-    # 比分按升序写死：主队写在前面还是后面纯看媒体习惯，「町田2-4柏」和
-    # 「柏4-2町田」说的是同一个结果，但 24 和 42 连一个公共二元组都没有。
-    # 真正的比分冲突交给 LLM，它读到的是未归一化的原标题。
-    value = _SCORE_RE.sub(_sorted_score, value)
     return _NORMALIZED_RE.sub("", value)
+
+
+def normalize_title(title: Any) -> str:
+    """模糊匹配用的归一化：在字面归一化之上再把比分按升序重排。
+
+    主队写在前面还是后面纯看媒体习惯，「町田2-4柏」和「柏4-2町田」说的是同一
+    个结果，但 24 和 42 连一个公共二元组都没有。真正的比分冲突由 LLM 判断，
+    它读到的是未归一化的原标题。
+    """
+
+    value = unicodedata.normalize("NFKC", str(title or "")).lower()
+    return _NORMALIZED_RE.sub("", _SCORE_RE.sub(_sorted_score, value))
 
 
 def score_title_similarity(left: Any, right: Any) -> dict[str, Any]:
@@ -125,7 +141,8 @@ def score_title_similarity(left: Any, right: Any) -> dict[str, Any]:
     right_chars = Counter(b)
     char_overlap = sum(min(count, right_chars.get(ch, 0)) for ch, count in left_chars.items())
     return {
-        "exact": a == b,
+        # exact 走的是字面归一化：它会绕过 LLM 直接判重，不能建立在比分重排上。
+        "exact": strict_normalize_title(left) == strict_normalize_title(right),
         "lcs_chars": lcs,
         "lcs_shorter": lcs / shorter if shorter else 0.0,
         "lcs_longer": lcs / longer if longer else 0.0,
