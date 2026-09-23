@@ -12,16 +12,77 @@
 {% endblock %}
 
 {% block content %}
-<!-- 实操标签统计 -->
+<!-- 未被栏目覆盖的赛事：直接驱动「该新建/启用哪个栏目」 -->
 <div class="page-section">
+  <div class="section-header">
+    <div>
+      <h2 class="section-title">未被栏目覆盖的赛事</h2>
+      <p class="section-description">
+        AI 归属校验判定「不属于原栏目」、且系统没能自动改挂的稿件，按其真实赛事汇总。
+        仅统计走过归属校验的草稿稿件（配置为直发的来源不校验），已成功改挂的不计入。
+      </p>
+    </div>
+  </div>
+
+  {% if uncovered_competitions %}
+  <div class="card">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>实际赛事</th>
+          <th>累计篇数</th>
+          <th>最近出现</th>
+          <th>主要来源</th>
+          <th>稿件现状</th>
+          <th>栏目状态</th>
+          <th>建议动作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in uncovered_competitions %}
+        <tr>
+          <td><strong>{{ item.competition }}</strong></td>
+          <td>{{ item.total }}</td>
+          <td>{{ item.last_seen }}</td>
+          <td>{{ item.top_source }}</td>
+          <td>
+            草稿 {{ item.drafts }}
+            {% if item.published %} · 已发 {{ item.published }}{% endif %}
+            {% if item.abandoned %} · 放弃 {{ item.abandoned }}{% endif %}
+          </td>
+          <td>
+            {% if item.tab_state == 'ready' %}
+              <span style="color:#16a34a;">{{ item.tab_state_label }}</span>
+            {% elif item.tab_state == 'missing' %}
+              <span style="color:#dc2626;">{{ item.tab_state_label }}</span>
+            {% else %}
+              <span style="color:#d97706;">{{ item.tab_state_label }}</span>
+            {% endif %}
+          </td>
+          <td style="color:#64748b;">{{ item.suggested_action }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="card" style="padding: 3rem; text-align: center; color: #64748b;">
+    <i data-lucide="check-circle" style="width: 48px; height: 48px; margin: 0 auto 1rem;"></i>
+    <p style="margin: 0;">没有未被覆盖的赛事，现有栏目已覆盖全部内容</p>
+  </div>
+  {% endif %}
+</div>
+
+<!-- 实操标签统计 -->
+<div class="page-section" style="margin-top: 3rem;">
   <div class="section-header">
     <div>
       <h2 class="section-title">实操标签统计</h2>
       <p class="section-description">
+        与上表同口径（未覆盖赛事）的累计与每日分布。单日单赛事量小、波动大，判断该
+        建哪个栏目请以上表的累计篇数为准。
         {% if competition_stats.date_range.start %}
-          数据范围: {{ competition_stats.date_range.start }} 至 {{ competition_stats.date_range.end }}
-        {% else %}
-          暂无数据
+          <br>数据范围: {{ competition_stats.date_range.start }} 至 {{ competition_stats.date_range.end }}
         {% endif %}
       </p>
     </div>

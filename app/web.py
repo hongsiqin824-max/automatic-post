@@ -67,6 +67,33 @@ STATUS_ALIASES = {
     "error": "ERROR",
 }
 
+
+# 「未被栏目覆盖的赛事」的统一口径，占位符按顺序需要传入 NON_COMPETITION_LABEL。
+# 这三条过滤必须和文章列表页 _decorate_article 里 league_guard_competition 的口径
+# 保持一致，否则同一份数据在列表页和看板上对不上号（改之前看板统计到 1174 篇，
+# 列表页口径只有 573 篇）：
+#   1. 排除「非赛事」和空值：没有信息量；
+#   2. 排除已改挂的：栏目已经被 AI 改对了，不算未覆盖；
+#   3. 排除与原栏目同名的：verdict 判了「不属于原栏目」却说实际赛事就是原栏目，
+#      属于两阶段调用口径不一致产生的矛盾值。
+# 原栏目要读 guard_tab_name 而不是 tab_name——后者记的是最终落点，改挂后已被改写。
+_UNCOVERED_COMPETITION_WHERE = """
+        json_extract(quality_json, '$.league_guard.actual_competition') IS NOT NULL
+    AND json_extract(quality_json, '$.league_guard.actual_competition') NOT IN (?, '')
+    AND json_extract(quality_json, '$.league_guard.reassigned_tab_id') IS NULL
+    AND json_extract(quality_json, '$.league_guard.actual_competition') <> COALESCE(
+            NULLIF(json_extract(quality_json, '$.league_guard.guard_tab_name'), ''),
+            json_extract(quality_json, '$.league_guard.tab_name'))
+"""
+
+# 未覆盖赛事该采取什么动作，取决于系统里有没有这个栏目、栏目是什么状态。
+_TAB_STATE_LABELS = {
+    "missing": ("无此栏目", "建议新建栏目"),
+    "disabled": ("栏目已停用", "启用该栏目即可自动改挂"),
+    "undefined": ("未配判定定义", "补判定定义，否则进不了候选栏目"),
+    "ready": ("栏目正常", "护栏未改挂，需人工核对"),
+}
+
 EVENT_LABELS = {
     "MATERIAL_RECEIVED": "素材进入系统",
     "QUALITY_STARTED": "开始自动质检",
@@ -802,35 +829,35 @@ def create_app(test_config: dict | None = None) -> Flask:
         cursor = conn.cursor()
 
         # 查询所有文章的 quality_json 中的 actual_competition 字段，按天统计
-        cursor.execute("""
+        cursor.execute(
+            f"""
             SELECT
                 DATE(created_at) as date,
                 json_extract(quality_json, '$.league_guard.actual_competition') as competition,
                 COUNT(*) as count
             FROM articles
-            WHERE quality_json IS NOT NULL
-                AND json_extract(quality_json, '$.league_guard.actual_competition') IS NOT NULL
-                AND json_extract(quality_json, '$.league_guard.actual_competition') != '非赛事'
-                AND json_extract(quality_json, '$.league_guard.actual_competition') != ''
+            WHERE {_UNCOVERED_COMPETITION_WHERE}
             GROUP BY date, competition
             ORDER BY date DESC, count DESC
-        """)
+            """,
+            (NON_COMPETITION_LABEL,),
+        )
 
         daily_competition = cursor.fetchall()
 
         # 统计总数
-        cursor.execute("""
+        cursor.execute(
+            f"""
             SELECT
                 json_extract(quality_json, '$.league_guard.actual_competition') as competition,
                 COUNT(*) as count
             FROM articles
-            WHERE quality_json IS NOT NULL
-                AND json_extract(quality_json, '$.league_guard.actual_competition') IS NOT NULL
-                AND json_extract(quality_json, '$.league_guard.actual_competition') != '非赛事'
-                AND json_extract(quality_json, '$.league_guard.actual_competition') != ''
+            WHERE {_UNCOVERED_COMPETITION_WHERE}
             GROUP BY competition
             ORDER BY count DESC
-        """)
+            """,
+            (NON_COMPETITION_LABEL,),
+        )
 
         total_stats = cursor.fetchall()
 
@@ -866,6 +893,84 @@ def create_app(test_config: dict | None = None) -> Flask:
             'competitions': competitions,
             'date_range': date_range
         }
+
+    def _get_uncovered_competitions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        """未被栏目覆盖的赛事排行，并给出该做什么动作。
+
+        只列赛事名和篇数的话，运营看完仍然不知道要干什么，所以 JOIN tabs 判出
+        栏目侧的状态：压根没建这个栏目、建了但停用、建了但没配判定定义（没配就
+        进不了候选栏目，护栏永远改挂不过去）。每种状态对应一个明确动作。
+
+        稿件现状一并带出来：这批稿件几乎全部停在 DRAFT_CREATED，说明内容一直在
+        进来却没有栏目可去，这才是要建栏目的依据。
+        """
+
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT
+                json_extract(a.quality_json, '$.league_guard.actual_competition') AS competition,
+                COUNT(*) AS total,
+                MAX(DATE(a.created_at)) AS last_seen,
+                SUM(CASE WHEN a.status='DRAFT_CREATED' THEN 1 ELSE 0 END) AS drafts,
+                SUM(CASE WHEN a.status='PUBLISHED' THEN 1 ELSE 0 END) AS published,
+                SUM(CASE WHEN a.status='ABANDONED' THEN 1 ELSE 0 END) AS abandoned,
+                CASE
+                    WHEN t.id IS NULL THEN 'missing'
+                    WHEN t.enabled = 0 THEN 'disabled'
+                    WHEN t.ai_league_guard_definition = '' THEN 'undefined'
+                    ELSE 'ready'
+                END AS tab_state
+            FROM articles a
+            LEFT JOIN tabs t
+                ON t.name = json_extract(a.quality_json, '$.league_guard.actual_competition')
+            WHERE {_UNCOVERED_COMPETITION_WHERE.replace('quality_json', 'a.quality_json')}
+            GROUP BY competition, tab_state
+            ORDER BY total DESC
+            """,
+            (NON_COMPETITION_LABEL,),
+        )
+        rows = cursor.fetchall()
+
+        # 主要来源单独查一次再在内存里归并：窗口函数写法在这点数据量上没有收益，
+        # 反而更难读。
+        cursor.execute(
+            f"""
+            SELECT
+                json_extract(quality_json, '$.league_guard.actual_competition') AS competition,
+                source,
+                COUNT(*) AS count
+            FROM articles
+            WHERE {_UNCOVERED_COMPETITION_WHERE}
+            GROUP BY competition, source
+            ORDER BY count DESC
+            """,
+            (NON_COMPETITION_LABEL,),
+        )
+        top_source: dict[str, str] = {}
+        for row in cursor.fetchall():
+            competition = str(row[0] or "")
+            if competition and competition not in top_source:
+                top_source[competition] = str(row[1] or "")
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            state = str(row[6] or "ready")
+            label, action = _TAB_STATE_LABELS.get(state, _TAB_STATE_LABELS["ready"])
+            competition = str(row[0] or "")
+            items.append({
+                'competition': competition,
+                'total': int(row[1] or 0),
+                'last_seen': row[2] or '',
+                'drafts': int(row[3] or 0),
+                'published': int(row[4] or 0),
+                'abandoned': int(row[5] or 0),
+                'tab_state': state,
+                'tab_state_label': label,
+                'suggested_action': action,
+                'top_source': top_source.get(competition, ''),
+            })
+        return items
 
     def _safe_back_url(fallback: str) -> str:
         """Return request.referrer only when it is same-origin; fall back otherwise."""
@@ -1652,8 +1757,14 @@ def create_app(test_config: dict | None = None) -> Flask:
         # 获取实操标签统计数据
         conn = get_db()
         competition_stats = _get_competition_stats(conn)
+        uncovered_competitions = _get_uncovered_competitions(conn)
 
-        return render_template("league_data.html", data=data, competition_stats=competition_stats)
+        return render_template(
+            "league_data.html",
+            data=data,
+            competition_stats=competition_stats,
+            uncovered_competitions=uncovered_competitions,
+        )
 
     @app.get("/health")
     def health():
