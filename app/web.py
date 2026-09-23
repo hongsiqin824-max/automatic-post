@@ -101,6 +101,7 @@ EVENT_LABELS = {
     "SOURCE_DUPLICATE_DETECTED": "发现同来源重复文章",
     "TITLE_DUPLICATE_DETECTED": "标题查重拦截",
     "TITLE_DUPLICATE_REVIEW": "标题查重转人工",
+    "TITLE_DUPLICATE_RELEASED": "标题相似但正文确认放行",
     "STATUS_CHANGED": "状态更新",
 }
 
@@ -795,6 +796,76 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.jinja_env.globals["cdn_url"] = cdn_url
     app.jinja_env.globals["status_label"] = lambda value: STATUS_LABELS.get(value, value)
     app.jinja_env.filters["beijing_time"] = format_beijing_time
+
+    def _get_competition_stats(conn: sqlite3.Connection) -> dict[str, Any]:
+        """获取按天统计的实操标签数据"""
+        cursor = conn.cursor()
+
+        # 查询所有文章的 quality_json 中的 actual_competition 字段，按天统计
+        cursor.execute("""
+            SELECT
+                DATE(created_at) as date,
+                json_extract(quality_json, '$.league_guard.actual_competition') as competition,
+                COUNT(*) as count
+            FROM articles
+            WHERE quality_json IS NOT NULL
+                AND json_extract(quality_json, '$.league_guard.actual_competition') IS NOT NULL
+                AND json_extract(quality_json, '$.league_guard.actual_competition') != '非赛事'
+                AND json_extract(quality_json, '$.league_guard.actual_competition') != ''
+            GROUP BY date, competition
+            ORDER BY date DESC, count DESC
+        """)
+
+        daily_competition = cursor.fetchall()
+
+        # 统计总数
+        cursor.execute("""
+            SELECT
+                json_extract(quality_json, '$.league_guard.actual_competition') as competition,
+                COUNT(*) as count
+            FROM articles
+            WHERE quality_json IS NOT NULL
+                AND json_extract(quality_json, '$.league_guard.actual_competition') IS NOT NULL
+                AND json_extract(quality_json, '$.league_guard.actual_competition') != '非赛事'
+                AND json_extract(quality_json, '$.league_guard.actual_competition') != ''
+            GROUP BY competition
+            ORDER BY count DESC
+        """)
+
+        total_stats = cursor.fetchall()
+
+        # 整理数据
+        daily_data = []
+        for row in daily_competition:
+            daily_data.append({
+                'date': row[0],
+                'competition': row[1],
+                'count': row[2]
+            })
+
+        total_data = []
+        for row in total_stats:
+            total_data.append({
+                'competition': row[0],
+                'count': row[1]
+            })
+
+        # 获取所有不重复的联赛名称
+        competitions = list(set(item['competition'] for item in daily_data))
+
+        # 获取日期范围
+        dates = sorted(list(set(item['date'] for item in daily_data)))
+        date_range = {
+            'start': dates[0] if dates else '',
+            'end': dates[-1] if dates else ''
+        }
+
+        return {
+            'daily_data': daily_data,
+            'total_data': total_data,
+            'competitions': competitions,
+            'date_range': date_range
+        }
 
     def _safe_back_url(fallback: str) -> str:
         """Return request.referrer only when it is same-origin; fall back otherwise."""
@@ -1562,6 +1633,27 @@ def create_app(test_config: dict | None = None) -> Flask:
             return jsonify({"success": False, "error": str(exc)}), 400
         except (ValueError, TypeError) as exc:
             return jsonify({"success": False, "error": str(exc)}), 400
+
+    @app.get("/league-data")
+    def league_data():
+        """联赛tab点击数据看板 + 实操标签统计"""
+        data_file = Path(__file__).resolve().parents[1] / "instance" / "league_clicks.json"
+        try:
+            with open(data_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            data = {
+                "update_time": "",
+                "date_range": {"start": "", "end": ""},
+                "leagues": [],
+                "daily_data": []
+            }
+
+        # 获取实操标签统计数据
+        conn = get_db()
+        competition_stats = _get_competition_stats(conn)
+
+        return render_template("league_data.html", data=data, competition_stats=competition_stats)
 
     @app.get("/health")
     def health():

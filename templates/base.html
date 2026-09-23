@@ -34,6 +34,9 @@
         <a href="{{ url_for('config') }}" class="nav-item {% if request.endpoint == 'config' %}is-active{% endif %}">
           <i data-lucide="settings-2"></i><span>栏目与来源</span>
         </a>
+        <a href="{{ url_for('league_data') }}" class="nav-item {% if request.endpoint == 'league_data' %}is-active{% endif %}">
+          <i data-lucide="bar-chart-3"></i><span>数据</span>
+        </a>
       </nav>
 
       <div class="sidebar-foot">

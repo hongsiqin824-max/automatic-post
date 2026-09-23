@@ -1,0 +1,676 @@
+{
+  "update_time": "2026-09-22 15:02:23",
+  "date_range": {
+    "start": "2026-06-25",
+    "end": "2026-09-22"
+  },
+  "leagues": [
+    {
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "total_clicks": 191113,
+      "total_devices": 95987,
+      "active_days": 90
+    },
+    {
+      "league_id": "18",
+      "league_name": "亚冠精英",
+      "total_clicks": 1,
+      "total_devices": 1,
+      "active_days": 1
+    },
+    {
+      "league_id": "83",
+      "league_name": "韩K联赛",
+      "total_clicks": 1,
+      "total_devices": 1,
+      "active_days": 1
+    }
+  ],
+  "daily_data": [
+    {
+      "date": "2026-09-22",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 430,
+      "devices": 239
+    },
+    {
+      "date": "2026-09-21",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1740,
+      "devices": 771
+    },
+    {
+      "date": "2026-09-20",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 3004,
+      "devices": 1377
+    },
+    {
+      "date": "2026-09-19",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 3110,
+      "devices": 1367
+    },
+    {
+      "date": "2026-09-18",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2108,
+      "devices": 879
+    },
+    {
+      "date": "2026-09-17",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2352,
+      "devices": 922
+    },
+    {
+      "date": "2026-09-16",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1933,
+      "devices": 902
+    },
+    {
+      "date": "2026-09-15",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2212,
+      "devices": 1023
+    },
+    {
+      "date": "2026-09-14",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1954,
+      "devices": 953
+    },
+    {
+      "date": "2026-09-13",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 3086,
+      "devices": 1392
+    },
+    {
+      "date": "2026-09-12",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2881,
+      "devices": 1389
+    },
+    {
+      "date": "2026-09-11",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1696,
+      "devices": 871
+    },
+    {
+      "date": "2026-09-10",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1813,
+      "devices": 886
+    },
+    {
+      "date": "2026-09-09",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1821,
+      "devices": 945
+    },
+    {
+      "date": "2026-09-08",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1711,
+      "devices": 829
+    },
+    {
+      "date": "2026-09-07",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1591,
+      "devices": 781
+    },
+    {
+      "date": "2026-09-06",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 3071,
+      "devices": 1381
+    },
+    {
+      "date": "2026-09-05",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2879,
+      "devices": 1377
+    },
+    {
+      "date": "2026-09-04",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1587,
+      "devices": 812
+    },
+    {
+      "date": "2026-09-03",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1600,
+      "devices": 764
+    },
+    {
+      "date": "2026-09-02",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2267,
+      "devices": 996
+    },
+    {
+      "date": "2026-09-01",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1614,
+      "devices": 817
+    },
+    {
+      "date": "2026-08-31",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1847,
+      "devices": 899
+    },
+    {
+      "date": "2026-08-30",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2860,
+      "devices": 1398
+    },
+    {
+      "date": "2026-08-29",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 3157,
+      "devices": 1425
+    },
+    {
+      "date": "2026-08-28",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1631,
+      "devices": 821
+    },
+    {
+      "date": "2026-08-27",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1501,
+      "devices": 754
+    },
+    {
+      "date": "2026-08-26",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1684,
+      "devices": 881
+    },
+    {
+      "date": "2026-08-25",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1740,
+      "devices": 916
+    },
+    {
+      "date": "2026-08-24",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1569,
+      "devices": 810
+    },
+    {
+      "date": "2026-08-23",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2698,
+      "devices": 1361
+    },
+    {
+      "date": "2026-08-22",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2877,
+      "devices": 1440
+    },
+    {
+      "date": "2026-08-21",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1933,
+      "devices": 972
+    },
+    {
+      "date": "2026-08-20",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1496,
+      "devices": 750
+    },
+    {
+      "date": "2026-08-19",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1501,
+      "devices": 808
+    },
+    {
+      "date": "2026-08-18",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1573,
+      "devices": 759
+    },
+    {
+      "date": "2026-08-17",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1495,
+      "devices": 839
+    },
+    {
+      "date": "2026-08-16",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2773,
+      "devices": 1328
+    },
+    {
+      "date": "2026-08-15",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 3037,
+      "devices": 1409
+    },
+    {
+      "date": "2026-08-14",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1759,
+      "devices": 900
+    },
+    {
+      "date": "2026-08-13",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1170,
+      "devices": 619
+    },
+    {
+      "date": "2026-08-12",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1305,
+      "devices": 741
+    },
+    {
+      "date": "2026-08-11",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1575,
+      "devices": 812
+    },
+    {
+      "date": "2026-08-10",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1318,
+      "devices": 738
+    },
+    {
+      "date": "2026-08-09",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2855,
+      "devices": 1354
+    },
+    {
+      "date": "2026-08-08",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2884,
+      "devices": 1340
+    },
+    {
+      "date": "2026-08-07",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2035,
+      "devices": 1018
+    },
+    {
+      "date": "2026-08-06",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1357,
+      "devices": 734
+    },
+    {
+      "date": "2026-08-05",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1365,
+      "devices": 739
+    },
+    {
+      "date": "2026-08-04",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1473,
+      "devices": 762
+    },
+    {
+      "date": "2026-08-03",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1519,
+      "devices": 834
+    },
+    {
+      "date": "2026-08-02",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2688,
+      "devices": 1350
+    },
+    {
+      "date": "2026-08-01",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2703,
+      "devices": 1252
+    },
+    {
+      "date": "2026-07-31",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1698,
+      "devices": 859
+    },
+    {
+      "date": "2026-07-30",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1839,
+      "devices": 959
+    },
+    {
+      "date": "2026-07-29",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1780,
+      "devices": 857
+    },
+    {
+      "date": "2026-07-28",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1542,
+      "devices": 792
+    },
+    {
+      "date": "2026-07-27",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1885,
+      "devices": 919
+    },
+    {
+      "date": "2026-07-26",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 3293,
+      "devices": 1608
+    },
+    {
+      "date": "2026-07-25",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2728,
+      "devices": 1348
+    },
+    {
+      "date": "2026-07-24",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1828,
+      "devices": 970
+    },
+    {
+      "date": "2026-07-23",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2161,
+      "devices": 1103
+    },
+    {
+      "date": "2026-07-22",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2304,
+      "devices": 1238
+    },
+    {
+      "date": "2026-07-21",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2210,
+      "devices": 1226
+    },
+    {
+      "date": "2026-07-20",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1863,
+      "devices": 1120
+    },
+    {
+      "date": "2026-07-19",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2934,
+      "devices": 1606
+    },
+    {
+      "date": "2026-07-18",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 3345,
+      "devices": 1669
+    },
+    {
+      "date": "2026-07-17",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2294,
+      "devices": 1207
+    },
+    {
+      "date": "2026-07-16",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1785,
+      "devices": 989
+    },
+    {
+      "date": "2026-07-15",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1954,
+      "devices": 991
+    },
+    {
+      "date": "2026-07-14",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1625,
+      "devices": 848
+    },
+    {
+      "date": "2026-07-13",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1641,
+      "devices": 938
+    },
+    {
+      "date": "2026-07-12",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 3198,
+      "devices": 1776
+    },
+    {
+      "date": "2026-07-11",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2888,
+      "devices": 1544
+    },
+    {
+      "date": "2026-07-10",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1777,
+      "devices": 1012
+    },
+    {
+      "date": "2026-07-10",
+      "league_id": "18",
+      "league_name": "亚冠精英",
+      "clicks": 1,
+      "devices": 1
+    },
+    {
+      "date": "2026-07-09",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1705,
+      "devices": 814
+    },
+    {
+      "date": "2026-07-08",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1988,
+      "devices": 1117
+    },
+    {
+      "date": "2026-07-07",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1974,
+      "devices": 1132
+    },
+    {
+      "date": "2026-07-06",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2088,
+      "devices": 1101
+    },
+    {
+      "date": "2026-07-05",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2901,
+      "devices": 1490
+    },
+    {
+      "date": "2026-07-04",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 3320,
+      "devices": 1701
+    },
+    {
+      "date": "2026-07-03",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2297,
+      "devices": 1149
+    },
+    {
+      "date": "2026-07-02",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1992,
+      "devices": 1072
+    },
+    {
+      "date": "2026-07-01",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2073,
+      "devices": 1042
+    },
+    {
+      "date": "2026-06-30",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2283,
+      "devices": 1175
+    },
+    {
+      "date": "2026-06-29",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 1442,
+      "devices": 797
+    },
+    {
+      "date": "2026-06-28",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2899,
+      "devices": 1532
+    },
+    {
+      "date": "2026-06-27",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2955,
+      "devices": 1472
+    },
+    {
+      "date": "2026-06-27",
+      "league_id": "83",
+      "league_name": "韩K联赛",
+      "clicks": 1,
+      "devices": 1
+    },
+    {
+      "date": "2026-06-26",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2664,
+      "devices": 1238
+    },
+    {
+      "date": "2026-06-25",
+      "league_id": "lotzc",
+      "league_name": "彩经",
+      "clicks": 2122,
+      "devices": 1140
+    }
+  ]
+}
