@@ -160,7 +160,13 @@ def _title_dedup_gate(config: AppConfig, connection, current: dict[str, Any]) ->
         int(current["id"]),
         connection,
     )
-    return title_dedup.check_title_duplicate(config, current, candidates, publish_mode=mode)
+    return title_dedup.check_title_duplicate(
+        config,
+        current,
+        candidates,
+        publish_mode=mode,
+        body_loader=lambda target_id: repo.get_article_body(target_id, connection),
+    )
 
 
 def _retry_eligible(article: dict[str, Any]) -> bool:
@@ -1064,6 +1070,7 @@ def _create_draft_attempt(
                 connection,
             ),
             publish_mode=publish_mode,
+            body_loader=lambda target_id: repo.get_article_body(target_id, connection),
         )
         if upgrade_dedup["outcome"] == "duplicate":
             matched = upgrade_dedup["matched"] or {}
@@ -1093,6 +1100,7 @@ def _create_draft_attempt(
                 payload=upgrade_dedup,
             )
             raise TitleDuplicateBlocked(blocked_message)
+        title_dedup.record_body_confirm_release(article_id, upgrade_dedup, connection)
 
     try:
         publish_account, current = _publish_account_for_attempt(current, connection)
@@ -1679,6 +1687,8 @@ def publish_ready_articles(config: AppConfig, connection, *, limit: int = 200) -
             })
             continue
         dedup_result = _title_dedup_gate(config, connection, current)
+        if dedup_result is not None and dedup_result["outcome"] not in {"duplicate", "needs_review"}:
+            title_dedup.record_body_confirm_release(article_id, dedup_result, connection)
         if dedup_result is not None and dedup_result["outcome"] in {"duplicate", "needs_review"}:
             skipped += 1
             # 查重要调用大模型，期间另一个发布轮次可能已经抢占并提交成功。必须

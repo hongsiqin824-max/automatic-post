@@ -252,6 +252,23 @@ class AppConfig:
     # 调用次数（一次判定只是多带几个候选），但候选越多 LLM 越容易挑错，所以
     # 先保守留在 3，要放宽用环境变量调，别忘了 .env 会覆盖这里。
     title_dedup_max_candidates: int = max(1, min(10, _env_int("AUTOMATIC_POST_TITLE_DEDUP_MAX_CANDIDATES", 3)))
+    # 正文二级确认：标题判重之后，再拿两篇正文问一次，只有正文也认才真的拦下。
+    # 标题只有 20 来个字，同一场比赛的首发名单和赛前前瞻在标题层面长得一样，
+    # 换更强的模型也变不出信息（实测 pro 的误杀率 44.3% 反而高于 flash 的 39.5%），
+    # 只有把正文喂进去才有新信息。实测误杀率可从约 10% 降到 4~5%，代价是放跑
+    # 约 4% 的真重复。任何一步取不到正文或调用失败都维持原判定，不引入新风险。
+    title_dedup_body_confirm_enabled: bool = _env_bool(
+        "AUTOMATIC_POST_TITLE_DEDUP_BODY_CONFIRM", True
+    )
+    # 送进确认的正文长度。测量用的就是 420 字，够覆盖导语和核心事实；再长只是
+    # 把赛后感想和背景资料塞进去，对判断没帮助还更贵。
+    title_dedup_body_confirm_chars: int = max(
+        200, min(2000, _env_int("AUTOMATIC_POST_TITLE_DEDUP_BODY_CONFIRM_CHARS", 420))
+    )
+    # 两侧正文都至少要有这么多字，否则没有判断依据，直接跳过确认维持原判定。
+    title_dedup_body_confirm_min_chars: int = max(
+        20, min(500, _env_int("AUTOMATIC_POST_TITLE_DEDUP_BODY_CONFIRM_MIN_CHARS", 60))
+    )
 
     # AI 栏目归属护栏。原实现只会逐个追问「是否属于某个预配候选栏目」
     # （tabs.ai_fallback_tab_ids），近半数栏目没配候选，于是 AI 答完「不属于」

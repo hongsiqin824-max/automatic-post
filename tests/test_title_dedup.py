@@ -25,7 +25,13 @@ def _config(**overrides) -> AppConfig:
     return AppConfig(**base)
 
 
-def _article(article_id: int, title: str, channels: list[int], status: str = "PUBLISHED") -> dict:
+def _article(
+    article_id: int,
+    title: str,
+    channels: list[int],
+    status: str = "PUBLISHED",
+    body: str | None = None,
+) -> dict:
     return {
         "id": article_id,
         "title_final": title,
@@ -33,7 +39,19 @@ def _article(article_id: int, title: str, channels: list[int], status: str = "PU
         "status": status,
         "published_at": "2026-09-09T00:00:00Z",
         "dqd_archive_id": 6300000 + article_id,
+        "body_html": body or "",
     }
+
+
+# 正文二级确认要求两侧都有足够长度，这两段各自超过 60 字的下限。
+_BODY_LINEUP = (
+    "<p>韩国U23代表队公布了对阵沙特阿拉伯的首发名单，梁民赫将出任首发前锋，"
+    "梁贤俊则坐在替补席上等待机会。主教练表示会根据体能状况在下半场做出调整。</p>"
+)
+_BODY_PREVIEW = (
+    "<p>韩国队本场只要不败就能以小组头名的身份晋级八强。球队此前在小组赛中两战全胜，"
+    "积六分位居榜首，而沙特阿拉伯需要赢球才能保留出线希望，因此比赛预计会相当激烈。</p>"
+)
 
 
 @pytest.mark.parametrize("left,right", SAME_FACT_PAIRS)
@@ -306,6 +324,8 @@ def test_check_exact_normalized_title_needs_no_llm(monkeypatch) -> None:
     )
     assert result["outcome"] == "duplicate"
     assert result["reason"] == "归一化标题完全一致"
+    # 这两篇都没有正文，正文二级确认因此跳过，标题结论原样保留。
+    assert result["body_confirm"]["skip_reason"] == "两侧正文不足，无法据正文判断"
 
 
 def test_check_routes_to_review_when_llm_fails(monkeypatch) -> None:
@@ -420,3 +440,214 @@ def test_check_not_duplicate_when_llm_says_different_event(monkeypatch) -> None:
         publish_mode=1,
     )
     assert result["outcome"] == "not_duplicate"
+
+
+def _dual_stage_llm(monkeypatch, *, title_dup: bool, body_same: bool | None,
+                    body_raises: Exception | None = None) -> list[str]:
+    """Stub both LLM stages and record which prompts were sent.
+
+    The two stages share :meth:`LLMService.chat_json`, so they are told apart by
+    a marker that only the body-confirmation prompt carries.
+    """
+
+    seen: list[str] = []
+
+    def fake_chat_json(self, prompt):
+        seen.append(prompt)
+        if "same=true" in prompt:
+            if body_raises is not None:
+                raise body_raises
+            return {"same": body_same, "confidence": "high", "reason": "正文核心事实不同"}
+        return {"duplicate": title_dup, "matched_id": "1", "reason": "标题看起来是同一事件"}
+
+    monkeypatch.setattr(LLMService, "chat_json", fake_chat_json)
+    return seen
+
+
+def test_body_confirmation_overturns_a_title_duplicate(monkeypatch) -> None:
+    """首发名单与赛前前瞻在标题层面几乎一样，正文能分开，应放行。"""
+
+    seen = _dual_stage_llm(monkeypatch, title_dup=True, body_same=False)
+    article = _article(5, "韩媒：韩国U23战沙特争头名", [100], body=_BODY_LINEUP)
+    matched = _article(1, "韩媒：韩国战沙特争首位，力求复仇", [100], body=_BODY_PREVIEW)
+    result = title_dedup.check_title_duplicate(
+        _config(), article, [matched], publish_mode=1,
+        body_loader=lambda target_id: matched["body_html"],
+    )
+    assert result["outcome"] == "not_duplicate"
+    assert result["body_confirm"]["ran"] is True
+    assert result["body_confirm"]["duplicate"] is False
+    assert "正文确认不是同一条新闻" in result["reason"]
+    # 判重指向的那篇仍留在 payload 里，便于事后追查标题查重当时的判断。
+    assert result["matched"]["id"] == 1
+    assert len(seen) == 2
+
+
+def test_body_confirmation_upholds_a_real_duplicate(monkeypatch) -> None:
+    seen = _dual_stage_llm(monkeypatch, title_dup=True, body_same=True)
+    article = _article(5, "韩媒：韩国U23战沙特争头名", [100], body=_BODY_LINEUP)
+    matched = _article(1, "韩媒：韩国战沙特争首位，力求复仇", [100], body=_BODY_PREVIEW)
+    result = title_dedup.check_title_duplicate(
+        _config(), article, [matched], publish_mode=1,
+        body_loader=lambda target_id: matched["body_html"],
+    )
+    assert result["outcome"] == "duplicate"
+    assert result["body_confirm"]["duplicate"] is True
+    assert len(seen) == 2
+
+
+def test_body_confirmation_keeps_title_verdict_when_call_fails(monkeypatch) -> None:
+    """确认失败不能变成放行：调用挂了就维持标题查重的结论。"""
+
+    _dual_stage_llm(
+        monkeypatch, title_dup=True, body_same=None,
+        body_raises=LLMCallError("timeout", category="timeout", retryable=True),
+    )
+    article = _article(5, "韩媒：韩国U23战沙特争头名", [100], body=_BODY_LINEUP)
+    matched = _article(1, "韩媒：韩国战沙特争首位，力求复仇", [100], body=_BODY_PREVIEW)
+    result = title_dedup.check_title_duplicate(
+        _config(), article, [matched], publish_mode=1,
+        body_loader=lambda target_id: matched["body_html"],
+    )
+    assert result["outcome"] == "duplicate"
+    assert result["body_confirm"]["duplicate"] is None
+    assert "正文确认调用失败" in result["body_confirm"]["skip_reason"]
+
+
+def test_body_confirmation_keeps_title_verdict_on_malformed_answer(monkeypatch) -> None:
+    def fake_chat_json(self, prompt):
+        if "same=true" in prompt:
+            return {"confidence": "high", "reason": "没给 same 字段"}
+        return {"duplicate": True, "matched_id": "1", "reason": "标题相似"}
+
+    monkeypatch.setattr(LLMService, "chat_json", fake_chat_json)
+    article = _article(5, "韩媒：韩国U23战沙特争头名", [100], body=_BODY_LINEUP)
+    matched = _article(1, "韩媒：韩国战沙特争首位，力求复仇", [100], body=_BODY_PREVIEW)
+    result = title_dedup.check_title_duplicate(
+        _config(), article, [matched], publish_mode=1,
+        body_loader=lambda target_id: matched["body_html"],
+    )
+    assert result["outcome"] == "duplicate"
+    assert result["body_confirm"]["skip_reason"] == "正文确认返回缺少 boolean same"
+
+
+def test_body_confirmation_also_guards_the_exact_title_path(monkeypatch) -> None:
+    """标题完全一致原本绕过 LLM 直接丢稿，现在也要过正文这一关。"""
+
+    seen = _dual_stage_llm(monkeypatch, title_dup=True, body_same=False)
+    article = _article(5, "韩媒：韩国U23战沙特争头名！", [100], body=_BODY_LINEUP)
+    matched = _article(1, "韩媒:韩国U23战沙特争头名", [100], body=_BODY_PREVIEW)
+    result = title_dedup.check_title_duplicate(
+        _config(), article, [matched], publish_mode=1,
+        body_loader=lambda target_id: matched["body_html"],
+    )
+    assert result["outcome"] == "not_duplicate"
+    # exact 路径不问标题 LLM，所以只应有正文确认这一次调用。
+    assert len(seen) == 1
+    assert "same=true" in seen[0]
+
+
+def test_body_confirmation_can_be_switched_off(monkeypatch) -> None:
+    seen = _dual_stage_llm(monkeypatch, title_dup=True, body_same=False)
+    article = _article(5, "韩媒：韩国U23战沙特争头名", [100], body=_BODY_LINEUP)
+    matched = _article(1, "韩媒：韩国战沙特争首位，力求复仇", [100], body=_BODY_PREVIEW)
+    result = title_dedup.check_title_duplicate(
+        _config(title_dedup_body_confirm_enabled=False), article, [matched], publish_mode=1,
+        body_loader=lambda target_id: matched["body_html"],
+    )
+    assert result["outcome"] == "duplicate"
+    assert result["body_confirm"] is None
+    assert len(seen) == 1
+
+
+def test_body_confirmation_loads_candidate_body_when_absent(monkeypatch) -> None:
+    """调用方没带上本篇正文时，按 id 补一次，别让确认整批跳过。"""
+
+    seen = _dual_stage_llm(monkeypatch, title_dup=True, body_same=False)
+    article = _article(5, "韩媒：韩国U23战沙特争头名", [100])
+    matched = _article(1, "韩媒：韩国战沙特争首位，力求复仇", [100])
+    bodies = {5: _BODY_LINEUP, 1: _BODY_PREVIEW}
+    result = title_dedup.check_title_duplicate(
+        _config(), article, [matched], publish_mode=1,
+        body_loader=lambda target_id: bodies[target_id],
+    )
+    assert result["outcome"] == "not_duplicate"
+    assert result["body_confirm"]["ran"] is True
+    assert len(seen) == 2
+
+
+def test_body_confirmation_skips_when_no_loader_is_given(monkeypatch) -> None:
+    seen = _dual_stage_llm(monkeypatch, title_dup=True, body_same=False)
+    article = _article(5, "韩媒：韩国U23战沙特争头名", [100], body=_BODY_LINEUP)
+    result = title_dedup.check_title_duplicate(
+        _config(), article,
+        [_article(1, "韩媒：韩国战沙特争首位，力求复仇", [100])],
+        publish_mode=1,
+    )
+    assert result["outcome"] == "duplicate"
+    assert result["body_confirm"]["skip_reason"] == "两侧正文不足，无法据正文判断"
+    assert len(seen) == 1
+
+
+def test_body_confirm_prompt_carries_both_bodies() -> None:
+    prompt = title_dedup.build_body_confirm_prompt(
+        "甲标题", "甲正文内容", "乙标题", "乙正文内容"
+    )
+    assert "甲正文内容" in prompt
+    assert "乙正文内容" in prompt
+    assert "same=true" in prompt
+
+
+def test_release_is_recorded_as_an_event(monkeypatch) -> None:
+    """被正文确认放行的稿件必须留痕，否则事后查不出它曾被判重。"""
+
+    events: list[dict] = []
+    monkeypatch.setattr(
+        title_dedup.repo,
+        "add_article_event",
+        lambda article_id, event_type, connection, **kw: events.append(
+            {"id": article_id, "type": event_type, **kw}
+        ),
+    )
+    result = {
+        "outcome": "not_duplicate",
+        "matched": {"id": 1, "title": "韩媒：韩国战沙特争首位，力求复仇"},
+        "body_confirm": {"duplicate": False, "reason": "一篇是首发名单，一篇是赛前前瞻"},
+    }
+    title_dedup.record_body_confirm_release(5, result, None)
+    assert len(events) == 1
+    assert events[0]["type"] == "TITLE_DUPLICATE_RELEASED"
+    assert "正文确认不是同一条新闻" in events[0]["message"]
+    assert "一篇是首发名单" in events[0]["message"]
+
+
+@pytest.mark.parametrize("confirm", [
+    None,
+    {"duplicate": True, "reason": "确实同一条"},
+    {"duplicate": None, "skip_reason": "两侧正文不足，无法据正文判断"},
+])
+def test_release_event_only_fires_when_verdict_was_overturned(monkeypatch, confirm) -> None:
+    events: list[dict] = []
+    monkeypatch.setattr(
+        title_dedup.repo,
+        "add_article_event",
+        lambda *a, **kw: events.append(kw),
+    )
+    title_dedup.record_body_confirm_release(
+        5, {"outcome": "duplicate", "body_confirm": confirm}, None
+    )
+    assert events == []
+
+
+def test_release_event_failure_does_not_propagate(monkeypatch) -> None:
+    """留痕失败不能挡住发布。"""
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("db is gone")
+
+    monkeypatch.setattr(title_dedup.repo, "add_article_event", boom)
+    title_dedup.record_body_confirm_release(
+        5,
+        {"matched": {"id": 1, "title": "x"}, "body_confirm": {"duplicate": False, "reason": "r"}},
+        None,
+    )

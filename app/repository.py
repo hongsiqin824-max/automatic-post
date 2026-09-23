@@ -2191,6 +2191,21 @@ def direct_publish_report(period_start: str, period_end: str, connection=None) -
     }
 
 
+def get_article_body(article_id: int, connection=None) -> str:
+    """Body HTML of one article, for the title-dedup body confirmation.
+
+    Kept separate from :func:`list_title_dedup_candidates` on purpose: the
+    candidate pool covers every article of the last 24h, and carrying their
+    bodies would pull megabytes into memory on every dedup run.  Only the one
+    article the decision actually matched needs its body loaded.
+    """
+
+    row = _conn(connection).execute(
+        "SELECT body_html FROM articles WHERE id=?", (int(article_id),)
+    ).fetchone()
+    return str(row["body_html"] or "") if row else ""
+
+
 def list_title_dedup_candidates(since: str, exclude_id: int, connection=None) -> list[dict]:
     """Recent published plus in-flight articles usable as title dedup targets.
 

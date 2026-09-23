@@ -128,8 +128,15 @@ def _apply_title_dedup(article_id: int, current: dict[str, Any], config: AppConf
         article_id,
         connection,
     )
-    result = title_dedup.check_title_duplicate(config, current, candidates, publish_mode=mode)
+    result = title_dedup.check_title_duplicate(
+        config,
+        current,
+        candidates,
+        publish_mode=mode,
+        body_loader=lambda target_id: repo.get_article_body(target_id, connection),
+    )
     if not result["checked"] or result["outcome"] not in {"duplicate", "needs_review"}:
+        title_dedup.record_body_confirm_release(article_id, result, connection)
         return None
     if result["outcome"] == "duplicate":
         matched = result["matched"] or {}
