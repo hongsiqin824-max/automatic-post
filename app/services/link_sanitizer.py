@@ -163,10 +163,20 @@ _ARTIFACT_TEXT_BLOCK = re.compile(
 # them in one place avoids the recurring "missing word" bug where a new lead-in
 # (e.g. ``编译``) is added to one regex but not the others.
 _BYLINE_LEAD_IN = r"编写|编译|撰文|编撰|编辑|记者|编排|整理|构成|供稿|文|著者"
+# 图注署名的标签词，和 _BYLINE_LEAD_IN 同理集中维护：下面的探针、整行规则和段尾
+# 规则共用这一份，避免新增一个词只改了其中一处。
+_PHOTO_CREDIT_LABEL = r"摄影|撮影|攝影|图片|圖片|照片|写真"
+# 署名标签和来源之间的分隔符，冒号和等号两种形态都有（"照片：德原隆元" /
+# "图片=Getty Images Korea"）。
+_PHOTO_CREDIT_SEPARATOR = r"[:：=＝]"
 _MEDIA_ARTIFACT_PROBE = re.compile(
     r"【\s*(?:图片|写真|视频|集锦|实战|直播|积分榜|赛程)"
     r"|\[\s*(?:图片|照片|写真|photo|video|视频|集锦|直播|积分榜|赛程)"
     r"|(?:" + _BYLINE_LEAD_IN + r")\s*[●•・·:：]"
+    # 冒号/等号形态的图注署名。``(?![^<>]*>)`` 要求命中点不在标签内部：aleagues 等
+    # WordPress 源会把整条图注复制进 ``data-image-caption`` 属性，那是标记而不是
+    # 正文，清理器也只处理纯文本块，探针不应因此放行整篇正文。
+    r"|(?:" + _PHOTO_CREDIT_LABEL + r")\s*" + _PHOTO_CREDIT_SEPARATOR + r"(?![^<>]*>)"
     r"|(?:编辑部|編集部)"
     r"|\(\s*[Cc]\s*\)"
     r"|[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+\.[A-Za-z]",
@@ -197,12 +207,27 @@ _MEDIA_CAPTION_LINE = re.compile(
 # the guard below does not match and the sentence is kept.  The boundary class
 # excludes ``。！？!?`` so a following reporting sentence is never swallowed, and
 # the caption sentence is length-capped.
+# ``进球(?!者)``：``【进球】`` 是集锦推广标记，但 ``【进球者】`` 是战报正文的小标题，
+# 后面跟的是"比分　分钟　球员（球队）"进球名单。把它当图注会连着吃掉 80 字进球
+# 名单——全库 27 篇命中，其中 20 篇已经建了草稿。只排除"者"字，保留原本要接住的
+# ``【进球】`` 推广形态。
 _INLINE_MEDIA_CAPTION = re.compile(
     r"(?:(?<=[。！？!?])|(?<![^ \t\u3000>]))[ \t\u3000]*(?:"
-    r"【\s*(?:图片|写真|视频|集锦|实战|直播|进球|录像|回放|锦集)[^】\r\n]{0,20}】"
-    r"|\[\s*(?:图片|写真|photo|video|视频|集锦|直播|进球|录像|回放)[^\]\r\n]{0,20}\]"
+    r"【\s*(?:图片|写真|视频|集锦|实战|直播|进球(?!者)|录像|回放|锦集)[^】\r\n]{0,20}】"
+    r"|\[\s*(?:图片|写真|photo|video|视频|集锦|直播|进球(?!者)|录像|回放)[^\]\r\n]{0,20}\]"
     r")[^<>\r\n。！？!?]{0,80}[。！？!?]?[ \t\u3000]*",
     re.IGNORECASE,
+)
+# 上面那条匹配到的内容里，标记本身的部分；剥掉它才能判断"标记之后"吃进了什么。
+_INLINE_MEDIA_CAPTION_MARKER = re.compile(
+    r"^[。！？!?]?[ \t\u3000]*(?:【[^】\r\n]{0,25}】|\[[^\]\r\n]{0,25}\])"
+)
+# 结构化比赛数据：比分、分钟、官方公告。推广标题里会出现"破门""助攻""首发"这类
+# 词，所以这些一概不算，只认这三类——全库 9 条命中里 8 条确实是吃到了正文。
+_MATCH_FACT_RESIDUE = re.compile(
+    r"\d+\s*[-－]\s*\d+"
+    r"|\d+\s*分钟|\d+\s*分\b"
+    r"|发布公告|官方宣布|正式宣布"
 )
 _EDITORIAL_BYLINE_LINE = re.compile(
     r"[ \t\u3000]*(?:" + _BYLINE_LEAD_IN + r")\s*[●•・·:：]\s*[^<>\r\n。]{1,80}[ \t\u3000]*",
@@ -250,6 +275,46 @@ _PHOTO_CREDIT_TAIL = re.compile(
     r"\[\s*(?:照片|写真|图片|photo)\s*\]\s*[=＝]\s*[^<>\[\]\r\n。！？!?]{1,60}"
     r"|\(\s*[Cc]\s*\)\s*[^<>\[\]\r\n。！？!?]{1,60}"
     r")[ \t\u3000]*$",
+    re.IGNORECASE,
+)
+# 段尾图注署名的冒号/等号形态，上面的 _PHOTO_CREDIT_TAIL 只认 "[图片]=Getty Images"
+# 和 "(C)Getty Images"，日本源（yahoojp、naversp 等）大量使用的冒号形态全部漏网：
+# 前者整篇被判脏后转人工，后者直接把署名发到了线上。实际形态都出现在图注段末尾：
+#   "京都新球衣受到关注【摄影：柳濑心祐】"
+#   "在巴塞罗那青训效力的西山芯太【图片：本人提供】"
+#   "……反种族主义活动“种族主义者？”。（摄影：朱塞佩-贝里尼/Getty Images）"
+#   "大阪钢巴35周年纪念球衣引发球迷热议。/摄影：中地拓也"
+#   "新潟转会加盟长崎的长谷川元希。照片：滝川敏之"
+# 带括号的形态零歧义，直接按段尾删除；裸形必须紧跟句末标点，避免删掉
+# "我家里有一张照片：在中国的泳池边，我和他摆出健美姿势。" 这类把冒号当普通标点
+# 的报道句。署名内容不含句末标点且长度受限，所以正常报道句不会被截断。
+_PHOTO_CREDIT_BRACKET_TAIL = re.compile(
+    r"[ \t\u3000]*[/／|｜·・\-—]?[ \t\u3000]*"
+    r"[（(\[【]\s*(?:" + _PHOTO_CREDIT_LABEL + r")\s*" + _PHOTO_CREDIT_SEPARATOR + r"\s*"
+    r"[^<>\r\n。！？!?]{1,60}?\s*[）)\]】][ \t\u3000]*$",
+    re.IGNORECASE,
+)
+_PHOTO_CREDIT_PLAIN_TAIL = re.compile(
+    r"(?<=[。！？!?])[ \t\u3000]*[/／|｜·・\-—]?[ \t\u3000]*"
+    r"(?:" + _PHOTO_CREDIT_LABEL + r")\s*" + _PHOTO_CREDIT_SEPARATOR + r"\s*"
+    r"[^<>\r\n。！？!?]{1,60}[ \t\u3000]*$",
+    re.IGNORECASE,
+)
+# 独立成块的图注署名，例如 "<p>图片=Getty Images Korea</p>"。整行只有标签、分隔符
+# 和来源名时必然是署名而不是报道句，所以整行删除；段尾规则要求前面有句末标点或
+# 括号，够不到这种形态。
+_PHOTO_CREDIT_LINE = re.compile(
+    r"[ \t\u3000]*[（(\[【]?\s*(?:" + _PHOTO_CREDIT_LABEL + r")\s*"
+    + _PHOTO_CREDIT_SEPARATOR + r"\s*[^<>\r\n。！？!?]{1,80}?\s*[）)\]】]?[ \t\u3000]*",
+    re.IGNORECASE,
+)
+# 正文末尾的招商引流整块，例如 "<p>合作咨询 ad@sportalkorea.co.kr</p>"。
+# naversp 等来源把它固定附在每篇正文的最后，AI 每次都判为广告但不给修复计划，
+# 于是整篇转人工。要求整行只有这条招商语加一个邮箱，正常报道句不会被整行匹配。
+_AD_CONTACT_LINE = re.compile(
+    r"[ \t\u3000]*(?:合作咨询|商务咨询|广告咨询|合作洽谈|商务合作)\s*[:：]?[ \t\u3000]*"
+    r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63}){1,3}"
+    r"[ \t\u3000]*",
     re.IGNORECASE,
 )
 # Upstream feeds occasionally leak the Dongqiudi highlight-tag syntax into the
@@ -373,20 +438,49 @@ _MARKDOWN_REFERENCE_DEFINITION = re.compile(
 )
 
 
+_HTML_TAG_SPAN = re.compile(r"<[^>]*>")
+
+
+def _apply_outside_tags(body: str, transform) -> str:
+    """Run *transform* over the text between tags, leaving every tag untouched.
+
+    Feeds such as aleagues ship WordPress ``data-image-meta`` attributes whose
+    value is a JSON object.  A cleanup that scans the raw body would rewrite
+    those attributes — the brace stripper below used to delete the JSON braces
+    and mangle the ``img`` node — so text-level cleanups must never see markup.
+    """
+
+    parts: list[str] = []
+    cursor = 0
+    for match in _HTML_TAG_SPAN.finditer(body):
+        parts.append(transform(body[cursor:match.start()]))
+        parts.append(match.group(0))
+        cursor = match.end()
+    parts.append(transform(body[cursor:]))
+    return "".join(parts)
+
+
 def _strip_template_residue(body_html: str | None) -> str:
     """Remove leaked highlight-tag braces before quality checks.
 
     ``{{X|Y}`` (closing brace optional) collapses to the display value ``Y``;
     any remaining ``{{``/``}}``/``{``/``}`` braces are dropped while their
-    surrounding text is preserved.  The operation is idempotent because a
-    cleaned body no longer contains braces for the probe to match.
+    surrounding text is preserved.  Only text outside tags is rewritten, so an
+    attribute carrying JSON keeps its braces.  The operation is idempotent
+    because cleaned text no longer contains braces for the matchers to hit.
     """
 
     body = str(body_html or "")
     if _TEMPLATE_RESIDUE_PROBE.search(body) is None:
         return body
-    body = _TEMPLATE_RESIDUE_PIPE.sub(lambda m: m.group(1), body)
-    return _TEMPLATE_RESIDUE_BRACE.sub("", body)
+
+    def _clean(text: str) -> str:
+        if not text or _TEMPLATE_RESIDUE_PROBE.search(text) is None:
+            return text
+        text = _TEMPLATE_RESIDUE_PIPE.sub(lambda m: m.group(1), text)
+        return _TEMPLATE_RESIDUE_BRACE.sub("", text)
+
+    return _apply_outside_tags(body, _clean)
 
 
 # Only inspect text-only p/div/li blocks; any block carrying markup such as
@@ -485,9 +579,23 @@ def _strip_inline_media_caption_from_text(text: str) -> str:
     Removes only the sentence that opens with a bracket media marker
     (``【视频】``/``[video]``/…) up to its sentence-ending mark, then collapses a
     doubled separator space left behind so the surrounding report reads cleanly.
+
+    A promo title is not always punctuated, so the 80-character window can run
+    past the caption and into the report that follows it (``【视频】李刚仁与偶像
+    合作画面来了比赛中，马竞第43分钟……最终1-3告负``).  There is no reliable
+    textual boundary between the two, so the match is skipped whenever the text
+    after the marker carries structured match data — a scoreline, a minute mark
+    or an official announcement.  Keeping a promo line is cosmetic; deleting a
+    scoreline is not, so this fails towards keeping the text.
     """
 
-    cleaned = _INLINE_MEDIA_CAPTION.sub("", text)
+    def _replace(match: "re.Match[str]") -> str:
+        tail = _INLINE_MEDIA_CAPTION_MARKER.sub("", match.group(0))
+        if _MATCH_FACT_RESIDUE.search(tail):
+            return match.group(0)
+        return ""
+
+    cleaned = _INLINE_MEDIA_CAPTION.sub(_replace, text)
     if cleaned == text:
         return text
     # Removing a mid-paragraph caption can leave two spaces where the caption
@@ -676,6 +784,10 @@ def _artifact_line_rule(line: str) -> str | None:
         return "media_caption_line"
     if _EDITORIAL_BYLINE_LINE.fullmatch(value):
         return "editorial_byline_line"
+    if _AD_CONTACT_LINE.fullmatch(value):
+        return "ad_contact_line"
+    if _PHOTO_CREDIT_LINE.fullmatch(value):
+        return "photo_credit_line"
     return None
 
 
@@ -698,6 +810,8 @@ def _strip_editorial_byline_tail(line: str) -> tuple[str, str | None, str]:
         (_EDITORIAL_DEPARTMENT_TAIL, "editorial_byline_tail"),
         (_BYLINE_EMAIL_TAIL, "editorial_byline_tail"),
         (_PHOTO_CREDIT_TAIL, "photo_credit_tail"),
+        (_PHOTO_CREDIT_BRACKET_TAIL, "photo_credit_tail"),
+        (_PHOTO_CREDIT_PLAIN_TAIL, "photo_credit_tail"),
     ):
         match = pattern.search(original)
         if match is not None:

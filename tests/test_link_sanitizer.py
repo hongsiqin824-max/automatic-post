@@ -592,9 +592,194 @@ def test_quality_preprocess_strips_trailing_copyright_credit_marker():
     assert preprocess_quality_body(cleaned) == cleaned
 
 
+def test_quality_preprocess_keeps_report_glued_to_unpunctuated_promo():
+    # 推广标题没有句末标点时，80 字窗口会一路吃到后面的战报。没有可靠的文本边界
+    # 能切开两者，所以待删文本里出现比分/分钟/公告时一律放弃删除——留一句推广语
+    # 是观感问题，删掉比分是事实错误。
+    for body in (
+        "<p>【视频】李刚仁与偶像合作画面来了比赛中，马竞第43分钟由乔尔吉-多明格斯"
+        "破门取得领先，但下半场连丢3球，最终1-3告负。</p>",
+        "<p>【图片集】比赛首日赛况 大津对阵创成馆时，凭借中场山本翼等人的进球，以3-0大胜。</p>",
+        "<p>【图片】引发热议的J1最新积分榜 FC町田泽维亚发布公告称：中山雄太将离队。</p>",
+    ):
+        assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_still_strips_promo_without_match_data():
+    # 守卫只认比分/分钟/公告，"破门""助攻"这类词推广标题本来就在用，不能因此放弃删除。
+    cases = {
+        "<p>上田绮世再次取得进球。【视频】“太夸张了吧”上田绮世的强力俯身冲顶破门！</p>": (
+            "<p>上田绮世再次取得进球。</p>"
+        ),
+        "<p>新潟取得领先。【视频】三户舜介送出精彩直塞助攻</p>": "<p>新潟取得领先。</p>",
+    }
+
+    for body, expected in cases.items():
+        cleaned = preprocess_quality_body(body)
+        assert cleaned == expected
+        assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_keeps_json_braces_inside_image_attributes():
+    # WordPress 源的 data-image-meta 属性值是 JSON，花括号清理此前会把它删成
+    # 残缺属性，导致图片安全校验失败、整篇稿件得不到清理。
+    body = (
+        "<p>正文里漏出了{{c|东京绿茵}的高亮标记。</p>"
+        '<p><img src="/body.jpg" data-image-meta=\'{"aperture":"6.3","credit":"Getty"}\''
+        ' data-image-title="Tatsuki Nara" /></p>'
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert '{"aperture":"6.3","credit":"Getty"}' in cleaned
+    assert "<p>正文里漏出了东京绿茵的高亮标记。</p>" in cleaned
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_keeps_goal_scorer_list_heading():
+    # 【进球者】是战报正文的小标题，后面跟的是进球名单，不是媒体图注。
+    # 此前 _INLINE_MEDIA_CAPTION 的标记词表里有"进球"，会连着吃掉 80 字进球名单。
+    body = (
+        "<p>【进球者】 1-0　42分钟　丹尼尔-平特尔（迈阿密国际） "
+        "1-1　50分钟　丹尼尔-阿尔西拉（莱昂体育） 2-1　54分钟　扬尼克-布赖特（迈阿密国际）</p>"
+    )
+
+    assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_still_strips_goal_highlight_promo():
+    # 排除的只有"者"字，【进球】集锦推广标记仍要照常删除。探针词表里没有"进球"，
+    # 所以这里用一个【视频】图注块把清理链路打开，再看同一篇里的【进球】推广。
+    body = (
+        "<p>【视频】本轮最佳进球集锦</p>"
+        "<p>广岛在主场取得领先。【进球】铃木章斗的重炮世界波</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == "<p>广岛在主场取得领先。</p>"
+    assert preprocess_quality_body(cleaned) == cleaned
+
+
 def test_quality_preprocess_keeps_inline_c_in_score():
     # 句中出现的 (C) 不是版权标记，正文必须逐字保留。
     body = "<p>本场比赛的比分是2(C)1，主队获胜。</p>"
+
+    assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_strips_bracketed_photo_credit_colon_tail():
+    # 日本源图注的括号署名形态。此前 _PHOTO_CREDIT_TAIL 只认 "[图片]=X" 和 "(C)X"，
+    # 这些冒号形态全部漏网，整篇稿件被判脏后转人工。
+    cases = {
+        "<p>京都新球衣受到关注【摄影：柳濑心祐】</p>": "<p>京都新球衣受到关注</p>",
+        "<p>加盟湘南的冈村来佳【摄影：森田直树/阿弗罗体育】</p>": "<p>加盟湘南的冈村来佳</p>",
+        "<p>巴里举行的反种族主义活动。（摄影：朱塞佩-贝里尼/Getty Images）</p>": (
+            "<p>巴里举行的反种族主义活动。</p>"
+        ),
+        # 图片/照片 标签与摄影同类，此前直接发到了线上。
+        "<p>在巴塞罗那青训效力的西山芯太【图片：本人提供】</p>": (
+            "<p>在巴塞罗那青训效力的西山芯太</p>"
+        ),
+        "<p>挪威队的埃尔林-布劳特-哈兰德【照片：德原隆元】</p>": (
+            "<p>挪威队的埃尔林-布劳特-哈兰德</p>"
+        ),
+    }
+
+    for body, expected in cases.items():
+        cleaned = preprocess_quality_body(body)
+        assert cleaned == expected
+        assert preprocess_quality_body(cleaned) == cleaned
+        assert [item["rule"] for item in find_media_artifact_lines(body)] == [
+            "photo_credit_tail",
+        ]
+
+
+def test_quality_preprocess_strips_plain_photo_credit_colon_tail():
+    # 裸形署名紧跟句末标点（可带 "/" 分隔符）时同样是图注残留。
+    cases = {
+        "<p>大阪钢巴35周年纪念球衣引发球迷热议。/摄影：中地拓也</p>": (
+            "<p>大阪钢巴35周年纪念球衣引发球迷热议。</p>"
+        ),
+        "<p>川崎前锋闯入决赛，最终获得亚军。摄影：中地拓也</p>": (
+            "<p>川崎前锋闯入决赛，最终获得亚军。</p>"
+        ),
+        "<p>鬼木达回顾对阵福冈黄蜂的比赛。摄影：金子拓弥（《足球文摘》摄影部）</p>": (
+            "<p>鬼木达回顾对阵福冈黄蜂的比赛。</p>"
+        ),
+        "<p>新潟转会加盟长崎的长谷川元希。照片：滝川敏之</p>": (
+            "<p>新潟转会加盟长崎的长谷川元希。</p>"
+        ),
+        "<p>本赛季转战英冠的西汉姆联。图片=Getty Images</p>": (
+            "<p>本赛季转战英冠的西汉姆联。</p>"
+        ),
+    }
+
+    for body, expected in cases.items():
+        cleaned = preprocess_quality_body(body)
+        assert cleaned == expected
+        assert preprocess_quality_body(cleaned) == cleaned
+
+
+def test_quality_preprocess_removes_standalone_photo_credit_block():
+    # naversp 把图注署名单独成块附在正文末尾，段尾规则够不到，需要整行删除。
+    body = (
+        "<p>最终在16年后做出出售决定。</p>"
+        "<p>图片=Getty Images Korea</p>"
+        "<p>合作咨询 ad@sportalkorea.co.kr</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == "<p>最终在16年后做出出售决定。</p>"
+    assert preprocess_quality_body(cleaned) == cleaned
+    assert [item["rule"] for item in find_media_artifact_lines(body)] == [
+        "photo_credit_line",
+        "ad_contact_line",
+    ]
+
+
+def test_quality_preprocess_keeps_photo_colon_used_as_ordinary_punctuation():
+    # "一张照片：" 后面接的是描述而不是署名，裸形规则要求紧跟句末标点，
+    # 所以这句必须逐字保留。
+    body = (
+        "<p>他又回忆了弗朗切斯科-巴雷西：“我家里有一张照片：在中国的泳池边，"
+        "我和他摆出健美姿势。”</p>"
+    )
+
+    assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_keeps_photo_label_inside_a_reporting_sentence():
+    # 标签词出现在句子中间时是报道内容的一部分，不能当署名删。
+    for body in (
+        "<p>他在社媒发了三张图片：第一张是训练照，另外两张是球迷合影。</p>",
+        "<p>俱乐部公布了新赛季球衣，官方摄影团队全程记录了拍摄过程。</p>",
+        "<p>球队晒出照片。照片里的球员正在为新赛季做准备。</p>",
+    ):
+        assert preprocess_quality_body(body) == body
+
+
+def test_quality_preprocess_removes_ad_contact_block():
+    # naversp 固定附在正文末尾的招商引流块，AI 每次判脏却不给修复计划，
+    # 结果整篇转人工。整块只有招商语和邮箱时直接删除。
+    body = (
+        "<p>目前，朴浩民也正效力于该队，活跃在赛场之上。</p>"
+        "<p>合作咨询 ad@sportalkorea.co.kr</p>"
+    )
+
+    cleaned = preprocess_quality_body(body)
+
+    assert cleaned == "<p>目前，朴浩民也正效力于该队，活跃在赛场之上。</p>"
+    assert preprocess_quality_body(cleaned) == cleaned
+    assert [item["rule"] for item in find_media_artifact_lines(body)] == [
+        "ad_contact_line",
+    ]
+
+
+def test_quality_preprocess_keeps_reporting_sentence_mentioning_cooperation():
+    # 整行不只是招商语时不能删，正常报道句必须保留。
+    body = "<p>俱乐部表示，关于合作咨询的具体条款仍在与赞助商谈判之中。</p>"
 
     assert preprocess_quality_body(body) == body
 

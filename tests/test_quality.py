@@ -136,6 +136,31 @@ def test_dirty_content_goes_to_review():
     assert result["issues"]["dirty_content"]
 
 
+def test_dirty_pattern_no_longer_fires_on_words_ending_in_tu():
+    # 原先 DIRTY_PATTERNS 里的裸「图[：:]」把「波尔图：」「意图：」「拼图：」全判成
+    # 图注残留，全库 6 次命中 5 次误判。收窄成「【图：」后这些正常正文必须放行。
+    for body in (
+        "<p>本轮西甲赛前发布会公布了首发名单，波尔图：迪奥戈-科斯塔、阿尔贝托-科斯塔和内乌恩-佩雷斯出战。</p>",
+        "<p>主帅赛后透露了起用古贺的意图：希望他在前场做支点，让球队重新调整进攻节奏。</p>",
+        "<p>主帅一直希望留下这名球员，并把他看作关键拼图：他是阵中最好的终结者之一。</p>",
+    ):
+        result = evaluate(title="西甲球队公布本轮首发名单", body=body, channels=[1])
+
+        assert result["issues"]["dirty_content"] == []
+
+
+def test_bracketed_photo_caption_marker_still_flags_dirty_content():
+    # 收窄后仍要接住真正的图注标记「【图：Getty Images】」。
+    result = evaluate(
+        title="巴黎圣日耳曼夺得欧洲超级杯冠军",
+        body="<p>法甲巴黎圣日耳曼在欧洲超级杯中击败对手夺冠，全场表现稳健。【图：Getty Images】</p>",
+        channels=[1],
+    )
+
+    assert result["needs_review"] is True
+    assert result["issues"]["dirty_content"]
+
+
 def test_unstripped_clickable_attributes_go_to_review():
     result = evaluate(
         title="球队公布本轮联赛完整比赛结果",

@@ -149,7 +149,12 @@ DIRTY_PATTERNS = (
     r"版权归",
     r"未经许可",
     r"摄影[：:]",
-    r"图[：:]",
+    # 原先是裸的「图[：:]」，本意是接住「图：Getty Images」这类图注署名，但中文没有
+    # 词边界，单字「图」分不清图注和普通词：全库 6 次命中里 5 次是误判——
+    # 「巴伊亚波尔图：123万雷亚尔」「波尔图：迪奥戈-科斯塔」（波尔图）、
+    # 「透露了起用古贺的意图：」（意图）、「看作关键拼图：」（拼图），
+    # 真图注只有「【图：Getty Images】」1 条。因此只保留带方括号的图注标记形态。
+    r"【\s*图\s*[：:]",
 )
 UNSANITIZED_ARTIFACT_RE = re.compile(
     r"<\s*(?:area|embed|iframe|math|noscript|object|script|style|svg|template|video|audio)\b"
