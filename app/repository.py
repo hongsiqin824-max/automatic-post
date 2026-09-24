@@ -3224,6 +3224,135 @@ def list_run_logs(connection=None, *, limit: int = 30) -> list[dict]:
     return result
 
 
+def save_league_tab_clicks(stat_date: str, rows: list[tuple[str, int]], connection=None) -> int:
+    """把某一天的联赛 tab 切换次数写入累积表（同日重复拉取按 UNIQUE 覆盖）。
+
+    先删掉该日旧数据再写入，避免上游某个联赛 tab 当天归零时旧值残留。
+    """
+    conn = _conn(connection)
+    day = str(stat_date)
+    with conn:
+        conn.execute("DELETE FROM league_tab_clicks WHERE stat_date=?", (day,))
+        conn.executemany(
+            """
+            INSERT INTO league_tab_clicks (stat_date, league_name, switch_cnt, updated_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(stat_date, league_name) DO UPDATE SET
+                switch_cnt=excluded.switch_cnt, updated_at=excluded.updated_at
+            """,
+            [(day, str(name), int(cnt), _now()) for name, cnt in rows],
+        )
+    return len(rows)
+
+
+def mark_league_tab_click_run(stat_date: str, connection=None, *, status: str = "SUCCESS",
+                              row_count: int = 0, total_cnt: int = 0,
+                              error: Optional[str] = None) -> None:
+    """记录某一天已拉取过，便于区分「当天真的 0 点击」和「还没拉」。"""
+    conn = _conn(connection)
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO league_tab_click_runs (stat_date, status, row_count, total_cnt, error, fetched_at)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(stat_date) DO UPDATE SET
+                status=excluded.status, row_count=excluded.row_count,
+                total_cnt=excluded.total_cnt, error=excluded.error, fetched_at=excluded.fetched_at
+            """,
+            (str(stat_date), str(status).upper(), int(row_count), int(total_cnt), error, _now()),
+        )
+
+
+def list_league_click_runs(connection=None, *, since: str = "") -> dict[str, dict]:
+    """已拉取记录，key 是统计日。
+
+    带上 fetched_at 是为了判断某天是否已「定稿」：如果拉取时间距统计日不足 2 天，
+    说明当时可能还有延迟入库的事件没进来，需要过几天再拉一次覆盖。
+    """
+    conn = _conn(connection)
+    if since:
+        rows = conn.execute(
+            "SELECT stat_date, status, fetched_at FROM league_tab_click_runs WHERE stat_date>=?",
+            (str(since),),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT stat_date, status, fetched_at FROM league_tab_click_runs"
+        ).fetchall()
+    return {row["stat_date"]: dict(row) for row in rows}
+
+
+def get_league_tab_click_stats(connection=None, *, since: str = "") -> dict:
+    """看板用数据：按联赛累计（含占比）+ 每日总量趋势。"""
+    conn = _conn(connection)
+    params: tuple = ()
+    where = ""
+    if since:
+        where = " WHERE stat_date>=?"
+        params = (str(since),)
+
+    leagues = _rows(conn.execute(
+        f"""
+        SELECT league_name,
+               SUM(switch_cnt) AS switch_cnt,
+               COUNT(DISTINCT stat_date) AS active_days
+        FROM league_tab_clicks{where}
+        GROUP BY league_name
+        ORDER BY switch_cnt DESC, league_name
+        """,
+        params,
+    ).fetchall())
+
+    daily = _rows(conn.execute(
+        f"""
+        SELECT stat_date AS date, SUM(switch_cnt) AS total_cnt
+        FROM league_tab_clicks{where}
+        GROUP BY stat_date
+        ORDER BY stat_date
+        """,
+        params,
+    ).fetchall())
+
+    # 每天每联赛的明细，供图表切到「按联赛」视图时用
+    daily_by_league = _rows(conn.execute(
+        f"""
+        SELECT stat_date AS date, league_name, switch_cnt
+        FROM league_tab_clicks{where}
+        ORDER BY stat_date, league_name
+        """,
+        params,
+    ).fetchall())
+
+    total = sum(int(item["switch_cnt"]) for item in leagues)
+    for item in leagues:
+        item["switch_cnt"] = int(item["switch_cnt"])
+        item["ratio_pct"] = round(item["switch_cnt"] * 100.0 / total, 2) if total else 0.0
+    for item in daily:
+        item["total_cnt"] = int(item["total_cnt"])
+    for item in daily_by_league:
+        item["switch_cnt"] = int(item["switch_cnt"])
+
+    runs = _rows(conn.execute(
+        """
+        SELECT stat_date, status, total_cnt, error, fetched_at
+        FROM league_tab_click_runs ORDER BY stat_date DESC LIMIT 30
+        """
+    ).fetchall())
+
+    return {
+        "leagues": leagues,
+        "daily": daily,
+        "daily_by_league": daily_by_league,
+        "total_switch_cnt": total,
+        "date_range": {
+            "start": daily[0]["date"] if daily else "",
+            "end": daily[-1]["date"] if daily else "",
+        },
+        "last_fetched_at": runs[0]["fetched_at"] if runs else "",
+        "runs": runs,
+    }
+
+
 def get_setting(key: str, default: Any = None, connection=None):
     row = _conn(connection).execute("SELECT value_json FROM settings WHERE key=?", (str(key),)).fetchone()
     return default if row is None else _loads(row["value_json"], default)

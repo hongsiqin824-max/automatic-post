@@ -34,9 +34,13 @@
         <a href="{{ url_for('config') }}" class="nav-item {% if request.endpoint == 'config' %}is-active{% endif %}">
           <i data-lucide="settings-2"></i><span>栏目与来源</span>
         </a>
-        <a href="{{ url_for('league_data') }}" class="nav-item {% if request.endpoint == 'league_data' %}is-active{% endif %}">
+        <a href="{{ url_for('league_data') }}" class="nav-item {% if request.endpoint in ['league_data', 'league_clicks'] %}is-active{% endif %}">
           <i data-lucide="bar-chart-3"></i><span>数据</span>
         </a>
+        <div class="nav-sub">
+          <a href="{{ url_for('league_data') }}" class="nav-subitem {% if request.endpoint == 'league_data' %}is-active{% endif %}">赛事覆盖</a>
+          <a href="{{ url_for('league_clicks') }}" class="nav-subitem {% if request.endpoint == 'league_clicks' %}is-active{% endif %}">联赛tab点击</a>
+        </div>
       </nav>
 
       <div class="sidebar-foot">

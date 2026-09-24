@@ -278,6 +278,33 @@ CREATE TABLE IF NOT EXISTS open_platform_auth (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- 联赛 tab 点击数据的本地累积表。上游 StarRocks 实时表只保留约 30 天就滚动删除，
+-- 而看板要看更长周期的变化，所以每天把当日结果抄一份存在这里长期留存。
+-- UNIQUE(stat_date, league_name) 让同一天重复拉取只会覆盖、不会翻倍计数，
+-- 也让「库里缺哪天」可查，进而支持关机/重启后自动补数。
+CREATE TABLE IF NOT EXISTS league_tab_clicks (
+    stat_date   TEXT NOT NULL,
+    league_name TEXT NOT NULL,
+    switch_cnt  INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(stat_date, league_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_league_tab_clicks_date
+    ON league_tab_clicks(stat_date DESC);
+
+-- 记录「哪一天已经拉过了」。单独一张表是因为某天真的 0 点击时
+-- league_tab_clicks 里不会有任何行，光看那张表无法区分「没数据」和「没拉过」。
+CREATE TABLE IF NOT EXISTS league_tab_click_runs (
+    stat_date  TEXT PRIMARY KEY,
+    status     TEXT NOT NULL DEFAULT 'SUCCESS'
+               CHECK (status IN ('SUCCESS', 'FAILED')),
+    row_count  INTEGER NOT NULL DEFAULT 0,
+    total_cnt  INTEGER NOT NULL DEFAULT 0,
+    error      TEXT,
+    fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 

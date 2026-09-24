@@ -220,10 +220,32 @@ class AppConfig:
         15, min(3600, _env_int("SOURCE_REPORT_CHECK_INTERVAL_SECONDS", 30))
     )
 
+    # 联赛 tab 点击数据：每天凌晨从 StarRocks 拉前一天的结果存进本地累积表。
+    # 上游实时表只保留约 30 天，所以补数窗口也就只能是 30 天。
+    # StarRocks 连接参数复用 dqd-bigdata-sr 技能里已配好的 .env，
+    # 也可以用下面的环境变量直接覆盖。
+    league_clicks_enabled: bool = _env_bool("LEAGUE_CLICKS_ENABLED", True)
+    league_clicks_hour: int = max(0, min(23, _env_int("LEAGUE_CLICKS_HOUR", 3)))
+    league_clicks_minute: int = max(0, min(59, _env_int("LEAGUE_CLICKS_MINUTE", 0)))
+    league_clicks_check_interval_seconds: int = max(
+        15, min(3600, _env_int("LEAGUE_CLICKS_CHECK_INTERVAL_SECONDS", 60))
+    )
+    # 最多往前补几天。上游只留约 30 天，设更大也补不回来。
+    league_clicks_backfill_days: int = max(
+        1, min(30, _env_int("LEAGUE_CLICKS_BACKFILL_DAYS", 30))
+    )
+    # 单日查询要 70~120 秒，留足超时余量。
+    league_clicks_query_timeout_seconds: int = max(
+        60, min(1800, _env_int("LEAGUE_CLICKS_QUERY_TIMEOUT_SECONDS", 540))
+    )
+    starrocks_host: str = os.getenv("STARROCKS_HOST", "").strip()
+    starrocks_port: int = _env_int("STARROCKS_PORT", 0)
+    starrocks_user: str = os.getenv("STARROCKS_USER", "").strip()
+    starrocks_password: str = os.getenv("STARROCKS_PASSWORD", "")
+
     # Open-platform article creation is a write operation, so it stays behind
     # an explicit flag even when credentials are present.
     publisher_enabled: bool = _env_bool("AUTOMATIC_POST_PUBLISHER", False)
-
     # Independent publish worker: drains READY_TO_PUBLISH on its own cadence so
     # queued articles no longer wait for a full (and slow) ingestion cycle to
     # finish before the end-of-run publish step reaches them. When disabled the

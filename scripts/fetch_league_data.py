@@ -1,146 +1,64 @@
-"""从StarRocks获取彩经联赛tab点击数据"""
-import json
-import os
+"""手动拉取联赛 tab 点击数据（平时由应用内的每日定时任务自动执行）
+
+口径、性能约束、为什么要本地累积，全部写在 app/services/league_clicks.py 的
+模块注释里，改之前先看那里。
+
+用法：
+    python3 scripts/fetch_league_data.py              # 补齐所有缺失的日期
+    python3 scripts/fetch_league_data.py 2026-09-23   # 强制重拉指定日期
+"""
 import sys
-from datetime import datetime, timedelta
+from datetime import date
 from pathlib import Path
 
-# 添加dqd-bigdata-sr技能路径
-SKILL_PATH = Path.home() / ".claude/skills/dqd-bigdata-sr"
-sys.path.insert(0, str(SKILL_PATH / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _lib import load_config, connect
+from app import repository as repo
+from app.config import AppConfig
+from app.db import _connect
+from app.services.league_clicks import (
+    credentials_configured,
+    fetch_day,
+    pending_dates,
+    sync_due_days,
+)
 
-# 目标联赛配置（联赛ID -> 中文名）
-TARGET_LEAGUES = {
-    "lotzc": "彩经",  # 彩经总tab
-    "18": "亚冠精英",
-    "83": "韩K联赛",
-    "17": "瑞典超",
-    "53": "挪超",
-    "21": "巴甲",
-    "16": "美职联",
-    "35": "德乙",
-    "15": "日职乙",
-    "8": "日职联",
-    "34": "澳超",
-}
 
-def fetch_league_clicks(days: int = 30) -> dict:
-    """获取最近N天的联赛tab点击数据
-
-    Args:
-        days: 查询最近多少天的数据
-
-    Returns:
-        {
-            "update_time": "2026-09-22 14:30:00",
-            "date_range": {"start": "2026-08-23", "end": "2026-09-22"},
-            "leagues": [...],
-            "daily_data": [...]
-        }
-    """
-    end_date = datetime.now().date()
-    start_date = end_date - timedelta(days=days - 1)
-
-    # 构建competition_id列表
-    league_ids = list(TARGET_LEAGUES.keys())
-
-    sql = f"""
-    WITH league_clicks AS (
-      SELECT
-        day,
-        CASE
-          WHEN page = '/live_tab/lotzc' THEN 'lotzc'
-          ELSE REPLACE(page, '/live_tab/league_', '')
-        END as competition_id_str,
-        COUNT(*) as click_cnt,
-        COUNT(DISTINCT device_id) as device_cnt
-      FROM hive.dwd.dwd_pb_zucai_event_sensor_src_ph
-      WHERE day >= '{start_date.strftime('%Y%m%d')}'
-        AND day <= '{end_date.strftime('%Y%m%d')}'
-        AND (
-          page = '/live_tab/lotzc'
-          OR page LIKE '/live_tab/league_%'
-        )
-      GROUP BY day, CASE
-        WHEN page = '/live_tab/lotzc' THEN 'lotzc'
-        ELSE REPLACE(page, '/live_tab/league_', '')
-      END
+def _fetch_one(config: AppConfig, conn, day: date) -> None:
+    print(f"拉取 {day}（约 1~2 分钟）...", flush=True)
+    rows = fetch_day(config, day)
+    repo.save_league_tab_clicks(day.isoformat(), rows, conn)
+    repo.mark_league_tab_click_run(
+        day.isoformat(), conn, status="SUCCESS",
+        row_count=len(rows), total_cnt=sum(cnt for _, cnt in rows),
     )
-    SELECT
-      day,
-      competition_id_str,
-      click_cnt,
-      device_cnt
-    FROM league_clicks
-    WHERE competition_id_str IN ({','.join(f"'{lid}'" for lid in league_ids)})
-    ORDER BY day DESC, click_cnt DESC
-    """
+    print(f"  {day} → {len(rows)} 个联赛tab，共 {sum(cnt for _, cnt in rows)} 次", flush=True)
 
-    conn = None
+
+def main() -> int:
+    config = AppConfig()
+    if not credentials_configured(config):
+        print("未配置 StarRocks 账号，请检查 dqd-bigdata-sr 技能的 .env 或 STARROCKS_USER 环境变量")
+        return 1
+
+    conn = _connect(config.database_path)
     try:
-        cfg = load_config()
-        conn = connect(cfg, query_timeout=300)
-        cursor = conn.cursor()
-        cursor.execute(sql)
-        rows = cursor.fetchall()
+        if len(sys.argv) > 1:
+            _fetch_one(config, conn, date.fromisoformat(sys.argv[1]))
+            return 0
 
-        # 转换数据格式
-        daily_data = []
-        for row in rows:
-            day_str = row[0]
-            formatted_date = f"{day_str[:4]}-{day_str[4:6]}-{day_str[6:]}"
-            daily_data.append({
-                "date": formatted_date,
-                "league_id": row[1],
-                "league_name": TARGET_LEAGUES.get(row[1], f"联赛{row[1]}"),
-                "clicks": row[2],
-                "devices": row[3],
-            })
-
-        # 汇总每个联赛的总数
-        league_summary = {}
-        for item in daily_data:
-            lid = item["league_id"]
-            if lid not in league_summary:
-                league_summary[lid] = {
-                    "league_id": lid,
-                    "league_name": item["league_name"],
-                    "total_clicks": 0,
-                    "total_devices": 0,
-                    "active_days": 0,
-                }
-            league_summary[lid]["total_clicks"] += item["clicks"]
-            league_summary[lid]["total_devices"] += item["devices"]
-            league_summary[lid]["active_days"] += 1
-
-        return {
-            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "date_range": {
-                "start": start_date.strftime("%Y-%m-%d"),
-                "end": end_date.strftime("%Y-%m-%d"),
-            },
-            "leagues": sorted(league_summary.values(), key=lambda x: x["total_clicks"], reverse=True),
-            "daily_data": daily_data,
-        }
+        days = pending_dates(config, conn)
+        if not days:
+            print("已是最新，没有需要补的日期")
+            return 0
+        print(f"待补 {len(days)} 天: {', '.join(d.isoformat() for d in days)}")
+        result = sync_due_days(config, conn)
+        print(f"✓ 完成: 成功 {result.get('synced')} / 失败 {result.get('failed')}"
+              f" / 仍待补 {result.get('remaining')} 天")
+        return 0
     finally:
-        if conn:
-            conn.close()
+        conn.close()
+
 
 if __name__ == "__main__":
-    days = int(sys.argv[1]) if len(sys.argv) > 1 else 30
-    data = fetch_league_clicks(days)
-
-    # 保存到instance目录
-    output_dir = Path(__file__).parent.parent / "instance"
-    output_dir.mkdir(exist_ok=True)
-    output_file = output_dir / "league_data.json"
-
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-    print(f"✓ 数据已保存到 {output_file}")
-    print(f"  查询范围: {data['date_range']['start']} ~ {data['date_range']['end']}")
-    print(f"  联赛数量: {len(data['leagues'])}")
-    print(f"  每日记录: {len(data['daily_data'])} 条")
+    raise SystemExit(main())

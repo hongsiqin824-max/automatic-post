@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+
+{% block title %}联赛tab点击数据 - 文章质检台{% endblock %}
+{% block page_id %}league-clicks{% endblock %}
+{% block eyebrow %}数据监控{% endblock %}
+{% block heading %}联赛tab点击数据{% endblock %}
+
+{% block topbar_actions %}
+<button type="button" class="button" id="leagueClicksSync">
+  <i data-lucide="refresh-cw"></i><span>立即拉数</span>
+</button>
+{% endblock %}
+
+{% block content %}
+<!-- 口径警示：默认折叠，展开后说明为什么这份数据只覆盖懂球帝Pro iOS 版 -->
+<details class="card" style="padding: .75rem 1.25rem; margin-bottom: 1.5rem; border-left: 3px solid #d97706; background: #fffbeb;">
+  <summary style="cursor: pointer; font-weight: 600; color: #92400e; font-size: .875rem;">
+    <i data-lucide="alert-triangle" style="width:15px;height:15px;vertical-align:-3px;"></i>
+    仅「懂球帝Pro iOS 版」数据，不代表全端
+  </summary>
+  <ul style="margin: .75rem 0 0; padding-left: 1.25rem; color: #78350f; font-size: .8125rem; line-height: 1.7;">
+    <li>安卓 / 鸿蒙主 App 把字段名拼成了 <code>thrid_tab_id</code>（应为 <code>third_tab_id</code>）且值为空，也不上报 <code>third_tab_name</code>，拿不到联赛名。</li>
+    <li>iOS 主 App 完全不上报 <code>tab_switch</code> 事件。</li>
+    <li>该埋点 2026-09-23 才开始有数据，日均几十次。<strong>判断用户偏好请看累计占比，单日排名的随机波动很大。</strong></li>
+  </ul>
+</details>
+
+<div class="page-section">
+  <div class="section-header">
+    <div>
+      <h2 class="section-title">每日切换总量</h2>
+      <p class="section-description">
+        懂球帝Pro iOS 版 · 头条 &gt; 彩经 下的联赛 tab 切换总次数。
+        每天 {{ '%02d'|format(fetch_hour) }}:{{ '%02d'|format(fetch_minute) }} 自动拉取前一天数据并长期累积
+        （上游实时表只保留约 30 天，过期无法补）。
+        {% if stats.date_range.start %}
+          <br>数据范围: {{ stats.date_range.start }} 至 {{ stats.date_range.end }}
+          | 累计切换 {{ stats.total_switch_cnt }} 次
+          {% if stats.last_fetched_at %} | 最后拉取: {{ stats.last_fetched_at[:19] | replace('T', ' ') }}{% endif %}
+        {% endif %}
+      </p>
+    </div>
+  </div>
+
+  {% if stats.daily %}
+  <div class="card" style="padding: 1rem;">
+    <div style="display: flex; gap: .5rem; margin-bottom: .75rem;">
+      <button type="button" class="button" data-chart-mode="league" style="font-size: .8125rem; padding: .35rem .75rem;">按联赛</button>
+      <button type="button" class="button" data-chart-mode="total" style="font-size: .8125rem; padding: .35rem .75rem;">总量</button>
+      <span style="margin-left: auto; align-self: center; color: #94a3b8; font-size: .75rem;">
+        点图例可单独开关某个联赛
+      </span>
+    </div>
+    <div id="dailyTotalChart" style="width: 100%; height: 380px;"></div>
+  </div>
+  {% else %}
+  <div class="card" style="padding: 3rem; text-align: center; color: #64748b;">
+    <i data-lucide="database" style="width: 48px; height: 48px; margin: 0 auto 1rem;"></i>
+    <p style="margin: 0;">暂无数据</p>
+    <p style="margin: 0.5rem 0 0; font-size: 0.875rem;">
+      定时任务每天 {{ '%02d'|format(fetch_hour) }}:{{ '%02d'|format(fetch_minute) }} 自动拉取，也可以点右上角「立即拉数」
+    </p>
+  </div>
+  {% endif %}
+</div>
+
+{% if stats.leagues %}
+<div class="page-section" style="margin-top: 2.5rem;">
+  <div class="section-header">
+    <div>
+      <h2 class="section-title">联赛 tab 累计排名</h2>
+      <p class="section-description">
+        按累计切换次数排序。累计量越大占比越稳，用它判断「用户最爱看哪个联赛」。
+      </p>
+    </div>
+  </div>
+
+  <div class="card">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>联赛 tab</th>
+          <th>累计切换次数</th>
+          <th>总占比</th>
+          <th>有数据天数</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for league in stats.leagues %}
+        <tr>
+          <td><strong>{{ league.league_name }}</strong></td>
+          <td>{{ league.switch_cnt }}</td>
+          <td>{{ league.ratio_pct }}%</td>
+          <td style="color:#64748b;">{{ league.active_days }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% if stats.runs %}
+<div class="page-section" style="margin-top: 2.5rem;">
+  <div class="section-header">
+    <div>
+      <h2 class="section-title">拉取记录</h2>
+      <p class="section-description">
+        每天一条。失败的日期会在下一轮自动重试；30 天内的缺口能补回来，超过就永久丢失了。
+      </p>
+    </div>
+  </div>
+
+  <div class="card">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>统计日</th>
+          <th>状态</th>
+          <th>切换次数</th>
+          <th>拉取时间</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in stats.runs %}
+        <tr>
+          <td>{{ run.stat_date }}</td>
+          <td>
+            {% if run.status == 'SUCCESS' %}
+              <span style="color:#16a34a;">成功</span>
+            {% else %}
+              <span style="color:#dc2626;" title="{{ run.error or '' }}">失败</span>
+            {% endif %}
+          </td>
+          <td>{{ run.total_cnt }}</td>
+          <td style="color:#64748b;">{{ run.fetched_at[:19] | replace('T', ' ') }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+<script>
+document.getElementById('leagueClicksSync')?.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await fetch('/api/league-clicks/sync', { method: 'POST' });
+    // 单日查询要 1~2 分钟，这里只是触发后台任务，稍后刷新页面才能看到结果
+    alert('已开始后台拉取。单日查询约 1~2 分钟，稍后刷新页面查看。');
+  } catch (err) {
+    alert('触发失败: ' + err);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+{% if stats.daily %}
+const dailyData = {{ stats.daily | tojson }};
+const dailyByLeague = {{ stats.daily_by_league | tojson }};
+const leagueRank = {{ stats.leagues | tojson }};
+const chart = echarts.init(document.getElementById('dailyTotalChart'));
+
+const dates = dailyData.map(d => d.date);
+const baseOption = {
+  tooltip: { trigger: 'axis' },
+  xAxis: { type: 'category', boundaryGap: false, data: dates },
+  yAxis: { type: 'value', name: '切换次数', minInterval: 1 }
+};
+
+// 按联赛：每个联赛一条线，缺失的日期补 0。联赛按累计次数排序，
+// 图例顺序跟下面的累计排名表一致，方便对着看。
+function leagueOption() {
+  const names = leagueRank.map(l => l.league_name);
+  return Object.assign({}, baseOption, {
+    legend: { data: names, top: 0, type: 'scroll' },
+    grid: { left: '3%', right: '4%', bottom: '3%', top: 45, containLabel: true },
+    series: names.map(name => ({
+      name: name,
+      type: 'line',
+      smooth: true,
+      symbolSize: 6,
+      connectNulls: true,
+      data: dates.map(date => {
+        const hit = dailyByLeague.find(r => r.date === date && r.league_name === name);
+        return hit ? hit.switch_cnt : 0;
+      })
+    }))
+  });
+}
+
+function totalOption() {
+  return Object.assign({}, baseOption, {
+    legend: { show: false },
+    grid: { left: '3%', right: '4%', bottom: '3%', top: 30, containLabel: true },
+    series: [{
+      name: '每日切换总次数',
+      type: 'line',
+      smooth: true,
+      symbolSize: 7,
+      areaStyle: { opacity: 0.12 },
+      data: dailyData.map(d => d.total_cnt)
+    }]
+  });
+}
+
+function renderChart(mode) {
+  // notMerge=true：两种模式的 series 数量不同，不清空会残留上一次的线
+  chart.setOption(mode === 'total' ? totalOption() : leagueOption(), true);
+  document.querySelectorAll('[data-chart-mode]').forEach(btn => {
+    btn.style.opacity = btn.dataset.chartMode === mode ? '1' : '.55';
+  });
+}
+
+document.querySelectorAll('[data-chart-mode]').forEach(btn => {
+  btn.addEventListener('click', () => renderChart(btn.dataset.chartMode));
+});
+renderChart('league');
+window.addEventListener('resize', () => chart.resize());
+{% endif %}
+</script>
+{% endblock %}

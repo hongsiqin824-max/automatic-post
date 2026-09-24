@@ -32,6 +32,7 @@ from .services.open_platform import AUTH_STATUS_LABELS, OpenPlatformClient, auth
 from .services.pipeline import RunController, recheck_article
 from .services.scheduler import Scheduler
 from .services.feishu_report import FeishuReportController, FeishuReportScheduler
+from .services.league_clicks import LeagueClicksController, LeagueClicksScheduler
 from .services.dqd_open_client import DqdOpenClientError
 from .services.publisher import (
     DraftClaimSkipped,
@@ -787,6 +788,11 @@ def create_app(test_config: dict | None = None) -> Flask:
         source_report_controller,
         cfg.source_report_check_interval_seconds,
     )
+    league_clicks_controller = LeagueClicksController(cfg)
+    league_clicks_scheduler = LeagueClicksScheduler(
+        league_clicks_controller,
+        cfg.league_clicks_check_interval_seconds,
+    )
     # The independent publish worker drains READY_TO_PUBLISH on its own cadence
     # and already reconciles due draft confirmations, so it takes the scheduler's
     # maintenance slot when enabled. Turning it off falls back to the original
@@ -810,6 +816,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.extensions["feishu_report_scheduler"] = feishu_report_scheduler
     app.extensions["source_report_controller"] = source_report_controller
     app.extensions["source_report_scheduler"] = source_report_scheduler
+    app.extensions["league_clicks_controller"] = league_clicks_controller
+    app.extensions["league_clicks_scheduler"] = league_clicks_scheduler
     app.extensions["scheduler"] = scheduler
     with app.app_context():
         scheduler_enabled = bool(repo.get_setting("scheduler_enabled", cfg.scheduler_enabled))
@@ -819,6 +827,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         feishu_report_scheduler.start()
     if cfg.source_report_configured and not app.config.get("TESTING") and not test_config:
         source_report_scheduler.start()
+    if cfg.league_clicks_enabled and not app.config.get("TESTING") and not test_config:
+        league_clicks_scheduler.start()
 
     app.jinja_env.globals["cdn_url"] = cdn_url
     app.jinja_env.globals["status_label"] = lambda value: STATUS_LABELS.get(value, value)
@@ -1741,30 +1751,35 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/league-data")
     def league_data():
-        """联赛tab点击数据看板 + 实操标签统计"""
-        data_file = Path(__file__).resolve().parents[1] / "instance" / "league_clicks.json"
-        try:
-            with open(data_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            data = {
-                "update_time": "",
-                "date_range": {"start": "", "end": ""},
-                "leagues": [],
-                "daily_data": []
-            }
-
-        # 获取实操标签统计数据
+        """赛事覆盖看板：未被栏目覆盖的赛事 + 实操标签统计"""
         conn = get_db()
         competition_stats = _get_competition_stats(conn)
         uncovered_competitions = _get_uncovered_competitions(conn)
 
         return render_template(
             "league_data.html",
-            data=data,
             competition_stats=competition_stats,
             uncovered_competitions=uncovered_competitions,
         )
+
+    @app.get("/league-data/clicks")
+    def league_clicks():
+        """联赛tab点击数据看板（数据来自本地累积表，由每日定时任务写入）"""
+        cfg: AppConfig = app.extensions["app_config"]
+        stats = repo.get_league_tab_click_stats(get_db())
+        return render_template(
+            "league_clicks.html",
+            stats=stats,
+            fetch_hour=cfg.league_clicks_hour,
+            fetch_minute=cfg.league_clicks_minute,
+        )
+
+    @app.post("/api/league-clicks/sync")
+    def league_clicks_sync():
+        """手动触发一次补数（后台线程跑，立即返回）"""
+        controller: LeagueClicksController = app.extensions["league_clicks_controller"]
+        started = controller.start()
+        return jsonify({"success": True, "started": started})
 
     @app.get("/health")
     def health():

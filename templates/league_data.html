@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 
-{% block title %}数据统计 - 文章质检台{% endblock %}
+{% block title %}赛事覆盖 - 文章质检台{% endblock %}
 {% block page_id %}league-data{% endblock %}
 {% block eyebrow %}数据监控{% endblock %}
-{% block heading %}数据统计看板{% endblock %}
+{% block heading %}赛事覆盖分析{% endblock %}
 
 {% block topbar_actions %}
 <button type="button" class="button" onclick="location.reload()">
@@ -119,57 +119,6 @@
   {% endif %}
 </div>
 
-<!-- 联赛tab点击数据 -->
-<div class="page-section" style="margin-top: 3rem;">
-  <div class="section-header">
-    <div>
-      <h2 class="section-title">联赛tab点击数据</h2>
-      <p class="section-description">
-        {% if data.update_time %}
-          最后更新: {{ data.update_time }} | 数据范围: {{ data.date_range.start }} 至 {{ data.date_range.end }}
-        {% else %}
-          暂无数据，请运行数据获取脚本
-        {% endif %}
-      </p>
-    </div>
-  </div>
-
-  {% if data.leagues %}
-  <div style="margin-bottom: 2rem;">
-    <div id="trendsChart" style="width: 100%; height: 500px;"></div>
-  </div>
-
-  <div class="card">
-    <table class="data-table">
-      <thead>
-        <tr>
-          <th>联赛</th>
-          <th>总点击数</th>
-          <th>独立设备数</th>
-          <th>活跃天数</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for league in data.leagues %}
-        <tr>
-          <td><strong>{{ league.league_name }}</strong></td>
-          <td>{{ league.total_clicks }}</td>
-          <td>{{ league.total_devices }}</td>
-          <td>{{ league.active_days }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-  {% else %}
-  <div class="card" style="padding: 3rem; text-align: center; color: #64748b;">
-    <i data-lucide="database" style="width: 48px; height: 48px; margin: 0 auto 1rem;"></i>
-    <p style="margin: 0;">暂无数据</p>
-    <p style="margin: 0.5rem 0 0; font-size: 0.875rem;">请运行 <code>python3 scripts/fetch_league_data.py</code> 获取数据</p>
-  </div>
-  {% endif %}
-</div>
-
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 <script>
 // 实操标签趋势图
@@ -228,64 +177,6 @@ const competitionOption = {
 
 competitionChart.setOption(competitionOption);
 window.addEventListener('resize', () => competitionChart.resize());
-{% endif %}
-
-// 联赛tab点击趋势图
-{% if data.daily_data %}
-const chartDom = document.getElementById('trendsChart');
-const myChart = echarts.init(chartDom);
-
-const rawData = {{ data.daily_data | tojson }};
-const leagues = {{ data.leagues | tojson }};
-
-// 准备数据
-const dates = [...new Set(rawData.map(d => d.date))].sort();
-const series = leagues.map(league => ({
-  name: league.league_name,
-  type: 'line',
-  smooth: true,
-  data: dates.map(date => {
-    const record = rawData.find(r => r.date === date && r.league_name === league.league_name);
-    return record ? record.clicks : 0;
-  })
-}));
-
-const option = {
-  title: {
-    text: '每日点击趋势',
-    left: 'center',
-    textStyle: { fontSize: 16, fontWeight: 500 }
-  },
-  tooltip: {
-    trigger: 'axis',
-    axisPointer: { type: 'cross' }
-  },
-  legend: {
-    data: leagues.map(l => l.league_name),
-    top: 40,
-    type: 'scroll'
-  },
-  grid: {
-    left: '3%',
-    right: '4%',
-    bottom: '3%',
-    top: 100,
-    containLabel: true
-  },
-  xAxis: {
-    type: 'category',
-    boundaryGap: false,
-    data: dates
-  },
-  yAxis: {
-    type: 'value',
-    name: '点击次数'
-  },
-  series: series
-};
-
-myChart.setOption(option);
-window.addEventListener('resize', () => myChart.resize());
 {% endif %}
 </script>
 {% endblock %}
