@@ -14,9 +14,9 @@
 
 性能约束：
   sr_prod 是 JDBC catalog，查询会下推到后端。跨天范围查询会被后端掐断
-  （7 天范围实测 51 秒就报错），所以只能按天逐日查。proc_time 必须带
-  范围否则走不动；properties 是超大 VARCHAR，先用 LIKE 粗筛再解析 JSON
-  能把单日耗时从 ~160s 压到 ~70s。
+  （7 天范围实测 51 秒就报错），所以按天逐日处理；每一天再拆成多个时间窗口。
+  proc_time 必须带范围否则走不动；properties 是超大 VARCHAR，先用 LIKE 粗筛
+  再解析 JSON，降低每个窗口的扫描量。
 """
 
 from __future__ import annotations
@@ -50,6 +50,11 @@ TARGET_TAB_NAME = "头条"
 TARGET_SUB_TAB_NAME = "彩经"
 # 单日查询要 70~120 秒，一次跑太多天会让后台线程挂很久
 MAX_DAYS_PER_RUN = 5
+# 先按 6 小时查询；如果仍然超时，会自动拆成 3 小时，再拆成 1 小时。
+INITIAL_QUERY_WINDOW_HOURS = 6
+MIN_QUERY_WINDOW = timedelta(hours=1)
+# 失败日期不应在每个调度周期都重复发起重查询。
+FAILED_RETRY_DELAY = timedelta(minutes=30)
 # 拉取时间距统计日不足这么多天，就认为还可能有延迟入库的事件，过几天再拉一次覆盖
 FINALIZE_LAG_DAYS = 2
 
@@ -60,6 +65,8 @@ FROM sr_prod.dwd.dwd_flow_sensor_s
 WHERE proc_time >= %s AND proc_time < %s
   AND event = 'tab_switch'
   AND properties LIKE '%%{TARGET_SUB_TAB_NAME}%%'
+  AND properties LIKE '%%{PRO_IOS_APP_ID}%%'
+  AND properties LIKE '%%{TARGET_TAB_NAME}%%'
   AND get_json_string(properties, '$.$app_id') = '{PRO_IOS_APP_ID}'
   AND get_json_string(properties, 'tab_name') = '{TARGET_TAB_NAME}'
   AND get_json_string(properties, 'sub_tab_name') = '{TARGET_SUB_TAB_NAME}'
@@ -120,15 +127,59 @@ def _connect_starrocks(config: AppConfig):
     )
 
 
-def fetch_day(config: AppConfig, day: date) -> list[tuple[str, int]]:
-    """拉取某一天的联赛 tab 切换次数。按 proc_time（入库时间）单日切分。"""
+def fetch_window(config: AppConfig, start: datetime, end: datetime) -> list[tuple[str, int]]:
+    """拉取一个时间窗口的联赛 tab 切换次数。"""
     conn = _connect_starrocks(config)
     try:
         cursor = conn.cursor()
-        cursor.execute(DAILY_SQL, (f"{day} 00:00:00", f"{day + timedelta(days=1)} 00:00:00"))
+        cursor.execute(
+            DAILY_SQL,
+            (start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")),
+        )
         return [(str(name), int(cnt)) for name, cnt in cursor.fetchall() if name]
     finally:
         conn.close()
+
+
+def _fetch_window_with_fallback(
+    config: AppConfig, start: datetime, end: datetime
+) -> list[tuple[str, int]]:
+    """查询窗口，超时后递归拆小，直到一小时窗口仍失败才放弃。"""
+    try:
+        return fetch_window(config, start, end)
+    except Exception as exc:  # noqa: BLE001 - 保留最后一个窗口错误给上层记录
+        span = end - start
+        if span <= MIN_QUERY_WINDOW:
+            raise
+
+        # 6 小时会先拆成 3+3，3 小时再拆成 1+2，最终最多落到 1 小时窗口。
+        span_hours = int(span.total_seconds() // 3600)
+        split = timedelta(hours=max(1, span_hours // 2))
+        midpoint = start + split
+        logger.warning(
+            "联赛点击查询窗口失败，拆分后重试: %s - %s (%s)",
+            start,
+            end,
+            str(exc)[:300],
+        )
+        return (
+            _fetch_window_with_fallback(config, start, midpoint)
+            + _fetch_window_with_fallback(config, midpoint, end)
+        )
+
+
+def fetch_day(config: AppConfig, day: date) -> list[tuple[str, int]]:
+    """拉取某一天的联赛 tab 切换次数，完整成功后再汇总返回。"""
+    start = datetime.combine(day, time.min)
+    end = start + timedelta(days=1)
+    aggregated: dict[str, int] = {}
+    window_start = start
+    while window_start < end:
+        window_end = min(window_start + timedelta(hours=INITIAL_QUERY_WINDOW_HOURS), end)
+        for name, count in _fetch_window_with_fallback(config, window_start, window_end):
+            aggregated[name] = aggregated.get(name, 0) + count
+        window_start = window_end
+    return sorted(aggregated.items(), key=lambda item: (-item[1], item[0]))
 
 
 def pending_dates(config: AppConfig, connection=None, now: datetime | None = None) -> list[date]:
@@ -156,8 +207,12 @@ def pending_dates(config: AppConfig, connection=None, now: datetime | None = Non
     day = earliest
     while day <= latest:
         run = runs.get(day.isoformat())
-        if run is None or str(run.get("status", "")).upper() != "SUCCESS":
+        if run is None:
             result.append(day)
+        elif str(run.get("status", "")).upper() != "SUCCESS":
+            fetched_at = _parse_timestamp(str(run.get("fetched_at") or ""))
+            if fetched_at is None or current.astimezone(timezone.utc) >= fetched_at + FAILED_RETRY_DELAY:
+                result.append(day)
         else:
             # 拉得太早可能漏了延迟入库的事件，过 FINALIZE_LAG_DAYS 天再覆盖一次。
             # 必须同时要求「上次拉取不是今天」，否则刚拉完就又满足重拉条件，
@@ -175,6 +230,21 @@ def _parse_day(value: str) -> date:
     except ValueError:
         # 解析不出来就当作很久以前，让它走重拉逻辑而不是被永久跳过
         return EARLIEST_DAY
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    """解析本地记录的 UTC 时间，用于失败重试退避。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def sync_due_days(config: AppConfig, connection=None, now: datetime | None = None) -> dict:

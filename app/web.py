@@ -33,6 +33,7 @@ from .services.pipeline import RunController, recheck_article
 from .services.scheduler import Scheduler
 from .services.feishu_report import FeishuReportController, FeishuReportScheduler
 from .services.league_clicks import LeagueClicksController, LeagueClicksScheduler
+from .services.league_clicks_weekly import LeagueClicksWeeklyController, LeagueClicksWeeklyScheduler
 from .services.dqd_open_client import DqdOpenClientError
 from .services.publisher import (
     DraftClaimSkipped,
@@ -793,6 +794,11 @@ def create_app(test_config: dict | None = None) -> Flask:
         league_clicks_controller,
         cfg.league_clicks_check_interval_seconds,
     )
+    league_clicks_weekly_controller = LeagueClicksWeeklyController(cfg)
+    league_clicks_weekly_scheduler = LeagueClicksWeeklyScheduler(
+        league_clicks_weekly_controller,
+        cfg.league_clicks_weekly_check_interval_seconds,
+    )
     # The independent publish worker drains READY_TO_PUBLISH on its own cadence
     # and already reconciles due draft confirmations, so it takes the scheduler's
     # maintenance slot when enabled. Turning it off falls back to the original
@@ -818,6 +824,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.extensions["source_report_scheduler"] = source_report_scheduler
     app.extensions["league_clicks_controller"] = league_clicks_controller
     app.extensions["league_clicks_scheduler"] = league_clicks_scheduler
+    app.extensions["league_clicks_weekly_controller"] = league_clicks_weekly_controller
+    app.extensions["league_clicks_weekly_scheduler"] = league_clicks_weekly_scheduler
     app.extensions["scheduler"] = scheduler
     with app.app_context():
         scheduler_enabled = bool(repo.get_setting("scheduler_enabled", cfg.scheduler_enabled))
@@ -829,6 +837,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         source_report_scheduler.start()
     if cfg.league_clicks_enabled and not app.config.get("TESTING") and not test_config:
         league_clicks_scheduler.start()
+    if cfg.feishu_spreadsheet_configured and not app.config.get("TESTING") and not test_config:
+        league_clicks_weekly_scheduler.start()
 
     app.jinja_env.globals["cdn_url"] = cdn_url
     app.jinja_env.globals["status_label"] = lambda value: STATUS_LABELS.get(value, value)

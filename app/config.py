@@ -243,6 +243,18 @@ class AppConfig:
     starrocks_user: str = os.getenv("STARROCKS_USER", "").strip()
     starrocks_password: str = os.getenv("STARROCKS_PASSWORD", "")
 
+    # 联赛点击数据周报：每周六自动汇总前 7 天数据并写入飞书表格
+    league_clicks_weekly_enabled: bool = _env_bool("LEAGUE_CLICKS_WEEKLY_ENABLED", True)
+    league_clicks_weekly_hour: int = max(0, min(23, _env_int("LEAGUE_CLICKS_WEEKLY_HOUR", 19)))
+    league_clicks_weekly_minute: int = max(0, min(59, _env_int("LEAGUE_CLICKS_WEEKLY_MINUTE", 0)))
+    league_clicks_weekly_check_interval_seconds: int = max(
+        15, min(3600, _env_int("LEAGUE_CLICKS_WEEKLY_CHECK_INTERVAL_SECONDS", 60))
+    )
+    feishu_app_id: str = os.getenv("FEISHU_APP_ID", "").strip()
+    feishu_app_secret: str = os.getenv("FEISHU_APP_SECRET", "").strip()
+    feishu_spreadsheet_token: str = os.getenv("FEISHU_SPREADSHEET_TOKEN", "").strip()
+    feishu_api_timeout_seconds: int = max(5, _env_int("FEISHU_API_TIMEOUT_SECONDS", 30))
+
     # Open-platform article creation is a write operation, so it stays behind
     # an explicit flag even when credentials are present.
     publisher_enabled: bool = _env_bool("AUTOMATIC_POST_PUBLISHER", False)
@@ -364,6 +376,15 @@ class AppConfig:
             self.source_report_enabled
             and self.source_report_webhook_url
             and self.source_report_boundaries
+        )
+
+    @property
+    def feishu_spreadsheet_configured(self) -> bool:
+        return bool(
+            self.league_clicks_weekly_enabled
+            and self.feishu_app_id
+            and self.feishu_app_secret
+            and self.feishu_spreadsheet_token
         )
 
 

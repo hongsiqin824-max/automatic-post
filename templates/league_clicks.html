@@ -36,7 +36,7 @@
         {% if stats.date_range.start %}
           <br>数据范围: {{ stats.date_range.start }} 至 {{ stats.date_range.end }}
           | 累计切换 {{ stats.total_switch_cnt }} 次
-          {% if stats.last_fetched_at %} | 最后拉取: {{ stats.last_fetched_at[:19] | replace('T', ' ') }}{% endif %}
+          {% if stats.last_fetched_at %} | 最后拉取: {{ stats.last_fetched_at | beijing_time }}{% endif %}
         {% endif %}
       </p>
     </div>
@@ -132,8 +132,14 @@
               <span style="color:#dc2626;" title="{{ run.error or '' }}">失败</span>
             {% endif %}
           </td>
-          <td>{{ run.total_cnt }}</td>
-          <td style="color:#64748b;">{{ run.fetched_at[:19] | replace('T', ' ') }}</td>
+          <td>
+            {% if run.status == 'SUCCESS' %}
+              {{ run.total_cnt }}
+            {% else %}
+              <span title="{{ run.error or '查询未完成，等待下一次重试' }}" style="color:#dc2626;">未取得</span>
+            {% endif %}
+          </td>
+          <td style="color:#64748b;">{{ run.fetched_at | beijing_time }}</td>
         </tr>
         {% endfor %}
       </tbody>
