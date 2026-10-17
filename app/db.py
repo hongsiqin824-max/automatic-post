@@ -305,6 +305,35 @@ CREATE TABLE IF NOT EXISTS league_tab_click_runs (
     error      TEXT,
     fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- 联赛标签白名单：每个 competition 当前「进行中赛季」有效的球队/球员标签。
+-- 标签来自 dedecms_channels，是文章 channels 里的那套数字 ID。黑白名单未来
+-- 都从这张表派生（第一期只用于按栏目白名单过滤）。
+CREATE TABLE IF NOT EXISTS competition_channel_tags (
+    competition_id INTEGER NOT NULL,
+    channel_id     INTEGER NOT NULL,
+    tag_type       TEXT NOT NULL CHECK (tag_type IN ('Team', 'Player')),
+    season_id      INTEGER NOT NULL,
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(competition_id, channel_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_competition_channel_tags_competition
+    ON competition_channel_tags(competition_id);
+
+-- 每个 competition 每次刷新的审计记录，支撑故障关闭/回滚/可观测。
+-- REJECTED 表示拉到的数据没通过安全校验、已保留上一版 good 数据未覆盖。
+CREATE TABLE IF NOT EXISTS competition_tag_runs (
+    competition_id INTEGER PRIMARY KEY,
+    status         TEXT NOT NULL DEFAULT 'SUCCESS'
+                   CHECK (status IN ('SUCCESS', 'FAILED', 'REJECTED')),
+    season_id      INTEGER,
+    team_count     INTEGER NOT NULL DEFAULT 0,
+    player_count   INTEGER NOT NULL DEFAULT 0,
+    total_count    INTEGER NOT NULL DEFAULT 0,
+    error          TEXT,
+    fetched_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 

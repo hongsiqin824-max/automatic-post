@@ -2772,3 +2772,470 @@ def test_publish_controller_drains_ready_queue_in_background(app, monkeypatch):
     assert result["draft_created"] == 1
     assert updated["status"] == "DRAFT_CREATED"
     assert updated["dqd_archive_id"] == 3809999
+
+
+# ---------------------------------------------------------------------------
+# 内容相关性过滤（relevance guard）测试
+# ---------------------------------------------------------------------------
+
+_RELEVANCE_CONFIG = dict(
+    relevance_guard_enabled=True,
+    relevance_guard_scope="intl",
+    relevance_guard_min_confidence=0.9,
+    league_guard_classifier_enabled=True,
+)
+
+
+def _direct_article(route_league: str = "intl", route_rule_id: int | None = None):
+    article = _ready_article()
+    article["material_user_name"] = f"test:soccer.{route_league}.team"
+    if route_rule_id is not None:
+        article["route_rule_id"] = route_rule_id
+    return article
+
+
+def _stub_classifier(tab_id: int | None, confidence: float, reason: str = "分类理由"):
+    return {
+        "tab_id": tab_id,
+        "confidence": confidence,
+        "reason": reason,
+        "actual_competition": "测试赛事",
+    }
+
+
+class _GuardClient:
+    captured: list[int] = []
+
+    def __init__(self, config):
+        self.config = config
+
+    def create_article(self, article, tab, **kwargs):
+        _GuardClient.captured.append(int(kwargs.get("status", 999)))
+        return DqdOpenDraftResult(
+            archive_id=88001,
+            payload={"code": 0, "data": {"archive_id": 88001}},
+            request_url="https://platform.dongqiudi.com/open/v1/do",
+            form_fields=[],
+        )
+
+
+def test_relevance_guard_direct_belongs_confirms_direct(app, monkeypatch):
+    """直发稿 scope=intl：判定属于 → 确认直发，不改模式，不写升级事件。"""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: {"belongs": True, "confidence": 0.95, "reason": "属于"},
+    )
+    monkeypatch.setattr(
+        "app.services.publisher.classify_article_tab",
+        lambda *a, **kw: _stub_classifier(None, 0.8, "not used"),
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=1,
+            ai_league_guard_enabled=False,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True,
+                           publish_mode_override=1)
+        article = repo.upsert_material(_direct_article("intl"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+            ), conn, article["id"],
+        )
+        updated = repo.get_article(article["id"], conn)
+
+        # 直发→直发，submit 带的 status=1。
+    assert _GuardClient.captured == [1]
+    assert result["status"] == "PUBLISHED"
+    guard = updated["quality"]["league_guard"]
+    assert guard["upgraded_to_publish"] is False
+    assert guard["downgraded_from_direct"] is False
+    assert guard["effective_publish_mode"] == 1
+    assert "保持直接发布" in guard["reason"]
+
+
+def test_relevance_guard_direct_belongs_no_upgrade_event(app, monkeypatch):
+    """直发稿确属时不触发 LEAGUE_GUARD_UPGRADED 事件。"""
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: {"belongs": True, "confidence": 0.95, "reason": "属于"},
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=1,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True,
+                           publish_mode_override=1)
+        article = repo.upsert_material(_direct_article("intl"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+            ), conn, article["id"],
+        )
+        events = repo.list_article_events(article["id"], conn)
+
+    assert not any(e["event_type"] == "LEAGUE_GUARD_UPGRADED" for e in events)
+
+
+def test_relevance_guard_direct_reassign_to_other_tab(app, monkeypatch):
+    """直发稿不属于当前栏目、分类到别的启用栏目 → 改挂并直发。"""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: {"belongs": False, "confidence": 0.95, "reason": "不属于"},
+    )
+    with app.app_context():
+        conn = get_db()
+        tabs = repo.list_tabs(conn)
+        j1 = tabs[0]
+        j2 = tabs[1]
+        repo.update_tab(j1["id"], conn, publish_mode=1,
+                        ai_league_guard_definition="日职联")
+        repo.update_tab(j2["id"], conn, publish_mode=1,
+                        ai_league_guard_definition="日职乙")
+        repo.update_source("marca", conn, tab_id=j1["id"], enabled=True,
+                           publish_mode_override=1)
+        article = repo.upsert_material(_direct_article("intl"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        # 分类器把文章判到 j2（日职乙）
+        monkeypatch.setattr(
+            "app.services.publisher.classify_article_tab",
+            lambda *a, **kw: _stub_classifier(j2["id"], 0.92, "实际是日职乙"),
+        )
+        result = create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+            ), conn, article["id"],
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert result["status"] == "PUBLISHED"
+    guard = updated["quality"]["league_guard"]
+    assert guard["reassigned_tab_id"] == j2["id"]
+    assert guard["fallback_tab_name"] == j2["name"]
+    assert guard["effective_publish_mode"] == 1
+    assert "已改挂" in guard["reason"]
+
+
+def test_relevance_guard_direct_homeless_downgrades_to_draft(app, monkeypatch):
+    """直发稿高置信谁都不属于 → 降级草稿，写 RELEVANCE_DOWNGRADED 事件。"""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: {"belongs": False, "confidence": 0.95, "reason": "不属于"},
+    )
+    monkeypatch.setattr(
+        "app.services.publisher.classify_article_tab",
+        lambda *a, **kw: _stub_classifier(None, 0.92, "不属于任何赛事栏目"),
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=1,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True,
+                           publish_mode_override=1)
+        article = repo.upsert_material(_direct_article("intl"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+            ), conn, article["id"],
+        )
+        updated = repo.get_article(article["id"], conn)
+
+        # 直发→草稿，submit 带的 status=0。
+        assert 0 in _GuardClient.captured
+        assert result["status"] == "DRAFT_CREATED"
+        guard = updated["quality"]["league_guard"]
+        assert guard["downgraded_from_direct"] is True
+        assert guard["effective_publish_mode"] == 0
+        assert "也不属于任何候选栏目" in guard["reason"]
+        events = repo.list_article_events(article["id"], conn)
+        assert any(e["event_type"] == "RELEVANCE_DOWNGRADED" for e in events)
+        assert not any(e["event_type"] == "LEAGUE_GUARD_UPGRADED" for e in events)
+
+
+def test_relevance_guard_direct_homeless_low_confidence_keeps_direct(app, monkeypatch):
+    """直发稿低置信谁都不属于 → fail-open，保持直发。"""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: {"belongs": False, "confidence": 0.9, "reason": "不属于"},
+    )
+    monkeypatch.setattr(
+        "app.services.publisher.classify_article_tab",
+        # confidence=0.8 < min_confidence=0.9 → 不算高置信
+        lambda *a, **kw: _stub_classifier(None, 0.8, "不太确定"),
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=1,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True,
+                           publish_mode_override=1)
+        article = repo.upsert_material(_direct_article("intl"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+            ), conn, article["id"],
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert result["status"] == "PUBLISHED"
+    guard = updated["quality"]["league_guard"]
+    assert guard["downgraded_from_direct"] is False
+    assert guard["effective_publish_mode"] == 1
+
+
+def test_relevance_guard_direct_llm_error_keeps_direct(app, monkeypatch):
+    """直发稿 LLM 调用失败 → fail-open，保持直发。"""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            LLMCallError("超时", category="timeout", retryable=True)
+        ),
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=1,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True,
+                           publish_mode_override=1)
+        article = repo.upsert_material(_direct_article("intl"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+            ), conn, article["id"],
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert result["status"] == "PUBLISHED"
+    guard = updated["quality"]["league_guard"]
+    assert guard["downgraded_from_direct"] is False
+    assert guard["effective_publish_mode"] == 1
+
+
+def test_relevance_guard_does_not_run_out_of_scope(app, monkeypatch):
+    """scope=intl 时，route_league=kleague1 不触发相关性过滤——保持原样直发。"""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    calls = []
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: calls.append(1) or {"belongs": True, "confidence": 0.95, "reason": "x"},
+    )
+    _enable_guard_llm(monkeypatch)
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=1,
+            ai_league_guard_definition="韩K",
+        )
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True,
+                           publish_mode_override=1)
+        article = repo.upsert_material(_direct_article("kleague1"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+            ), conn, article["id"],
+        )
+
+    assert result["status"] == "PUBLISHED"
+    assert len(calls) == 0  # check_league_membership 从未被调用
+
+
+def test_relevance_guard_generic_tab_skipped(app, monkeypatch):
+    """泛栏目（无定义）不触发相关性过滤。"""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: calls.append(1) or {"belongs": True, "confidence": 0.95, "reason": "x"},
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        # 不配 ai_league_guard_definition → 无定义泛栏目
+        repo.update_tab(tab["id"], conn, publish_mode=1)
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True,
+                           publish_mode_override=1)
+        article = repo.upsert_material(_direct_article("intl"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+            ), conn, article["id"],
+        )
+
+    assert result["status"] == "PUBLISHED"
+    assert len(calls) == 0
+
+
+def test_relevance_guard_draft_upgrade_with_keep_upgrade_false(app, monkeypatch):
+    """草稿稿确属但 keep_upgrade=False → 不升级，维持草稿。"""
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: {"belongs": True, "confidence": 0.95, "reason": "属于"},
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        repo.update_tab(
+            tab["id"], conn, publish_mode=0,
+            ai_league_guard_enabled=True,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True,
+                           publish_mode_override=None)
+        article = repo.upsert_material(_direct_article("intl"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+                relevance_guard_keep_upgrade=False,
+            ), conn, article["id"],
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert result["status"] == "DRAFT_CREATED"
+    guard = updated["quality"]["league_guard"]
+    assert guard["upgraded_to_publish"] is False
+    assert guard["effective_publish_mode"] == 0
+    assert "升级开关已关闭" in guard["reason"]
+
+
+def test_relevance_guard_downgraded_article_shows_badge(app, monkeypatch):
+    """降级稿在网页列表中显示「已降级草稿」徽章，且无 competence 字段。"""
+    quality = {
+        "league_guard": {
+            "tab_id": 1,
+            "tab_name": "日职联",
+            "guard_tab_id": 1,
+            "guard_tab_name": "日职联",
+            "configured_publish_mode": 1,
+            "effective_publish_mode": 0,
+            "upgraded_to_publish": False,
+            "downgraded_from_direct": True,
+            "reassigned_tab_id": None,
+            "reassigned_tab_active": None,
+            "classifier_used": True,
+            "verdict": {"belongs": False, "confidence": 0.95, "reason": "不属于日职联"},
+            "fallback_verdict": None,
+            "fallback_tab_name": None,
+            "fallback_candidates": ["韩K", "日职乙"],
+            "reason": "AI 判断本篇不属于日职联，也不属于任何候选栏目",
+            "actual_competition": "英超",
+        }
+    }
+    article = {
+        "id": 99901,
+        "status": "DRAFT_CREATED",
+        "publish_mode": 0,
+        "title": "日媒：英格兰球队1-0西班牙球队",
+        "body_html": "<p>正文</p>",
+        "quality": quality,
+    }
+
+    from app.web import _article_view as decorate
+    with app.app_context():
+        item = decorate(article)
+
+    assert item["league_guard_state"] == "downgraded"
+    assert "已降级草稿" in item["league_guard_label"]
+    assert "日职联" in item["league_guard_label"]
+    # 降级时没有改挂，competition 字段应该显示出来（不属于原栏目、又没改挂）
+    assert item["league_guard_competition"] == "英超"

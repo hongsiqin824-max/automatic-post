@@ -19,6 +19,10 @@ DEFAULT_TABS = (
     {"backend_tab_id": -100, "name": "gif合集"},
     {"backend_tab_id": 335, "name": "苏超"},
     {"backend_tab_id": 240, "name": "小酒馆"},
+    # 国家队栏目：生产库已有，补进种子让全新部署/测试库也一致。此栏目照常用于
+    # intl 路由接收文章。（曾配过按栏目白名单，经全量评估不适配国家队已停用，原因
+    # 见 competition_tags._WHITELIST_ROUTING；栏目本身保留。）
+    {"backend_tab_id": 364, "name": "国家队"},
     # Confirmed event columns used by the user_name league routing rules.
     # Keeping them in the first-run catalog lets a fresh deployment receive
     # the same editable defaults as an upgraded production database.

@@ -408,23 +408,54 @@ def _apply_ai_league_guard(
     ``league_guard_reassign_publish_mode``.
     """
 
-    if int(configured_mode) != 0:
-        return int(configured_mode), article
-    if str(article.get("route_league") or "").strip() and not repo.event_tab_rule_allows_ai_guard(
-        article.get("route_rule_id"), connection
+    configured_mode = int(configured_mode)
+    # 内容相关性过滤：命中 scope 的文章在原护栏三道闸之外也要校验，覆盖「直发稿」
+    # 与「league 路径」这两类原本被跳过的入口（intl→硬挂栏目→直发是重灾区）。
+    scope_raw = (config.relevance_guard_scope or "").strip().lower()
+    scope_all = scope_raw == "all"
+    scope_codes = {code for code in (c.strip() for c in scope_raw.split(",")) if code}
+    route_league = str(article.get("route_league") or "").strip().lower()
+    in_relevance_scope = bool(
+        config.relevance_guard_enabled
+        and (scope_all or (route_league and route_league in scope_codes))
+    )
+
+    # 闸1：原本直发稿一律不校验；命中相关性 scope 时也放进来（直发稿只做改挂 / 降级，
+    # 不反向升级）。
+    if configured_mode != 0 and not in_relevance_scope:
+        return configured_mode, article
+    # 闸2：原本 league 路径（route_league 非空且规则没开 ai_guard_enabled）直接跳过；
+    # 命中相关性 scope 时覆盖这道跳过。
+    if (
+        route_league
+        and not repo.event_tab_rule_allows_ai_guard(article.get("route_rule_id"), connection)
+        and not in_relevance_scope
     ):
-        return int(configured_mode), article
+        return configured_mode, article
+    # 闸3：原本要求栏目显式开 ai_league_guard_enabled；命中 scope 时放宽为「栏目配了
+    # 定义即可」，否则 intl→国家队 这类即便进来也因没开开关而无栏目可校验。精选等泛
+    # 栏目没有定义，天然被排除，通用新闻不会被误判。
     guard_tab = next(
         (tab for tab in tabs if int(tab.get("ai_league_guard_enabled") or 0) == 1),
         None,
     )
+    if guard_tab is None and in_relevance_scope:
+        guard_tab = next(
+            (
+                tab
+                for tab in tabs
+                if str(tab.get("ai_league_guard_definition") or "").strip()
+            ),
+            None,
+        )
     if guard_tab is None:
-        return int(configured_mode), article
+        return configured_mode, article
 
     tab_name = str(guard_tab.get("name") or "")
     definition = str(guard_tab.get("ai_league_guard_definition") or "")
     upgrade_reason: str | None = None
     keep_reason: str | None = None
+    homeless_confident: bool = False
     verdict: dict[str, Any] | None = None
     fallback_verdict: dict[str, Any] | None = None
     fallback_tab_name: str | None = None
@@ -452,11 +483,24 @@ def _apply_ai_league_guard(
                 verdict["belongs"] is True
                 and verdict["confidence"] >= config.league_guard_min_confidence
             ):
-                upgrade_reason = (
-                    f"AI 判断本篇属于「{tab_name or '兜底栏目'}」"
-                    f"（confidence={verdict['confidence']:.2f}），"
-                    f"已升级为直接发布：{verdict['reason']}"
-                )
+                if configured_mode != 0:
+                    # 已经是直发（相关性 scope 放进来的直发稿）：确认归属即可，无需升级。
+                    keep_reason = (
+                        f"AI 确认本篇属于「{tab_name or '兜底栏目'}」"
+                        f"（confidence={verdict['confidence']:.2f}），保持直接发布"
+                    )
+                elif config.relevance_guard_keep_upgrade:
+                    upgrade_reason = (
+                        f"AI 判断本篇属于「{tab_name or '兜底栏目'}」"
+                        f"（confidence={verdict['confidence']:.2f}），"
+                        f"已升级为直接发布：{verdict['reason']}"
+                    )
+                else:
+                    keep_reason = (
+                        f"AI 判断本篇属于「{tab_name or '兜底栏目'}」"
+                        f"（confidence={verdict['confidence']:.2f}），"
+                        f"升级开关已关闭，维持创建草稿：{verdict['reason']}"
+                    )
             elif config.league_guard_classifier_enabled:
                 # 分类模式：不再逐个追问预配候选，一次调用就在全部候选栏目里选一个。
                 # 覆盖面因此与 tabs.ai_fallback_tab_ids 配过没有无关——线上近半数
@@ -490,6 +534,11 @@ def _apply_ai_league_guard(
                         else None
                     )
                     if routed_row is None:
+                        # 直发稿的降级闸门：只有高置信「谁都不属于」才拦；低置信留给
+                        # 下面的 fail-open 分支放行，绝不因不确定而少发。
+                        homeless_confident = (
+                            routed_confidence >= config.relevance_guard_min_confidence
+                        )
                         keep_reason = (
                             f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」，"
                             f"也不属于任何候选栏目，维持创建草稿：{routed_reason}"
@@ -604,8 +653,19 @@ def _apply_ai_league_guard(
             effective_mode = int(fallback_publish_mode or 0)
     elif upgrade_reason:
         effective_mode = 1 if repo.is_active_tab(guard_tab) else 0
+    elif configured_mode != 0 and homeless_confident:
+        # 直发稿被高置信判为「谁都不属于任何栏目」→ 降级草稿送审（相关性过滤的拦截
+        # 动作）。只有高置信才降级，低置信 / 调用失败走下面 fail-open 保持直发。
+        effective_mode = 0
     else:
+        # fail-open：直发稿维持直发、草稿维持草稿，绝不因不确定少发。
         effective_mode = int(configured_mode)
+    relevance_downgraded = (
+        fallback_tab_id is None
+        and not upgrade_reason
+        and configured_mode != 0
+        and effective_mode == 0
+    )
     final_tab_id = guard_tab.get("id")
     final_tab_name = tab_name
 
@@ -640,7 +700,9 @@ def _apply_ai_league_guard(
         "guard_tab_name": tab_name,
         "configured_publish_mode": int(configured_mode),
         "effective_publish_mode": effective_mode,
-        "upgraded_to_publish": effective_mode != int(configured_mode),
+        # 只有「草稿→直发」才算升级；直发稿被相关性过滤降级（1→0）不是升级，单列字段。
+        "upgraded_to_publish": effective_mode == 1 and int(configured_mode) == 0,
+        "downgraded_from_direct": relevance_downgraded,
         "reassigned_tab_id": fallback_tab_id,
         "reassigned_tab_active": fallback_tab_active if fallback_tab_id is not None else None,
         "classifier_used": classifier_result is not None,
@@ -671,6 +733,20 @@ def _apply_ai_league_guard(
             "LEAGUE_GUARD_UPGRADED",
             connection,
             message=upgrade_reason,
+            payload=guard_record,
+            from_status=str(article.get("status") or "READY_TO_PUBLISH"),
+            to_status=str(article.get("status") or "READY_TO_PUBLISH"),
+        )
+    elif relevance_downgraded:
+        repo.add_article_event(
+            int(article["id"]),
+            "RELEVANCE_DOWNGRADED",
+            connection,
+            message=(
+                f"相关性过滤：AI 判本篇不属于「{tab_name}」且无栏目可归属"
+                f"（confidence={float((classifier_result or {}).get('confidence') or 0):.2f}），"
+                f"已从直发降级为创建草稿"
+            ),
             payload=guard_record,
             from_status=str(article.get("status") or "READY_TO_PUBLISH"),
             to_status=str(article.get("status") or "READY_TO_PUBLISH"),

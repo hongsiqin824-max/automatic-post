@@ -15,7 +15,7 @@ from .article_images import (
     effective_litpic,
     fallback_litpic_for_tabs,
 )
-from .channel_filter import filter_blocked_channels
+from .channel_filter import filter_blocked_channels, filter_to_tab_whitelist
 from .dqd_publish_html import DqdPublishHtmlError, sanitize_dqd_publish_html
 from .link_sanitizer import preprocess_quality_body, remove_clickable_links
 from .quality import html_to_text
@@ -172,11 +172,18 @@ def build_create_article_form(
     # 上游没有幂等请求键，client_request_id 只做本地审计，绝不作为表单字段发送。
     fields.extend(_publish_account_fields(publish_account))
     fields.extend(("tabs[]", str(tab_id)) for tab_id in backend_tab_ids)
-    channels = filter_blocked_channels(article.get("channels") or [])
+    # 先按栏目联赛白名单收敛（只保留本栏目联赛的球队/球员标签，解决乱打标签），
+    # 再叠加全局黑名单（通用后台标签、大联赛标签等一律删）。白名单无数据时放行，
+    # 不会误清空。非联赛栏目没有白名单，等同只走黑名单，行为与改造前一致。
+    channels = filter_blocked_channels(
+        filter_to_tab_whitelist(article.get("channels") or [], backend_tab_ids)
+    )
     if channels:
         channel_values = ",".join(str(int(value)) for value in channels)
         fields.append(("channels", channel_values))
-    channelsnew = filter_blocked_channels(article.get("channelsnew") or [])
+    channelsnew = filter_blocked_channels(
+        filter_to_tab_whitelist(article.get("channelsnew") or [], backend_tab_ids)
+    )
     if channelsnew:
         channel_values = ",".join(str(int(value)) for value in channelsnew)
         fields.append(("channelsnew", channel_values))

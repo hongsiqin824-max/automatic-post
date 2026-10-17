@@ -3353,6 +3353,111 @@ def get_league_tab_click_stats(connection=None, *, since: str = "") -> dict:
     }
 
 
+def replace_competition_tags(
+    competition_id: int,
+    season_id: int,
+    team_channel_ids: Iterable[int],
+    player_channel_ids: Iterable[int],
+    connection=None,
+) -> int:
+    """原子替换某 competition 的全部标签（先删后插，同一事务）。
+
+    调用前应已通过安全校验；这里只负责落库。返回写入的标签总数。
+    """
+    conn = _conn(connection)
+    cid = int(competition_id)
+    sid = int(season_id)
+    now = _now()
+    rows: list[tuple] = []
+    seen: set[int] = set()
+    for channel_id in team_channel_ids:
+        cval = int(channel_id)
+        if cval not in seen:
+            seen.add(cval)
+            rows.append((cid, cval, "Team", sid, now))
+    for channel_id in player_channel_ids:
+        cval = int(channel_id)
+        if cval not in seen:
+            seen.add(cval)
+            rows.append((cid, cval, "Player", sid, now))
+    with conn:
+        conn.execute("DELETE FROM competition_channel_tags WHERE competition_id=?", (cid,))
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO competition_channel_tags
+                    (competition_id, channel_id, tag_type, season_id, updated_at)
+                VALUES (?,?,?,?,?)
+                """,
+                rows,
+            )
+    return len(rows)
+
+
+def mark_competition_tag_run(
+    competition_id: int,
+    connection=None,
+    *,
+    status: str = "SUCCESS",
+    season_id: Optional[int] = None,
+    team_count: int = 0,
+    player_count: int = 0,
+    error: Optional[str] = None,
+) -> None:
+    """记录某 competition 本次刷新结果（SUCCESS/FAILED/REJECTED）。"""
+    conn = _conn(connection)
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO competition_tag_runs
+                (competition_id, status, season_id, team_count, player_count,
+                 total_count, error, fetched_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(competition_id) DO UPDATE SET
+                status=excluded.status, season_id=excluded.season_id,
+                team_count=excluded.team_count, player_count=excluded.player_count,
+                total_count=excluded.total_count, error=excluded.error,
+                fetched_at=excluded.fetched_at
+            """,
+            (
+                int(competition_id),
+                str(status).upper(),
+                None if season_id is None else int(season_id),
+                int(team_count),
+                int(player_count),
+                int(team_count) + int(player_count),
+                error,
+                _now(),
+            ),
+        )
+
+
+def get_competition_tag_run(competition_id: int, connection=None) -> Optional[dict]:
+    """取某 competition 上一次刷新记录，用于骤降保护的基线比较。"""
+    return _row(_conn(connection).execute(
+        "SELECT * FROM competition_tag_runs WHERE competition_id=?",
+        (int(competition_id),),
+    ).fetchone())
+
+
+def list_competition_tag_runs(connection=None) -> list[dict]:
+    """全部刷新记录，按最近拉取时间倒序，供观测/诊断。"""
+    return _rows(_conn(connection).execute(
+        "SELECT * FROM competition_tag_runs ORDER BY fetched_at DESC"
+    ).fetchall())
+
+
+def load_competition_channel_tags(connection=None) -> dict[int, set[int]]:
+    """把表加载成 {competition_id: {channel_id, ...}}，供构建内存白名单。"""
+    rows = _conn(connection).execute(
+        "SELECT competition_id, channel_id FROM competition_channel_tags"
+    ).fetchall()
+    result: dict[int, set[int]] = {}
+    for row in rows:
+        result.setdefault(int(row["competition_id"]), set()).add(int(row["channel_id"]))
+    return result
+
+
 def get_setting(key: str, default: Any = None, connection=None):
     row = _conn(connection).execute("SELECT value_json FROM settings WHERE key=?", (str(key),)).fetchone()
     return default if row is None else _loads(row["value_json"], default)

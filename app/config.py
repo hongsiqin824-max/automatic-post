@@ -255,6 +255,24 @@ class AppConfig:
     feishu_spreadsheet_token: str = os.getenv("FEISHU_SPREADSHEET_TOKEN", "").strip()
     feishu_api_timeout_seconds: int = max(5, _env_int("FEISHU_API_TIMEOUT_SECONDS", 30))
 
+    # 栏目标签白名单：每天从 StarRocks 按「进行中赛季」拉取各联赛的球队/球员
+    # 标签，写进本地表后在提交懂球帝前把文章标签过滤到所属栏目联赛的范围内，
+    # 解决上游乱打标签。StarRocks 连接参数复用 league_clicks 的 resolve_credentials。
+    competition_tags_enabled: bool = _env_bool("AUTOMATIC_POST_COMPETITION_TAGS_ENABLED", True)
+    competition_tags_hour: int = max(0, min(23, _env_int("AUTOMATIC_POST_COMPETITION_TAGS_HOUR", 4)))
+    competition_tags_minute: int = max(0, min(59, _env_int("AUTOMATIC_POST_COMPETITION_TAGS_MINUTE", 0)))
+    competition_tags_check_interval_seconds: int = max(
+        15, min(3600, _env_int("AUTOMATIC_POST_COMPETITION_TAGS_CHECK_INTERVAL_SECONDS", 60))
+    )
+    # 与上一次成功相比，球队/球员数骤降超过该比例则拒绝覆盖、保留上一版 good 数据，
+    # 防赛季切换瞬间 season_teams 尚未灌满导致白名单塌缩误删标签。
+    competition_tags_max_drop_ratio: float = max(
+        0.0, min(1.0, _env_float("AUTOMATIC_POST_COMPETITION_TAGS_MAX_DROP_RATIO", 0.5))
+    )
+    competition_tags_query_timeout_seconds: int = max(
+        30, min(1800, _env_int("AUTOMATIC_POST_COMPETITION_TAGS_QUERY_TIMEOUT_SECONDS", 180))
+    )
+
     # Open-platform article creation is a write operation, so it stays behind
     # an explicit flag even when credentials are present.
     publisher_enabled: bool = _env_bool("AUTOMATIC_POST_PUBLISHER", False)
@@ -326,6 +344,29 @@ class AppConfig:
         frozenset({"target", "always_direct"}),
     )
 
+    # 内容相关性过滤（全量 AI 归属校验的扩展）。原护栏三道闸只在「草稿模式 + 非
+    # league 路径 + 栏目显式开 ai_league_guard_enabled」时才跑，于是 intl 这类
+    # catch-all 标记硬挂栏目后直发，全程没看过内容。开启后对 scope 命中的来源在发布
+    # 前补跑一次归属校验：挂错的改挂、确属的保留、高置信「谁都不属于」的直发稿降级为
+    # 草稿送审；拿不准 / 调用失败一律放行（fail-open），绝不因不确定而少发。
+    relevance_guard_enabled: bool = _env_bool(
+        "AUTOMATIC_POST_RELEVANCE_GUARD_ENABLED", True
+    )
+    # 生效范围：填 route_league 短码名单（逗号分隔，如 "intl,asia"），或 "all" 覆盖
+    # 全部。默认只打最脏的 catch-all 入口 intl，验证后再放量。
+    relevance_guard_scope: str = os.getenv(
+        "AUTOMATIC_POST_RELEVANCE_GUARD_SCOPE", "intl"
+    ).strip()
+    # 直发稿被判「谁都不属于任何栏目」要降级草稿，至少要这么大的把握，防误伤少发。
+    relevance_guard_min_confidence: float = max(
+        0.0, min(1.0, _env_float("AUTOMATIC_POST_RELEVANCE_GUARD_MIN_CONFIDENCE", 0.9))
+    )
+    # 是否保留「判定确属当前栏目 → 把草稿升级为直接发布」这个现有行为。关掉后确属的
+    # 草稿仍留草稿，只做改挂与拦截。
+    relevance_guard_keep_upgrade: bool = _env_bool(
+        "AUTOMATIC_POST_RELEVANCE_GUARD_KEEP_UPGRADE", True
+    )
+
     # Concurrent quality workers per ingestion run; 1 keeps serial behavior.
     quality_workers: int = max(1, min(8, _env_int("AUTOMATIC_POST_QUALITY_WORKERS", 4)))
 
@@ -377,6 +418,12 @@ class AppConfig:
             and self.source_report_webhook_url
             and self.source_report_boundaries
         )
+
+    @property
+    def competition_tags_configured(self) -> bool:
+        # StarRocks 凭据在 competition_tags.resolve_credentials 里判定（复用
+        # league_clicks 的回退逻辑），这里只反映开关。
+        return bool(self.competition_tags_enabled)
 
     @property
     def feishu_spreadsheet_configured(self) -> bool:

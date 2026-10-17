@@ -164,11 +164,84 @@ def filter_blocked_channels(channels: Iterable[Any] | None) -> list[int]:
 
     if channels is None:
         return []
+    blocked = BLOCKED_CHANNEL_IDS | _DYNAMIC_BLOCKED
     result: list[int] = []
     seen: set[int] = set()
     for raw in channels:
         channel_id = int(raw)
-        if channel_id in BLOCKED_CHANNEL_IDS or channel_id in seen:
+        if channel_id in blocked or channel_id in seen:
+            continue
+        seen.add(channel_id)
+        result.append(channel_id)
+    return result
+
+
+# 动态黑名单：大联赛/中超/中甲中乙「进行中赛季」的球队/球员标签，由
+# competition_tags.reload_tag_caches 从本地表刷新注入，叠加在静态 BLOCKED_CHANNEL_IDS
+# 之上。保持新鲜（随转会/升降级更新），静态常量仍兜底，import 无副作用。
+_DYNAMIC_BLOCKED: frozenset[int] = frozenset()
+
+
+def set_dynamic_blocked(channel_ids: Iterable[int] | None) -> None:
+    """Replace the in-memory dynamic blacklist (called after each refresh)."""
+
+    global _DYNAMIC_BLOCKED
+    _DYNAMIC_BLOCKED = frozenset(int(cid) for cid in (channel_ids or []))
+
+
+# 按栏目（backend_tab_id）的标签白名单，运行时由 competition_tags.reload_tag_caches
+# 从本地表构建后注入。模块级缓存让过滤在热路径上保持 O(1)，且 channel_filter 本身
+# 不依赖数据库，import 无副作用。数据未加载时字典为空 —— 白名单一律放行（故障关闭
+# 的方向是「不要误删」），绝不因缺数据把文章标签清空。
+_ALLOWED_BY_TAB: dict[int, frozenset[int]] = {}
+
+
+def set_tab_whitelist(allowed_by_tab: dict[int, Iterable[int]] | None) -> None:
+    """Replace the in-memory per-tab whitelist (called after each refresh)."""
+
+    global _ALLOWED_BY_TAB
+    _ALLOWED_BY_TAB = {
+        int(tab_id): frozenset(int(cid) for cid in ids)
+        for tab_id, ids in (allowed_by_tab or {}).items()
+        if ids
+    }
+
+
+def tab_has_whitelist(backend_tab_ids: Iterable[Any] | None) -> bool:
+    """Whether any of the given backend tab ids carries a whitelist set."""
+
+    if not backend_tab_ids:
+        return False
+    return any(int(tab_id) in _ALLOWED_BY_TAB for tab_id in backend_tab_ids)
+
+
+def filter_to_tab_whitelist(
+    channels: Iterable[Any] | None, backend_tab_ids: Iterable[Any] | None
+) -> list[int]:
+    """Keep only channel IDs allowed by the article's league tab(s).
+
+    If none of the article's tabs has a configured whitelist (e.g. non-league
+    columns such as 头条/快讯, or the whitelist data has not been loaded yet),
+    the channels pass through unchanged so a missing dataset never strips an
+    article's tags.  Order and uniqueness match ``filter_blocked_channels``.
+    """
+
+    if channels is None:
+        return []
+    allowed: set[int] = set()
+    has_whitelist = False
+    for tab_id in (backend_tab_ids or []):
+        tab_set = _ALLOWED_BY_TAB.get(int(tab_id))
+        if tab_set:
+            has_whitelist = True
+            allowed |= tab_set
+    result: list[int] = []
+    seen: set[int] = set()
+    for raw in channels:
+        channel_id = int(raw)
+        if channel_id in seen:
+            continue
+        if has_whitelist and channel_id not in allowed:
             continue
         seen.add(channel_id)
         result.append(channel_id)

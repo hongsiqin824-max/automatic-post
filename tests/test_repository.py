@@ -25,7 +25,7 @@ def _material(**overrides):
 
 def test_catalog_is_seeded_and_disabled_by_default(app):
     with app.app_context():
-        assert len(repo.list_tabs()) == 35
+        assert len(repo.list_tabs()) == 36
         sources = repo.list_sources()
         assert len(sources) == 85
         assert not any(row["enabled"] for row in sources)

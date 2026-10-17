@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from app.services.channel_filter import BLOCKED_CHANNEL_IDS, filter_blocked_channels
+import pytest
+
+from app.services.channel_filter import (
+    BLOCKED_CHANNEL_IDS,
+    filter_blocked_channels,
+    filter_to_tab_whitelist,
+    set_tab_whitelist,
+    tab_has_whitelist,
+)
 
 
 def test_filter_blocked_channels_matches_exact_ids_and_preserves_order():
@@ -37,3 +45,38 @@ def test_filter_blocked_channels_allows_empty_input():
 
 def test_filter_blocked_channels_removes_every_configured_blacklist_id():
     assert filter_blocked_channels(sorted(BLOCKED_CHANNEL_IDS)) == []
+
+
+@pytest.fixture()
+def _reset_whitelist():
+    """Keep the module-level whitelist out of other tests."""
+    set_tab_whitelist(None)
+    yield
+    set_tab_whitelist(None)
+
+
+def test_whitelist_passthrough_when_tab_has_no_set(_reset_whitelist):
+    # 非联赛栏目（没有白名单）原样放行，仅去重。
+    set_tab_whitelist({348: {111, 222}})
+    assert filter_to_tab_whitelist([111, 999, 999], [1]) == [111, 999]
+    assert not tab_has_whitelist([1])
+
+
+def test_whitelist_keeps_only_in_league_tags(_reset_whitelist):
+    set_tab_whitelist({348: {111, 222}})
+    # 栏目 348 有白名单：集合外的 999 被剔除，顺序与去重保持。
+    assert filter_to_tab_whitelist([999, 111, 222, 111], [348]) == [111, 222]
+    assert tab_has_whitelist([348])
+
+
+def test_whitelist_passthrough_when_cache_empty(_reset_whitelist):
+    # 数据未加载（缓存空）时绝不清空文章标签，而是放行。
+    assert filter_to_tab_whitelist([111, 222], [348]) == [111, 222]
+
+
+def test_whitelist_then_blacklist_compose(_reset_whitelist):
+    # 提交前的真实顺序：先白名单收敛再叠加黑名单。89 是黑名单国家队标签，
+    # 700000111 是任何黑名单都没有的任意 ID。
+    set_tab_whitelist({348: {700000111, 222, 89}})
+    kept = filter_blocked_channels(filter_to_tab_whitelist([89, 700000111, 999], [348]))
+    assert kept == [700000111]

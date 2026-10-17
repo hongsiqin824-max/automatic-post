@@ -34,6 +34,11 @@ from .services.scheduler import Scheduler
 from .services.feishu_report import FeishuReportController, FeishuReportScheduler
 from .services.league_clicks import LeagueClicksController, LeagueClicksScheduler
 from .services.league_clicks_weekly import LeagueClicksWeeklyController, LeagueClicksWeeklyScheduler
+from .services.competition_tags import (
+    CompetitionTagsController,
+    CompetitionTagsScheduler,
+    reload_tag_caches,
+)
 from .services.dqd_open_client import DqdOpenClientError
 from .services.publisher import (
     DraftClaimSkipped,
@@ -305,6 +310,7 @@ def _article_view(article: dict | None) -> dict | None:
         # 直发没落地时点明真实原因：几乎总是翻译没跑干净触发了语言护栏，笼统说
         # 「未生效」看不出该做什么。兜底那句留给将来可能新增的降级关卡。
         blocked_suffix = "但正文非中文降级草稿" if language_downgraded else "但直发未生效"
+        relevance_downgraded = bool(guard.get("downgraded_from_direct"))
         if reassigned:
             # 改挂与发布模式解耦：目标栏目停用、或目标栏目自身配置为草稿时，栏目
             # 纠正了但文章仍留在草稿。改挂要先于直发判断，否则这两种情况会被混进
@@ -328,6 +334,15 @@ def _article_view(article: dict | None) -> dict | None:
                 )
                 item["league_guard_state"] = "kept"
                 item["league_guard_label"] = f"{moved}{disabled}仅草稿"
+        elif relevance_downgraded:
+            # 内容相关性过滤：直发稿被高置信判为谁都不属于，已降级草稿送审。
+            item["league_guard_state"] = "downgraded"
+            label = (
+                f"AI：不属于「{guard_tab_name}」已降级草稿"
+                if guard_tab_name
+                else "AI：无对应栏目已降级草稿"
+            )
+            item["league_guard_label"] = label
         elif guard_wants_direct and direct_applied:
             item["league_guard_state"] = "upgraded"
             item["league_guard_label"] = f"AI：属于「{guard_tab_name}」已升级直发"
@@ -799,6 +814,11 @@ def create_app(test_config: dict | None = None) -> Flask:
         league_clicks_weekly_controller,
         cfg.league_clicks_weekly_check_interval_seconds,
     )
+    competition_tags_controller = CompetitionTagsController(cfg)
+    competition_tags_scheduler = CompetitionTagsScheduler(
+        competition_tags_controller,
+        cfg.competition_tags_check_interval_seconds,
+    )
     # The independent publish worker drains READY_TO_PUBLISH on its own cadence
     # and already reconciles due draft confirmations, so it takes the scheduler's
     # maintenance slot when enabled. Turning it off falls back to the original
@@ -826,6 +846,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.extensions["league_clicks_scheduler"] = league_clicks_scheduler
     app.extensions["league_clicks_weekly_controller"] = league_clicks_weekly_controller
     app.extensions["league_clicks_weekly_scheduler"] = league_clicks_weekly_scheduler
+    app.extensions["competition_tags_controller"] = competition_tags_controller
+    app.extensions["competition_tags_scheduler"] = competition_tags_scheduler
     app.extensions["scheduler"] = scheduler
     with app.app_context():
         scheduler_enabled = bool(repo.get_setting("scheduler_enabled", cfg.scheduler_enabled))
@@ -839,6 +861,15 @@ def create_app(test_config: dict | None = None) -> Flask:
         league_clicks_scheduler.start()
     if cfg.feishu_spreadsheet_configured and not app.config.get("TESTING") and not test_config:
         league_clicks_weekly_scheduler.start()
+    # 无论调度是否启用，启动时都把已有的栏目标签白名单载入内存缓存，
+    # 这样即使本次不触发刷新，提交懂球帝前的白名单过滤也能立即生效。
+    with app.app_context():
+        try:
+            reload_tag_caches(get_db())
+        except Exception:
+            app.logger.exception("栏目标签白名单加载失败")
+    if cfg.competition_tags_enabled and not app.config.get("TESTING") and not test_config:
+        competition_tags_scheduler.start()
 
     app.jinja_env.globals["cdn_url"] = cdn_url
     app.jinja_env.globals["status_label"] = lambda value: STATUS_LABELS.get(value, value)

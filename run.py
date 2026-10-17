@@ -11,6 +11,7 @@ from app.db import _connect, init_db
 from app.services.pipeline import run_once
 from app.services.feishu_report import send_due_report
 from app.services.source_report import send_due_source_report
+from app.services.competition_tags import sync_due as sync_competition_tags
 from app.web import create_app
 
 
@@ -46,8 +47,17 @@ def main() -> int:
             connection.close()
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if not result.get("failed") else 1
+    if mode == "competition-tags":
+        init_db(config.database_path)
+        connection = _connect(config.database_path)
+        try:
+            result = sync_competition_tags(config, connection, force=True)
+        finally:
+            connection.close()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if not result.get("failed") else 1
     if mode != "web":
-        print("用法: python run.py [web|once|report|source-report]")
+        print("用法: python run.py [web|once|report|source-report|competition-tags]")
         return 2
     app = create_app()
     print(f"\n文章质检台已启动: http://{config.host}:{config.port}\n")

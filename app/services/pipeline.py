@@ -1915,6 +1915,14 @@ def _run_once_locked(config: AppConfig, *, database_path: str | None = None) -> 
     except Exception:
         conn.close()
         raise
+    # Warm the per-tab channel whitelist from local data so the publish step
+    # of a standalone ``run.py once`` process (no create_app) also applies it.
+    try:
+        from .competition_tags import reload_tag_caches
+
+        reload_tag_caches(conn)
+    except Exception:  # noqa: BLE001 - a missing whitelist must not stop ingestion
+        logger.exception("栏目标签白名单加载失败")
     fetched = inserted = updated = errors = 0
     status_counts: dict[str, int] = {}
     failed_items: list[dict[str, str]] = []
