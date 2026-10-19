@@ -485,13 +485,17 @@ class CompetitionTagsController:
         return True
 
     def _run(self) -> None:
-        conn = _connect(self.config.database_path)
+        # _connect 必须在 try 里：连接失败（如 SQLite 瞬时 authorization denied）
+        # 时也要走 finally 复位 _running，否则线程永久卡死、再也不刷新。
+        conn = None
         try:
+            conn = _connect(self.config.database_path)
             self._last_result = sync_due(self.config, conn)
         except Exception:  # noqa: BLE001 - keep future scheduler ticks alive
             logger.exception("联赛标签同步任务失败")
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
             with self._lock:
                 self._running = False
 

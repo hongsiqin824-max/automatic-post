@@ -1660,13 +1660,16 @@ class DraftConfirmationController:
         return True
 
     def _run(self) -> None:
-        connection = _connect(self.config.database_path)
+        # _connect 必须在 try 里，连接失败也要复位 _running，否则线程永久卡死。
+        connection = None
         try:
+            connection = _connect(self.config.database_path)
             confirm_due_draft_results(self.config, connection)
         except Exception:  # noqa: BLE001 - keep future confirmation ticks alive
             logger.exception("自动核对草稿结果失败")
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
             with self._lock:
                 self._running = False
 
@@ -1981,15 +1984,18 @@ class PublishController:
             return {"running": self._running, "last_result": self._last_result}
 
     def _run(self) -> None:
-        connection = _connect(self.config.database_path)
+        # _connect 必须在 try 里，连接失败也要复位 _running，否则线程永久卡死。
+        connection = None
         try:
+            connection = _connect(self.config.database_path)
             result = publish_ready_articles(self.config, connection)
             with self._lock:
                 self._last_result = result
         except Exception:  # noqa: BLE001 - keep future publish ticks alive
             logger.exception("独立发布 worker 执行失败")
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
             with self._lock:
                 self._running = False
 

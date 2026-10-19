@@ -170,3 +170,31 @@ def test_national_column_has_no_whitelist_clubs_kept(app):
         assert published == [500, 600, 1568]
     channel_filter.set_tab_whitelist(None)
     channel_filter.set_dynamic_blocked(None)
+
+
+def test_controller_recovers_when_connect_fails(monkeypatch):
+    """_connect 抛错（线上实测 SQLite 瞬时 authorization denied）后 _running 必须复位。
+
+    回归：原实现把 _connect 放在 try 外，连接失败时 finally 不执行，_running 永远
+    为 True，调度器之后每次 start() 都返回 False，白名单从此不再刷新。
+    """
+    import sqlite3
+    import time
+
+    calls: list[str] = []
+
+    def boom(_path):
+        calls.append("connect")
+        raise sqlite3.DatabaseError("authorization denied")
+
+    monkeypatch.setattr(ct, "_connect", boom)
+    controller = ct.CompetitionTagsController(_cfg())
+    assert controller.start() is True
+    for _ in range(50):
+        if not controller._running:
+            break
+        time.sleep(0.02)
+    assert controller._running is False
+    assert calls == ["connect"]
+    # 下一轮必须还能启动，而不是被卡死的 _running 拒绝。
+    assert controller.start() is True

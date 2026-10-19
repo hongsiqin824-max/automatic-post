@@ -209,13 +209,16 @@ class FeishuReportController:
         return True
 
     def _run(self) -> None:
-        conn = _connect(self.config.database_path)
+        # _connect 必须在 try 里，连接失败也要复位 _running，否则线程永久卡死。
+        conn = None
         try:
+            conn = _connect(self.config.database_path)
             send_due_report(self.config, conn)
         except Exception:  # noqa: BLE001 - keep future scheduler ticks alive
             logger.exception("飞书统计任务失败")
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
             with self._lock:
                 self._running = False
 
