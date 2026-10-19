@@ -420,12 +420,6 @@ class AppConfig:
         )
 
     @property
-    def competition_tags_configured(self) -> bool:
-        # StarRocks 凭据在 competition_tags.resolve_credentials 里判定（复用
-        # league_clicks 的回退逻辑），这里只反映开关。
-        return bool(self.competition_tags_enabled)
-
-    @property
     def feishu_spreadsheet_configured(self) -> bool:
         return bool(
             self.league_clicks_weekly_enabled

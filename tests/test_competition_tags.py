@@ -79,7 +79,63 @@ def test_sync_competition_success_then_rejected_keeps_old(monkeypatch, tmp_path)
     assert len(tags[257]) == 320  # unchanged
     run = repo.get_competition_tag_run(257, conn)
     assert run["status"] == "REJECTED"
+
+    # 第二轮同样塌缩的数据必须仍被拒：基线读的是本地标签表（320），
+    # 不是被 REJECTED 覆盖掉的 runs 行（2）。
+    result = ct.sync_competition(cfg, 257, conn)
+    assert result["status"] == "REJECTED"
+    assert len(repo.load_competition_channel_tags(conn)[257]) == 320
     conn.close()
+
+
+def test_sync_due_all_failed_does_not_mark_day_and_cools_down(monkeypatch, tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    database = str(tmp_path / "ct.sqlite3")
+    init_db(database)
+    conn = _connect(database)
+    cfg = _cfg(competition_tags_hour=4, competition_tags_minute=0)
+    monkeypatch.setattr(ct, "credentials_configured", lambda config: True)
+
+    def _boom(config, cid):
+        raise RuntimeError("starrocks down")
+
+    monkeypatch.setattr(ct, "fetch_competition", _boom)
+    now = datetime(2026, 10, 20, 2, 0, tzinfo=timezone.utc)  # 北京 10:00，已过 04:00
+    result = ct.sync_due(cfg, conn, now)
+    assert result["ran"] is True
+    assert result["failed"] == len(ct._all_competition_ids())
+    # 整轮全失败：不记当天，但进入冷却。
+    assert repo.get_setting(ct._LAST_SYNC_SETTING, default="", connection=conn) == ""
+    assert ct._is_due(cfg, conn, now + timedelta(minutes=5)) is False
+    assert ct._is_due(cfg, conn, now + timedelta(seconds=ct._FAILED_RETRY_SECONDS + 1)) is True
+
+    # 冷却后恢复：拉到数据就记当天。
+    monkeypatch.setattr(
+        ct, "fetch_competition",
+        lambda config, cid: {"season_id": 1, "team_ids": [1], "player_ids": [2]},
+    )
+    later = now + timedelta(hours=2)
+    result = ct.sync_due(cfg, conn, later)
+    assert result["ran"] is True and result["success"] > 0
+    assert repo.get_setting(ct._LAST_SYNC_SETTING, default="", connection=conn) == "2026-10-20"
+    assert ct._is_due(cfg, conn, later + timedelta(minutes=5)) is False
+    conn.close()
+
+
+def test_reload_tag_caches_warns_when_routed_tab_missing(app, monkeypatch, caplog):
+    import logging
+
+    with app.app_context():
+        conn = get_db()
+        repo.replace_competition_tags(257, 100, [111], [333], conn)
+        monkeypatch.setattr(ct, "_WHITELIST_ROUTING", ((257, "不存在的栏目"),))
+        with caplog.at_level(logging.WARNING, logger=ct.logger.name):
+            caches = ct.reload_tag_caches(conn)
+        assert caches["tabs"] == {}
+        assert any("不存在的栏目" in record.getMessage() for record in caplog.records)
+    channel_filter.set_tab_whitelist(None)
+    channel_filter.set_dynamic_blocked(None)
 
 
 def test_reload_tag_caches_builds_tab_whitelist(app):

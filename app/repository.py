@@ -3453,11 +3453,30 @@ def mark_competition_tag_run(
 
 
 def get_competition_tag_run(competition_id: int, connection=None) -> Optional[dict]:
-    """取某 competition 上一次刷新记录，用于骤降保护的基线比较。"""
+    """取某 competition 上一次刷新记录（SUCCESS/FAILED/REJECTED 任一），供观测。"""
     return _row(_conn(connection).execute(
         "SELECT * FROM competition_tag_runs WHERE competition_id=?",
         (int(competition_id),),
     ).fetchone())
+
+
+def count_competition_tags(competition_id: int, connection=None) -> dict[str, int]:
+    """数某 competition 本地现存的球队/球员标签数，作为骤降保护的基线。
+
+    基线必须读标签表而不是 runs 表：runs 一个 competition 一行，REJECTED 也会
+    覆盖进去，拿它当基线会在被拒的下一轮失去比较对象、把塌缩数据放行。标签表
+    只在校验通过后才被替换，数出来的就是「上次被接受的那版」。
+    """
+    rows = _conn(connection).execute(
+        "SELECT tag_type, COUNT(*) AS count FROM competition_channel_tags "
+        "WHERE competition_id=? GROUP BY tag_type",
+        (int(competition_id),),
+    ).fetchall()
+    counts = {"team_count": 0, "player_count": 0}
+    for row in rows:
+        key = "team_count" if str(row["tag_type"]) == "Team" else "player_count"
+        counts[key] = int(row["count"])
+    return counts
 
 
 def list_competition_tag_runs(connection=None) -> list[dict]:

@@ -190,6 +190,10 @@ def _all_competition_ids() -> list[int]:
     return ordered
 
 _LAST_SYNC_SETTING = "competition_tags_last_sync_date"
+# 整轮全部 FAILED（通常是 StarRocks 连不上）时不记当天已同步，改记失败时刻，
+# 冷却一段时间后再试；既不让一次网络抖动废掉一整天，也不让 60 秒轮询狂刷上游。
+_LAST_FAILED_SETTING = "competition_tags_last_failed_at"
+_FAILED_RETRY_SECONDS = 3600
 
 
 def _connect_starrocks(config: AppConfig):
@@ -285,7 +289,9 @@ def _validate(config: AppConfig, fetched: dict, previous: dict | None) -> tuple[
     """安全校验：决定这批数据能否覆盖本地。
 
     - 拉空（球队或球员为 0）一律拒绝。
-    - 有历史成功基线时，球队或球员数骤降超过阈值则拒绝（防赛季切换塌缩）。
+    - 有本地基线时（``previous`` 为现存标签计数），球队或球员数骤降超过阈值则
+      拒绝（防赛季切换塌缩）。基线来自标签表而非 runs 表，REJECTED 不会污染它，
+      所以连续多轮塌缩每一轮都会被拦住，而不是只挡第一轮。
     返回 ``(accepted, reason)``；reason 为空表示通过。
     """
     team_count = len(fetched["team_ids"])
@@ -295,18 +301,14 @@ def _validate(config: AppConfig, fetched: dict, previous: dict | None) -> tuple[
     if team_count == 0 or player_count == 0:
         return False, f"拉取为空（球队 {team_count} / 球员 {player_count}）"
 
-    prev_ok = (
-        previous is not None
-        and str(previous.get("status")) == "SUCCESS"
-        and int(previous.get("team_count") or 0) > 0
-    )
+    prev_ok = previous is not None and int(previous.get("team_count") or 0) > 0
     if prev_ok:
         keep = 1.0 - float(config.competition_tags_max_drop_ratio)
         min_team = int(int(previous["team_count"]) * keep)
         min_player = int(int(previous["player_count"]) * keep)
         if team_count < min_team or player_count < min_player:
             return False, (
-                f"较上次骤降（球队 {team_count}<{min_team} 或 "
+                f"较本地现有数据骤降（球队 {team_count}<{min_team} 或 "
                 f"球员 {player_count}<{min_player}），保留上一版数据"
             )
         return True, ""
@@ -335,7 +337,7 @@ def sync_competition(config: AppConfig, competition_id: int, connection) -> dict
         )
         return {"competition_id": competition_id, "status": "FAILED", "error": str(exc)[:300]}
 
-    previous = repo.get_competition_tag_run(competition_id, connection)
+    previous = repo.count_competition_tags(competition_id, connection)
     accepted, reason = _validate(config, fetched, previous)
     team_count = len(fetched["team_ids"])
     player_count = len(fetched["player_ids"])
@@ -379,6 +381,12 @@ def reload_tag_caches(connection) -> dict:
             continue
         tab = repo.get_tab_by_name(tab_name, connection)
         if tab is None or tab.get("backend_tab_id") in (None, ""):
+            # 路由按栏目名绑定，栏目改名/删除后白名单会无声失效（退化成只走黑名单，
+            # 标签只多不少，方向安全），但必须留下痕迹方便排查。
+            logger.warning(
+                "联赛标签白名单：栏目「%s」（competition %s）不存在或缺 backend_tab_id，已跳过",
+                tab_name, competition_id,
+            )
             continue
         backend_tab_id = int(tab["backend_tab_id"])
         allowed_by_tab.setdefault(backend_tab_id, set()).update(channel_ids)
@@ -411,7 +419,20 @@ def _is_due(config: AppConfig, connection, now: datetime | None = None) -> bool:
     if not boundary_passed:
         return False
     last = repo.get_setting(_LAST_SYNC_SETTING, default="", connection=connection)
-    return str(last) != local.date().isoformat()
+    if str(last) == local.date().isoformat():
+        return False
+    last_failed = repo.get_setting(_LAST_FAILED_SETTING, default="", connection=connection)
+    if last_failed:
+        try:
+            failed_at = datetime.fromisoformat(str(last_failed).replace("Z", "+00:00"))
+        except ValueError:
+            failed_at = None
+        if failed_at is not None:
+            if failed_at.tzinfo is None:
+                failed_at = failed_at.replace(tzinfo=timezone.utc)
+            if (current - failed_at).total_seconds() < _FAILED_RETRY_SECONDS:
+                return False
+    return True
 
 
 def sync_due(
@@ -434,14 +455,24 @@ def sync_due(
     ]
     caches = reload_tag_caches(connection)
 
-    local = (now or datetime.now(timezone.utc)).astimezone(BEIJING)
-    # 只要本轮没有因异常中断就记为「今天已同步」；REJECTED 属于预期内的安全保留，
-    # 不该让整轮每个周期反复重跑。
-    repo.set_setting(_LAST_SYNC_SETTING, local.date().isoformat(), connection)
-
     success = sum(1 for r in results if r["status"] == "SUCCESS")
     rejected = sum(1 for r in results if r["status"] == "REJECTED")
     failed = sum(1 for r in results if r["status"] == "FAILED")
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    if results and failed == len(results):
+        # 一个都没拉到说明是上游/网络整体故障，不算「今天已同步」，冷却后重试。
+        repo.set_setting(_LAST_FAILED_SETTING, current.isoformat(), connection)
+        logger.warning(
+            "联赛标签本轮全部失败（%d 个），%d 秒后重试", failed, _FAILED_RETRY_SECONDS
+        )
+    else:
+        # 只要有联赛真的拉到了就记为「今天已同步」；REJECTED 属于预期内的安全保留，
+        # 不该让整轮每个周期反复重跑。
+        local = current.astimezone(BEIJING)
+        repo.set_setting(_LAST_SYNC_SETTING, local.date().isoformat(), connection)
+
     return {
         "ran": True,
         "success": success,
