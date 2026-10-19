@@ -2383,6 +2383,54 @@ def test_classifier_keeps_draft_when_no_column_matches(app, monkeypatch):
     assert guard["reassigned_tab_id"] is None
 
 
+def test_draft_belongs_but_low_confidence_skips_classifier_and_says_so(app, monkeypatch):
+    """草稿稿第一问「属于」但置信度不足：不问分类器，理由写「属于但置信度不足」。
+
+    之前这种稿掉进「不属于 → 找候选」流程，草稿路径候选不含原栏目，分类器只能
+    答「候选里没有 X」，最终理由变成「AI 判断不属于 X」，与第一问自相矛盾。
+    """
+
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *args, **kwargs: {
+            "belongs": True, "confidence": 0.8, "reason": "俱乐部综述，核心是 J1 球队",
+        },
+    )
+    classifier_calls: list = []
+    monkeypatch.setattr(
+        "app.services.publisher.classify_article_tab",
+        lambda *args, **kwargs: classifier_calls.append(args) or {
+            "tab_id": None, "confidence": 0.95, "reason": "候选里没有日职联",
+        },
+    )
+
+    with app.app_context():
+        conn = get_db()
+        j1_tab, j2_tab = _setup_classifier_tabs(conn)
+        material = _ready_article()
+        article = repo.upsert_material(material, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            _open_config(app.config["DATABASE"]), conn, article["id"]
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert classifier_calls == []
+    assert _GuardClient.captured == [0]
+    assert result["status"] == "DRAFT_CREATED"
+    assert j1_tab["id"] in updated["tab_ids"]
+    guard = updated["quality"]["league_guard"]
+    assert guard["upgraded_to_publish"] is False
+    assert guard["reassigned_tab_id"] is None
+    assert guard["classifier_used"] is False
+    assert "属于「日职联」但置信度不足" in guard["reason"]
+    assert "不属于" not in guard["reason"]
+
+
 def test_classifier_below_confidence_must_not_reassign(app, monkeypatch):
     """置信度不足时既不能发布，也不能改挂——错挂比留草稿更糟。"""
 

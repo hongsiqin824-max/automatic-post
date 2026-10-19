@@ -501,7 +501,26 @@ def _apply_ai_league_guard(
                         f"（confidence={verdict['confidence']:.2f}），"
                         f"升级开关已关闭，维持创建草稿：{verdict['reason']}"
                     )
+            elif verdict["belongs"] is True and configured_mode == 0:
+                # 「属于但置信度不足」的草稿稿：本来就是草稿，升级线没过就留着。
+                # 不再去问分类器——草稿路径的候选清单排除原栏目，分类器只能答
+                # 「候选里没有 X」，写出来和第一问的「属于」自相矛盾，还白花一次调用。
+                keep_reason = (
+                    f"AI 认为本篇属于「{tab_name or '兜底栏目'}」但置信度不足"
+                    f"（confidence={verdict['confidence']:.2f}"
+                    f"<{config.league_guard_min_confidence:.2f}），"
+                    f"维持创建草稿：{verdict['reason']}"
+                )
             elif config.league_guard_classifier_enabled:
+                # 第一问的结论要原样带进后面的理由里：belongs=True 但置信度不足和
+                # belongs=False 走的是同一条分类流程，但措辞不能都写成「不属于」。
+                first_verdict_text = (
+                    f"AI 认为本篇属于「{tab_name or '兜底栏目'}」但置信度不足"
+                    f"（confidence={verdict['confidence']:.2f}"
+                    f"<{config.league_guard_min_confidence:.2f}）"
+                    if verdict["belongs"] is True
+                    else f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」"
+                )
                 # 分类模式：不再逐个追问预配候选，一次调用就在全部候选栏目里选一个。
                 # 覆盖面因此与 tabs.ai_fallback_tab_ids 配过没有无关——线上近半数
                 # 栏目该字段为空，正是「AI 答完不属于就无处可去」的根因。
@@ -526,7 +545,7 @@ def _apply_ai_league_guard(
                     )
                 except LLMCallError as exc_classify:
                     keep_reason = (
-                        f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」，"
+                        f"{first_verdict_text}，"
                         f"栏目分类调用失败，维持创建草稿：{exc_classify}"
                     )
                 else:
@@ -545,12 +564,12 @@ def _apply_ai_league_guard(
                             routed_confidence >= config.relevance_guard_min_confidence
                         )
                         keep_reason = (
-                            f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」，"
+                            f"{first_verdict_text}，"
                             f"也不属于任何候选栏目，维持创建草稿：{routed_reason}"
                         )
                     elif routed_confidence < config.league_guard_min_confidence:
                         keep_reason = (
-                            f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」，"
+                            f"{first_verdict_text}，"
                             f"分类到「{routed_row.get('name')}」但置信度不足"
                             f"（confidence={routed_confidence:.2f}），维持创建草稿：{routed_reason}"
                         )
@@ -570,7 +589,7 @@ def _apply_ai_league_guard(
                         fallback_tab_active = repo.is_active_tab(routed_row)
                         fallback_verdict = classifier_result
                         upgrade_reason = (
-                            f"AI 判断本篇不属于「{tab_name}」，分类到"
+                            f"{first_verdict_text}，分类到"
                             f"「{fallback_tab_name}」"
                             f"（confidence={routed_confidence:.2f}），"
                             f"已改挂该栏目"
@@ -757,7 +776,13 @@ def _apply_ai_league_guard(
             "RELEVANCE_DOWNGRADED",
             connection,
             message=(
-                f"相关性过滤：AI 判本篇不属于「{tab_name}」且无栏目可归属"
+                "相关性过滤："
+                + (
+                    f"AI 对本篇属于「{tab_name}」把握不足"
+                    if verdict is not None and verdict.get("belongs") is True
+                    else f"AI 判本篇不属于「{tab_name}」"
+                )
+                + "且无栏目可归属"
                 f"（confidence={float((classifier_result or {}).get('confidence') or 0):.2f}），"
                 f"已从直发降级为创建草稿"
             ),
