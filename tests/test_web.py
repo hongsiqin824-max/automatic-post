@@ -30,6 +30,44 @@ def test_dashboard_renders_beijing_time(app, client):
     assert "2026-08-10T02:18:06.681Z" not in html
 
 
+def test_dashboard_counts_todays_reassignments_to_inactive_tabs(app, client):
+    # 看板按天数「改挂至停用栏目」，并链到同名筛选——这类文章事件名是 UPGRADED、
+    # 不打降级标记，没有这个入口就只能靠反查 SQL 才发现栏目停用在吸走线上稿。
+    with app.app_context():
+        article = repo.upsert_material(
+            {
+                "source": "marca",
+                "source_url": "https://example.com/inactive/1",
+                "translate_title": "韩媒：首尔衣恋大胜金海",
+                "translate_body": "<p>这是一篇完整的体育新闻正文，包含足够的信息用于自动质量检测。</p>",
+                "archive_id": 0,
+                "dqd_litpic": "/fastdfs8/example.jpg",
+                "channels": [11],
+            }
+        )["article"]
+        repo.save_quality(
+            article["id"],
+            {
+                "league_guard": {
+                    "guard_tab_name": "韩K",
+                    "reassigned_tab_id": 28,
+                    "reassigned_tab_active": False,
+                    "fallback_tab_name": "韩K2联",
+                    "effective_publish_mode": 0,
+                }
+            },
+        )
+
+    html = client.get("/").get_data(as_text=True)
+    assert "今日改挂至停用栏目" in html
+    assert "filter_type=reassigned_inactive" in html
+    assert '<strong>1</strong>' in html.split("今日改挂至停用栏目")[1][:80]
+
+    filtered = client.get("/articles?filter_type=reassigned_inactive").get_data(as_text=True)
+    assert "韩媒：首尔衣恋大胜金海" in filtered
+    assert "league-guard-reassigned_inactive" in filtered
+
+
 def test_source_and_tab_configuration_api(app, client):
     with app.app_context():
         tab = repo.list_tabs()[0]
@@ -684,13 +722,25 @@ def _reassigned_guard(**overrides) -> dict:
 def test_article_badge_names_the_checked_column_when_reassigned_to_disabled_tab(app):
     # 徽章必须说「不属于原栏目」：读落点栏目会拼出「不属于「亚冠2」」，与紧随其后
     # 的理由（正是在讲这篇属于亚冠2）自相矛盾。
+    # 改挂到停用栏目是独立状态：它是直发稿无声掉量的来源，要能和普通「仅草稿」分开数。
     article = _league_guard_article(_reassigned_guard(), publish_mode=0)
     with app.app_context():
         item = _article_view(article)
 
-    assert item["league_guard_state"] == "kept"
+    assert item["league_guard_state"] == "reassigned_inactive"
     assert item["league_guard_label"] == "AI：不属于「日职联」已改挂「亚冠2」（栏目停用）仅草稿"
     assert item["league_guard_reason"] == "主要报道亚冠二级联赛"
+
+
+def test_article_badge_keeps_plain_draft_state_when_reassigned_to_active_draft_tab(app):
+    # 目标栏目在用、只是自身配成草稿：不是停用，不能混进「改挂至停用栏目」的计数。
+    guard = _reassigned_guard(reassigned_tab_active=True)
+    article = _league_guard_article(guard, publish_mode=0)
+    with app.app_context():
+        item = _article_view(article)
+
+    assert item["league_guard_state"] == "kept"
+    assert item["league_guard_label"] == "AI：不属于「日职联」已改挂「亚冠2」仅草稿"
 
 
 def test_article_badge_reports_direct_publish_after_reassigning_to_active_tab(app):
@@ -810,7 +860,7 @@ def test_article_badge_omits_checked_column_when_legacy_record_lacks_it(app):
     with app.app_context():
         item = _article_view(article)
 
-    assert item["league_guard_state"] == "kept"
+    assert item["league_guard_state"] == "reassigned_inactive"
     assert item["league_guard_label"] == "AI：已改挂「亚冠2」（栏目停用）仅草稿"
 
 

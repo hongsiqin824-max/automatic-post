@@ -2053,6 +2053,24 @@ def get_article_by_key(source: str, source_url: str, connection=None) -> Optiona
     return _decorate_article(row, conn)
 
 
+# 护栏改挂到停用栏目：栏目改对了但只能落草稿。SQLite 的 json_extract 把 JSON
+# false 读成整数 0，None（未改挂）读成 NULL，所以 =0 精确命中「改挂且停用」。
+_REASSIGNED_INACTIVE_CLAUSE = (
+    "json_extract(a.quality_json, '$.league_guard.reassigned_tab_active')=0"
+)
+
+
+def count_reassigned_to_inactive_since(since: str, connection=None) -> int:
+    """Count articles the guard moved into a disabled column on or after ``since``."""
+
+    row = _conn(connection).execute(
+        "SELECT COUNT(*) AS count FROM articles a WHERE a.created_at>=? AND "
+        + _REASSIGNED_INACTIVE_CLAUSE,
+        (str(since),),
+    ).fetchone()
+    return int(row["count"]) if row else 0
+
+
 def list_articles(connection=None, *, status: Optional[str] = None,
                   source: Optional[str] = None, tab_id: Optional[int] = None,
                   query: Optional[str] = None, filter_type: Optional[str] = None,
@@ -2079,6 +2097,8 @@ def list_articles(connection=None, *, status: Optional[str] = None,
     # 拦截类型筛选：通过 quality_json 字段过滤
     if filter_type == "regional_sensitive":
         clauses.append("json_extract(a.quality_json, '$.regional_sensitive')=1")
+    elif filter_type == "reassigned_inactive":
+        clauses.append(_REASSIGNED_INACTIVE_CLAUSE)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))

@@ -703,6 +703,36 @@ def test_manual_review_only_accepts_articles_waiting_for_review(app):
             repo.manual_review_update(article["id"], "pass")
 
 
+def test_reassigned_to_inactive_filter_and_count_only_match_disabled_targets(app):
+    """「改挂至停用栏目」要精确命中 reassigned_tab_active=false。
+
+    JSON false 在 json_extract 里是 0；未改挂（None）是 NULL、改挂到在用栏目是 1，
+    三者都不能混进来——这个计数是直发稿无声掉量的报警线，混了就失真。
+    """
+
+    with app.app_context():
+        inactive = repo.upsert_material(_material(source_url="https://example.com/a/1"))["article"]
+        active = repo.upsert_material(_material(source_url="https://example.com/a/2"))["article"]
+        untouched = repo.upsert_material(_material(source_url="https://example.com/a/3"))["article"]
+        repo.save_quality(
+            inactive["id"],
+            {"league_guard": {"reassigned_tab_id": 28, "reassigned_tab_active": False}},
+        )
+        repo.save_quality(
+            active["id"],
+            {"league_guard": {"reassigned_tab_id": 6, "reassigned_tab_active": True}},
+        )
+        repo.save_quality(
+            untouched["id"],
+            {"league_guard": {"reassigned_tab_id": None, "reassigned_tab_active": None}},
+        )
+
+        rows = repo.list_articles(filter_type="reassigned_inactive")
+        assert [row["id"] for row in rows] == [inactive["id"]]
+        assert repo.count_reassigned_to_inactive_since("2000-01-01T00:00:00.000Z") == 1
+        assert repo.count_reassigned_to_inactive_since("2999-01-01T00:00:00.000Z") == 0
+
+
 def test_quality_recheck_claim_is_atomic_and_clears_previous_attempt_marker(app):
     with app.app_context():
         article = repo.upsert_material(_material())["article"]

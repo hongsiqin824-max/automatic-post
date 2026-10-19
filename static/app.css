@@ -88,7 +88,7 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .text-link svg, .external-link svg { width: 14px; height: 14px; }
 .text-link:hover, .external-link:hover { color: var(--accent); }
 
-.summary-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+.summary-strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
 .metric { position: relative; display: flex; align-items: center; gap: 12px; min-height: 104px; padding: 18px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); box-shadow: var(--shadow); transition: border-color .15s, transform .15s; }
 .metric:hover { border-color: #aebac5; transform: translateY(-1px); }
 .metric-icon { display: grid; place-items: center; width: 38px; height: 38px; flex: 0 0 38px; border-radius: 6px; }
@@ -173,6 +173,7 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .league-guard-upgraded { background: rgba(22, 163, 74, .12); color: var(--green); }
 .league-guard-stale { background: var(--red-bg); color: var(--red); }
 .league-guard-downgraded { background: var(--red-bg); color: var(--red); }
+.league-guard-reassigned_inactive { background: var(--red-bg); color: var(--red); }
 .league-guard-competition { background: var(--blue-bg); color: var(--blue); }
 
 .filter-bar { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 9px; margin-bottom: 17px; }

@@ -35,6 +35,11 @@
       <span><small>处理失败</small><strong>{{ stats.error|default(0) }}</strong></span>
       <i class="metric-arrow" data-lucide="arrow-up-right"></i>
     </a>
+    <a class="metric" href="{{ url_for('articles', filter_type='reassigned_inactive') }}">
+      <span class="metric-icon tone-red"><i data-lucide="folder-x"></i></span>
+      <span><small>今日改挂至停用栏目</small><strong>{{ reassigned_inactive_today|default(0) }}</strong></span>
+      <i class="metric-arrow" data-lucide="arrow-up-right"></i>
+    </a>
   </section>
 
   <section class="dashboard-grid">

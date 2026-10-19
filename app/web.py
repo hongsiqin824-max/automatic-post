@@ -326,14 +326,17 @@ def _article_view(article: dict | None) -> dict | None:
             elif guard_wants_direct:
                 item["league_guard_state"] = "stale"
                 item["league_guard_label"] = f"{moved}{blocked_suffix}"
+            elif guard.get("reassigned_tab_active") is False:
+                # 改挂到了停用栏目 → 文章落草稿。这是直发稿「无声掉量」的主要
+                # 来源（K2 停用时韩K 两天落了 80 篇），独立状态好让列表和看板
+                # 能单独数出来；它不是相关性过滤的降级，不复用 downgraded。
+                item["league_guard_state"] = "reassigned_inactive"
+                item["league_guard_label"] = f"{moved}（栏目停用）仅草稿"
             else:
-                # 「为什么还是草稿」只有栏目停用值得点名。目标栏目自身配成草稿
-                # （reassign 模式为 target 时）不解释，避免说出一个错误的原因。
-                disabled = (
-                    "（栏目停用）" if guard.get("reassigned_tab_active") is False else ""
-                )
+                # 目标栏目自身配成草稿（reassign 模式为 target 时）不解释，
+                # 避免说出一个错误的原因。
                 item["league_guard_state"] = "kept"
-                item["league_guard_label"] = f"{moved}{disabled}仅草稿"
+                item["league_guard_label"] = f"{moved}仅草稿"
         elif relevance_downgraded:
             # 内容相关性过滤：直发稿被高置信判为谁都不属于，已降级草稿送审。
             item["league_guard_state"] = "downgraded"
@@ -1055,12 +1058,25 @@ def create_app(test_config: dict | None = None) -> Flask:
         stats = repo.article_counts(conn)
         recent = [_article_view(row) for row in repo.list_articles(conn, limit=12)]
         runs = _run_views(conn)
+        # 改挂到停用栏目是直发稿「无声掉量」的来源，按北京日计数挂在看板上，
+        # 一天里涨上去就说明某个停用栏目正在吸走线上稿。
+        beijing_day_start = (
+            datetime.now(BEIJING_TIMEZONE)
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .astimezone(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+        reassigned_inactive_today = repo.count_reassigned_to_inactive_since(
+            beijing_day_start, conn
+        )
         return render_template(
             "dashboard.html",
             stats={key.lower(): value for key, value in stats.items()},
             status_groups=_dashboard_status_groups(stats),
             recent=recent,
             runs=runs,
+            reassigned_inactive_today=reassigned_inactive_today,
         )
 
     @app.get("/articles")
