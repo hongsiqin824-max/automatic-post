@@ -505,6 +505,10 @@ def _apply_ai_league_guard(
                 # 分类模式：不再逐个追问预配候选，一次调用就在全部候选栏目里选一个。
                 # 覆盖面因此与 tabs.ai_fallback_tab_ids 配过没有无关——线上近半数
                 # 栏目该字段为空，正是「AI 答完不属于就无处可去」的根因。
+                #
+                # 直发稿（configured_mode != 0）下，候选清单保留原栏目，让 AI 第二问
+                # 有机会选回来（避免"第一问答错 + 第二问选项里没正确答案"的误杀）。
+                # 草稿路径仍然排除原栏目，避免循环确认。
                 article_title = str(
                     article.get("title_final") or article.get("title") or ""
                 )
@@ -512,7 +516,8 @@ def _apply_ai_league_guard(
                 choices = [
                     row
                     for row in repo.list_guard_candidate_tabs(connection)
-                    if int(row.get("id") or 0) != int(guard_tab.get("id") or 0)
+                    if configured_mode != 0
+                    or int(row.get("id") or 0) != int(guard_tab.get("id") or 0)
                 ]
                 fallback_candidates = [str(row.get("name") or "") for row in choices]
                 try:
@@ -548,6 +553,15 @@ def _apply_ai_league_guard(
                             f"AI 判断本篇不属于「{tab_name or '兜底栏目'}」，"
                             f"分类到「{routed_row.get('name')}」但置信度不足"
                             f"（confidence={routed_confidence:.2f}），维持创建草稿：{routed_reason}"
+                        )
+                    elif int(routed_row["id"]) == int(guard_tab.get("id") or 0):
+                        # AI 第二问选回原栏目：第一问答错、第二问纠正了。只有直发稿的
+                        # 候选里才有原栏目（见上面 choices），所以这里一定是直发：确认
+                        # 归属、保持直发，不是改挂。草稿路径不走这里——草稿是 fail-closed，
+                        # 两个矛盾的 AI 答案不该变成升级发布的依据。
+                        keep_reason = (
+                            f"AI 分类确认本篇属于「{tab_name or '兜底栏目'}」"
+                            f"（confidence={routed_confidence:.2f}），保持直接发布：{routed_reason}"
                         )
                     else:
                         fallback_tab_id = int(routed_row["id"])

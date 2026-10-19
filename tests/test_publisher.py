@@ -3043,6 +3043,126 @@ def test_relevance_guard_direct_homeless_low_confidence_keeps_direct(app, monkey
     assert guard["effective_publish_mode"] == 1
 
 
+def test_relevance_guard_direct_classifier_picks_back_guard_tab_keeps_direct(app, monkeypatch):
+    """直发稿第一问答错（不属于），第二问候选里有原栏目且高置信选回 → 保持直发。
+
+    回归：原实现把原栏目从候选里剔掉，第一问一旦误判，第二问只能答 null，
+    高置信 null 就触发降级——线上「名古屋鲸八是日职联球队，候选栏目中无日职联」
+    这类误杀的根因。
+    """
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: {"belongs": False, "confidence": 0.95, "reason": "第一问误判"},
+    )
+    offered: list[list[int]] = []
+
+    def classifier(title, body, candidates, llm):
+        ids = [int(c["id"]) for c in candidates]
+        offered.append(ids)
+        # 直发路径下原栏目必须在候选里，否则第二问没有纠错机会。
+        assert guard_tab_id in ids
+        return _stub_classifier(guard_tab_id, 0.95, "其实就是日职联")
+
+    monkeypatch.setattr("app.services.publisher.classify_article_tab", classifier)
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        guard_tab_id = int(tab["id"])
+        repo.update_tab(
+            tab["id"], conn, publish_mode=1,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True,
+                           publish_mode_override=1)
+        article = repo.upsert_material(_direct_article("intl"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+            ), conn, article["id"],
+        )
+        updated = repo.get_article(article["id"], conn)
+        events = repo.list_article_events(article["id"], conn)
+
+    assert offered and guard_tab_id in offered[0]
+    assert _GuardClient.captured == [1]
+    assert result["status"] == "PUBLISHED"
+    guard = updated["quality"]["league_guard"]
+    assert guard["effective_publish_mode"] == 1
+    assert guard["downgraded_from_direct"] is False
+    assert guard["upgraded_to_publish"] is False
+    # 选回不是改挂：栏目不变，不写任何护栏事件。
+    assert guard["reassigned_tab_id"] is None
+    assert guard["tab_id"] == guard_tab_id
+    assert "AI 分类确认本篇属于" in guard["reason"]
+    assert not any(e["event_type"] == "RELEVANCE_DOWNGRADED" for e in events)
+    assert not any(e["event_type"] == "LEAGUE_GUARD_UPGRADED" for e in events)
+
+
+def test_relevance_guard_direct_classifier_picks_back_low_confidence_still_direct(app, monkeypatch):
+    """第二问低置信选回原栏目 → 不走「确认归属」分支，走 fail-open，仍保持直发。
+
+    钉死分支顺序：置信度不足的判断必须在「选回原栏目」之前，否则低置信也会被
+    当成确认。两条路最终模式一样（都直发），靠 reason 区分走的是哪条。
+    """
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *a, **kw: {"belongs": False, "confidence": 0.95, "reason": "第一问误判"},
+    )
+    with app.app_context():
+        conn = get_db()
+        tab = repo.list_tabs(conn)[0]
+        guard_tab_id = int(tab["id"])
+        monkeypatch.setattr(
+            "app.services.publisher.classify_article_tab",
+            # 0.6 < league_guard_min_confidence(0.9)
+            lambda *a, **kw: _stub_classifier(guard_tab_id, 0.6, "可能是日职联"),
+        )
+        repo.update_tab(
+            tab["id"], conn, publish_mode=1,
+            ai_league_guard_definition="日本职业足球联赛",
+        )
+        repo.update_source("marca", conn, tab_id=tab["id"], enabled=True,
+                           publish_mode_override=1)
+        article = repo.upsert_material(_direct_article("intl"), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+
+        result = create_draft_for_article(
+            AppConfig(
+                database_path=app.config["DATABASE"],
+                publisher_enabled=True,
+                dqd_open_appid="appid-test",
+                dqd_open_appsecret="secret-test",
+                dqd_open_enname="hongsiqin",
+                **_RELEVANCE_CONFIG,
+            ), conn, article["id"],
+        )
+        updated = repo.get_article(article["id"], conn)
+        events = repo.list_article_events(article["id"], conn)
+
+    assert _GuardClient.captured == [1]
+    assert result["status"] == "PUBLISHED"
+    guard = updated["quality"]["league_guard"]
+    assert guard["effective_publish_mode"] == 1
+    assert guard["downgraded_from_direct"] is False
+    assert guard["reassigned_tab_id"] is None
+    assert "置信度不足" in guard["reason"]
+    assert "AI 分类确认本篇属于" not in guard["reason"]
+    assert not any(e["event_type"] == "RELEVANCE_DOWNGRADED" for e in events)
+
+
 def test_relevance_guard_direct_llm_error_keeps_direct(app, monkeypatch):
     """直发稿 LLM 调用失败 → fail-open，保持直发。"""
     _GuardClient.captured = []
