@@ -3497,6 +3497,18 @@ def load_competition_channel_tags(connection=None) -> dict[int, set[int]]:
     return result
 
 
+def list_recent_publish_failures(since: str, connection=None, *, limit: int = 200) -> list[dict]:
+    """``since`` 之后落 PUBLISH_FAILED 的文章，供失败告警汇总。按 updated_at 取：
+    文章是什么时候失败的看的是状态变更时间，不是入库时间。"""
+
+    return _rows(_conn(connection).execute(
+        "SELECT id, title_final, title_original, source, error, updated_at "
+        "FROM articles WHERE status='PUBLISH_FAILED' AND updated_at>=? "
+        "ORDER BY updated_at DESC LIMIT ?",
+        (str(since), max(1, int(limit))),
+    ).fetchall())
+
+
 def get_setting(key: str, default: Any = None, connection=None):
     row = _conn(connection).execute("SELECT value_json FROM settings WHERE key=?", (str(key),)).fetchone()
     return default if row is None else _loads(row["value_json"], default)

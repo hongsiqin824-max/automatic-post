@@ -32,6 +32,7 @@ from .services.open_platform import AUTH_STATUS_LABELS, OpenPlatformClient, auth
 from .services.pipeline import RunController, recheck_article
 from .services.scheduler import Scheduler
 from .services.feishu_report import FeishuReportController, FeishuReportScheduler
+from .services.publish_alert import PublishAlertController, PublishAlertScheduler
 from .services.league_clicks import LeagueClicksController, LeagueClicksScheduler
 from .services.league_clicks_weekly import LeagueClicksWeeklyController, LeagueClicksWeeklyScheduler
 from .services.competition_tags import (
@@ -807,6 +808,11 @@ def create_app(test_config: dict | None = None) -> Flask:
         source_report_controller,
         cfg.source_report_check_interval_seconds,
     )
+    publish_alert_controller = PublishAlertController(cfg)
+    publish_alert_scheduler = PublishAlertScheduler(
+        publish_alert_controller,
+        cfg.publish_alert_check_interval_seconds,
+    )
     league_clicks_controller = LeagueClicksController(cfg)
     league_clicks_scheduler = LeagueClicksScheduler(
         league_clicks_controller,
@@ -845,6 +851,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.extensions["feishu_report_scheduler"] = feishu_report_scheduler
     app.extensions["source_report_controller"] = source_report_controller
     app.extensions["source_report_scheduler"] = source_report_scheduler
+    app.extensions["publish_alert_controller"] = publish_alert_controller
+    app.extensions["publish_alert_scheduler"] = publish_alert_scheduler
     app.extensions["league_clicks_controller"] = league_clicks_controller
     app.extensions["league_clicks_scheduler"] = league_clicks_scheduler
     app.extensions["league_clicks_weekly_controller"] = league_clicks_weekly_controller
@@ -860,6 +868,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         feishu_report_scheduler.start()
     if cfg.source_report_configured and not app.config.get("TESTING") and not test_config:
         source_report_scheduler.start()
+    if cfg.publish_alert_configured and not app.config.get("TESTING") and not test_config:
+        publish_alert_scheduler.start()
     if cfg.league_clicks_enabled and not app.config.get("TESTING") and not test_config:
         league_clicks_scheduler.start()
     if cfg.feishu_spreadsheet_configured and not app.config.get("TESTING") and not test_config:

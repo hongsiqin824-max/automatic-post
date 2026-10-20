@@ -220,6 +220,25 @@ class AppConfig:
         15, min(3600, _env_int("SOURCE_REPORT_CHECK_INTERVAL_SECONDS", 30))
     )
 
+    # 提交懂球帝失败告警：每隔 check_interval 看一次最近 lookback 秒内落
+    # PUBLISH_FAILED 的篇数，达到 threshold 就推飞书；发过之后 cooldown 内不再发，
+    # 上游持续故障时每个 cooldown 提醒一次。webhook 不单独配时沿用来源预警机器人。
+    publish_alert_enabled: bool = _env_bool("PUBLISH_ALERT_ENABLED", True)
+    publish_alert_webhook_url: str = os.getenv("PUBLISH_ALERT_WEBHOOK_URL", "").strip()
+    publish_alert_threshold: int = max(1, _env_int("PUBLISH_ALERT_THRESHOLD", 3))
+    publish_alert_lookback_seconds: int = max(
+        60, min(86400, _env_int("PUBLISH_ALERT_LOOKBACK_SECONDS", 900))
+    )
+    publish_alert_cooldown_seconds: int = max(
+        60, min(86400, _env_int("PUBLISH_ALERT_COOLDOWN_SECONDS", 1800))
+    )
+    publish_alert_check_interval_seconds: int = max(
+        15, min(3600, _env_int("PUBLISH_ALERT_CHECK_INTERVAL_SECONDS", 300))
+    )
+    publish_alert_timeout_seconds: int = max(
+        5, _env_int("PUBLISH_ALERT_TIMEOUT_SECONDS", 10)
+    )
+
     # 联赛 tab 点击数据：每天凌晨从 StarRocks 拉前一天的结果存进本地累积表。
     # 上游实时表只保留约 30 天，所以补数窗口也就只能是 30 天。
     # StarRocks 连接参数复用 dqd-bigdata-sr 技能里已配好的 .env，
@@ -418,6 +437,14 @@ class AppConfig:
             and self.source_report_webhook_url
             and self.source_report_boundaries
         )
+
+    @property
+    def publish_alert_resolved_webhook_url(self) -> str:
+        return self.publish_alert_webhook_url or self.source_report_webhook_url
+
+    @property
+    def publish_alert_configured(self) -> bool:
+        return bool(self.publish_alert_enabled and self.publish_alert_resolved_webhook_url)
 
     @property
     def feishu_spreadsheet_configured(self) -> bool:
