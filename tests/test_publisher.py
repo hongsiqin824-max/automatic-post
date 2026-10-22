@@ -2198,6 +2198,134 @@ def test_classifier_reassigns_without_configured_fallback_candidates(app, monkey
     assert guard["guard_tab_id"] == j1_tab["id"]
 
 
+def _setup_korean_media_tabs(conn, source_code: str):
+    """韩K 作为护栏栏目，国家队带通用定义作为分类候选；来源默认挂韩K。"""
+
+    k1_tab = repo.get_tab_by_name("韩K", conn)
+    nt_tab = repo.get_tab_by_name("国家队", conn)
+    repo.update_tab(
+        k1_tab["id"], conn, publish_mode=0,
+        ai_league_guard_enabled=True,
+        ai_league_guard_definition="韩国职业足球甲级联赛",
+        ai_fallback_tab_ids=[],
+    )
+    repo.update_tab(
+        nt_tab["id"], conn, publish_mode=0,
+        ai_league_guard_enabled=False,
+        ai_league_guard_definition="收录一切国家队与热身赛内容",
+    )
+    repo.update_source(
+        source_code, conn, tab_id=k1_tab["id"], enabled=True,
+        publish_mode_override=None,
+    )
+    return k1_tab, nt_tab
+
+
+def test_korean_media_sees_home_only_national_team_definition(app, monkeypatch):
+    """韩媒的「国家队」候选换成只收韩国队的定义，其他来源仍用 DB 里的通用定义。
+
+    10-20 C罗 被葡足协处罚：韩媒 4 篇、德媒 1 篇、巴西媒 1 篇各自被护栏判「属于
+    国家队」直发，同一条新闻在栏目里堆了 6 篇。韩媒转述外国国家队新闻没有信息增量，
+    对这些来源把国家队定义收窄到韩国队；定义只在问 AI 时替换，不动 DB。
+    """
+
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *args, **kwargs: {"belongs": False, "confidence": 0.99, "reason": "不属于韩K"},
+    )
+    seen: dict[str, dict[str, str]] = {}
+
+    def _classify(title, body, candidates, llm):
+        seen[title] = {
+            str(row.get("name") or ""): str(row.get("ai_league_guard_definition") or "")
+            for row in candidates
+        }
+        return {"tab_id": None, "confidence": 0.95, "reason": "外国国家队新闻"}
+
+    monkeypatch.setattr("app.services.publisher.classify_article_tab", _classify)
+
+    with app.app_context():
+        conn = get_db()
+        k1_tab, nt_tab = _setup_korean_media_tabs(conn, "naversp")
+        _setup_korean_media_tabs(conn, "marca")
+        korean = repo.upsert_material({
+            **_ready_article(),
+            "source": "naversp",
+            "source_url": "https://example.com/naversp/ronaldo",
+            "translate_title": "韩媒：C罗擅离训练营被罚255欧",
+        }, conn)["article"]
+        other = repo.upsert_material({
+            **_ready_article(),
+            "source": "marca",
+            "source_url": "https://example.com/marca/ronaldo",
+            "translate_title": "马卡：C罗擅离训练营被罚255欧",
+        }, conn)["article"]
+        for row in (korean, other):
+            repo.transition_status(row["id"], "READY_TO_PUBLISH", conn)
+            create_draft_for_article(_open_config(app.config["DATABASE"]), conn, row["id"])
+        korean_after = repo.get_article(korean["id"], conn)
+        nt_after = repo.get_tab(nt_tab["id"], conn)
+
+    korean_defs = seen["韩媒：C罗擅离训练营被罚255欧"]
+    other_defs = seen["马卡：C罗擅离训练营被罚255欧"]
+    assert "韩国" in korean_defs["国家队"]
+    assert "其他国家或地区的国家队" in korean_defs["国家队"]
+    assert other_defs["国家队"] == "收录一切国家队与热身赛内容"
+    # 只换国家队这一项，别的候选原样。
+    assert {k: v for k, v in korean_defs.items() if k != "国家队"} == {
+        k: v for k, v in other_defs.items() if k != "国家队"
+    }
+    # DB 里的通用定义没被改写。
+    assert nt_after["ai_league_guard_definition"] == "收录一切国家队与热身赛内容"
+    # 韩媒的外国国家队稿：第二问选不出 → 草稿稿留草稿，不进国家队。
+    assert korean_after["status"] == "DRAFT_CREATED"
+    assert korean_after["publish_mode"] == 0
+    assert nt_tab["id"] not in korean_after["tab_ids"]
+    assert korean_after["quality"]["league_guard"]["national_team_home_only"] is True
+
+
+def test_national_team_home_only_sources_can_be_disabled(app, monkeypatch):
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *args, **kwargs: {"belongs": False, "confidence": 0.99, "reason": "不属于韩K"},
+    )
+    seen: dict[str, str] = {}
+
+    def _classify(title, body, candidates, llm):
+        seen.update({
+            str(row.get("name") or ""): str(row.get("ai_league_guard_definition") or "")
+            for row in candidates
+        })
+        return {"tab_id": None, "confidence": 0.95, "reason": "x"}
+
+    monkeypatch.setattr("app.services.publisher.classify_article_tab", _classify)
+
+    with app.app_context():
+        conn = get_db()
+        _setup_korean_media_tabs(conn, "naversp")
+        article = repo.upsert_material({
+            **_ready_article(),
+            "source": "naversp",
+            "source_url": "https://example.com/naversp/off",
+        }, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+        create_draft_for_article(
+            _open_config(app.config["DATABASE"], national_team_home_sources=""),
+            conn,
+            article["id"],
+        )
+        updated = repo.get_article(article["id"], conn)
+
+    assert seen["国家队"] == "收录一切国家队与热身赛内容"
+    assert updated["quality"]["league_guard"]["national_team_home_only"] is False
+
+
 def test_classifier_files_into_disabled_column_as_draft(app, monkeypatch):
     """AI 判到停用栏目时改挂过去，但只创建草稿。
 

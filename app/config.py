@@ -385,6 +385,14 @@ class AppConfig:
     relevance_guard_keep_upgrade: bool = _env_bool(
         "AUTOMATIC_POST_RELEVANCE_GUARD_KEEP_UPGRADE", True
     )
+    # 这些来源（韩媒）的文章，「国家队」栏目只收本国（韩国）国家队内容：护栏问 AI 时
+    # 把国家队栏目的定义换成「只收韩国队」版本。韩媒转述的外国国家队新闻（C罗 被葡
+    # 足协处罚、阿根廷名单）本身没有信息增量，德媒/葡媒/巴西媒各自会报，再从韩媒进
+    # 一遍只会在国家队栏目堆同一条新闻。判不属于后走原有分支：草稿稿留草稿，直发稿
+    # 降级草稿。留空关闭。
+    national_team_home_sources: str = os.getenv(
+        "AUTOMATIC_POST_NATIONAL_TEAM_HOME_SOURCES", "naversp,kbs,chosun"
+    ).strip()
 
     # Concurrent quality workers per ingestion run; 1 keeps serial behavior.
     quality_workers: int = max(1, min(8, _env_int("AUTOMATIC_POST_QUALITY_WORKERS", 4)))

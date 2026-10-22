@@ -7,7 +7,11 @@ from app.config import AppConfig
 from app.db import _connect
 from app.services.material_client import MaterialFetchResult
 from app.services.pipeline import run_once
-from app.services.publisher import publish_ready_articles
+from app.services.publisher import (
+    TitleDuplicateBlocked,
+    create_draft_for_article,
+    publish_ready_articles,
+)
 from app.services.quality import LLMCallError, LLMService
 
 
@@ -217,6 +221,55 @@ def test_publisher_gate_blocks_duplicate_before_draft(app, monkeypatch) -> None:
         assert not updated["dqd_archive_id"]
     finally:
         conn.close()
+
+
+def test_retry_runs_title_dedup_before_resubmit(app, monkeypatch) -> None:
+    """重试路径也要查重。
+
+    10-20 上游故障：同一事件的多篇报道一起落 PUBLISH_FAILED，彼此都不在候选池
+    里；恢复后按 id 顺序重试，第一篇发布成功后，后面几篇走 create_draft_for_article
+    并不经过批量发布循环里的提交前查重闸，原样直发出去。
+    """
+
+    database = app.config["DATABASE"]
+    _enable_direct_source(database)
+    published_id = _publish_article(database, "a", TITLE_A, [100])
+    conn = _connect(database)
+    try:
+        article = repo.upsert_material(_item("b", TITLE_B, [100]), conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+        repo.transition_status(article["id"], "PUBLISH_FAILED", conn)
+        article_id = int(article["id"])
+    finally:
+        conn.close()
+
+    def no_draft(self, *args, **kwargs):
+        raise AssertionError("查重拦截后不应调用开放平台")
+
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", no_draft)
+    prompts: list[str] = []
+
+    def fake_chat(self, prompt):
+        prompts.append(prompt)
+        return {"duplicate": True, "matched_id": str(published_id), "reason": "同一事件"}
+
+    monkeypatch.setattr(LLMService, "chat_json", fake_chat)
+
+    conn = _connect(database)
+    try:
+        try:
+            create_draft_for_article(_open_config(database), conn, article_id)
+        except TitleDuplicateBlocked:
+            pass
+        else:
+            raise AssertionError("重试撞上重复标题必须抛 TitleDuplicateBlocked")
+        updated = repo.get_article(article_id, conn)
+    finally:
+        conn.close()
+
+    assert prompts, "重试前必须真的跑一次查重"
+    assert updated["status"] == "TITLE_DUPLICATE"
+    assert not updated["dqd_archive_id"]
 
 
 def test_guard_upgrade_to_direct_publish_still_runs_title_dedup(app, monkeypatch) -> None:

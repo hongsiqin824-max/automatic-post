@@ -358,6 +358,45 @@ def _apply_language_publish_guard(
     return effective_mode, article
 
 
+NATIONAL_TEAM_TAB_NAME = "国家队"
+
+# 韩媒来源看到的「国家队」栏目定义。与 DB 里的通用定义（收一切国家队/热身赛）不同，
+# 这里只收韩国队；韩媒转述的外国国家队新闻按「不属于」处理。
+_NATIONAL_TEAM_HOME_DEFINITION = (
+    "本栏目只收录以韩国各级国家队为主要报道对象的文章：韩国成年男足/女足国家队、"
+    "U23/U20/U17 等各级梯队、韩国队的征召名单/热身赛/世预赛/亚洲杯等国家队赛事、"
+    "韩国足协（KFA）的国家队事务、韩国国脚以国家队身份的表现与言论。判定要点："
+    "1. 只看文章的主要报道对象，不做关键词匹配；仅顺带提及韩国队不算。"
+    "2. 主要报道对象是其他国家或地区的国家队（如葡萄牙、阿根廷、日本、英格兰）的，"
+    "不收录，即使由韩国媒体报道、即使涉及韩国球员所在联赛。"
+    "3. 主要内容属于俱乐部赛事（联赛、杯赛、亚冠等）的，不收录，即使涉及韩国国脚。"
+    "4. 正文信息不足以确认是否为韩国国家队内容时，按“不属于”处理。"
+)
+
+
+def _national_team_home_only(article: dict[str, Any], config: AppConfig) -> bool:
+    """Whether this article's source sees the home-only national team definition."""
+
+    codes = {
+        code.strip().lower()
+        for code in str(getattr(config, "national_team_home_sources", "") or "").split(",")
+        if code.strip()
+    }
+    return str(article.get("source") or "").strip().lower() in codes
+
+
+def _guard_tab_view(tab: dict[str, Any], home_only: bool) -> dict[str, Any]:
+    """The tab row as the guard should see it for this article.
+
+    Only the national team column changes, and only for home-only sources; the
+    DB definition itself is untouched so other sources keep the generic one.
+    """
+
+    if not home_only or str(tab.get("name") or "").strip() != NATIONAL_TEAM_TAB_NAME:
+        return tab
+    return {**tab, "ai_league_guard_definition": _NATIONAL_TEAM_HOME_DEFINITION}
+
+
 def _make_league_guard_llm(config: AppConfig) -> LLMService | None:
     if not getattr(config, "llm_configured", False):
         return None
@@ -452,7 +491,10 @@ def _apply_ai_league_guard(
         return configured_mode, article
 
     tab_name = str(guard_tab.get("name") or "")
-    definition = str(guard_tab.get("ai_league_guard_definition") or "")
+    home_only = _national_team_home_only(article, config)
+    definition = str(
+        _guard_tab_view(guard_tab, home_only).get("ai_league_guard_definition") or ""
+    )
     upgrade_reason: str | None = None
     keep_reason: str | None = None
     homeless_confident: bool = False
@@ -533,7 +575,7 @@ def _apply_ai_league_guard(
                 )
                 article_body = str(article.get("body_html") or "")
                 choices = [
-                    row
+                    _guard_tab_view(row, home_only)
                     for row in repo.list_guard_candidate_tabs(connection)
                     if configured_mode != 0
                     or int(row.get("id") or 0) != int(guard_tab.get("id") or 0)
@@ -742,6 +784,7 @@ def _apply_ai_league_guard(
         "actual_competition": normalized_competition or None,
         "actual_competition_raw": raw_competition,
         "min_confidence": config.league_guard_min_confidence,
+        "national_team_home_only": home_only,
         "verdict": verdict,
         "fallback_verdict": fallback_verdict,
         "fallback_tab_name": fallback_tab_name,
@@ -1171,11 +1214,16 @@ def _create_draft_attempt(
     # 却仍发到「日职联」）。改判失败时保留原栏目，不让提交因此落空。
     tabs = _current_tabs(current) or tabs
 
-    # 护栏还会把草稿配置的文章升级成直接发布，而两道标题查重关卡都只认
-    # publish_mode==1：质检那道运行时它还是草稿，提交前那道运行在护栏之前，
-    # 等升级落定时两道都已经错过。不在这里补一次，同一场比赛的多篇报道会原样
-    # 全部直发出去。此刻文章已被抢占为 PUBLISHING，所以终态按该状态做 CAS。
-    if publish_mode == 1 and _guard_upgraded_to_publish(current):
+    # 两种情况提交前的标题查重闸（publish_ready_articles 里的 _title_dedup_gate）
+    # 等于没跑过，必须在这里补一次：
+    # 1. 护栏把草稿配置的文章升级成直接发布——两道关卡都只认 publish_mode==1，
+    #    质检那道运行时它还是草稿，提交前那道运行在护栏之前，升级落定时都已错过。
+    # 2. 重试（页面「重试」按钮、批量重试脚本）——这条路径不经过批量发布循环，
+    #    根本没有提交前那道闸；而首次发布时同事件的兄弟稿往往也一起失败，
+    #    PUBLISH_FAILED 不在候选池里，互相看不见。上游故障恢复后按 id 顺序重试，
+    #    不在这里查，同一事件会原样发出去多篇。
+    # 此刻文章已被抢占为 PUBLISHING，所以终态按该状态做 CAS。
+    if publish_mode == 1 and (retry or _guard_upgraded_to_publish(current)):
         upgrade_dedup = title_dedup.check_title_duplicate(
             config,
             current,
