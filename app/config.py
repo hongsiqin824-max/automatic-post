@@ -239,6 +239,26 @@ class AppConfig:
         5, _env_int("PUBLISH_ALERT_TIMEOUT_SECONDS", 10)
     )
 
+    # TokenHub（降级模型平台）余额告警：每隔 check_interval 读一次钱包余额，
+    # 低于 threshold 元或令牌失效就推飞书；发过之后 cooldown 内不再发。
+    # webhook 不单独配时沿用发布告警 / 来源预警机器人。
+    tokenhub_base_url: str = os.getenv(
+        "TOKENHUB_BASE_URL", "https://tokenhub.dongqiudi.com"
+    ).strip().rstrip("/")
+    tokenhub_access_token: str = os.getenv("TOKENHUB_ACCESS_TOKEN", "").strip()
+    balance_alert_enabled: bool = _env_bool("BALANCE_ALERT_ENABLED", True)
+    balance_alert_webhook_url: str = os.getenv("BALANCE_ALERT_WEBHOOK_URL", "").strip()
+    balance_alert_threshold_cny: float = max(0.0, _env_float("BALANCE_ALERT_THRESHOLD_CNY", 100.0))
+    balance_alert_cooldown_seconds: int = max(
+        300, min(7 * 86400, _env_int("BALANCE_ALERT_COOLDOWN_SECONDS", 21600))
+    )
+    balance_alert_check_interval_seconds: int = max(
+        60, min(86400, _env_int("BALANCE_ALERT_CHECK_INTERVAL_SECONDS", 1800))
+    )
+    balance_alert_timeout_seconds: int = max(
+        5, _env_int("BALANCE_ALERT_TIMEOUT_SECONDS", 15)
+    )
+
     # 联赛 tab 点击数据：每天凌晨从 StarRocks 拉前一天的结果存进本地累积表。
     # 上游实时表只保留约 30 天，所以补数窗口也就只能是 30 天。
     # StarRocks 连接参数复用 dqd-bigdata-sr 技能里已配好的 .env，
@@ -453,6 +473,18 @@ class AppConfig:
     @property
     def publish_alert_configured(self) -> bool:
         return bool(self.publish_alert_enabled and self.publish_alert_resolved_webhook_url)
+
+    @property
+    def balance_alert_resolved_webhook_url(self) -> str:
+        return self.balance_alert_webhook_url or self.publish_alert_resolved_webhook_url
+
+    @property
+    def balance_alert_configured(self) -> bool:
+        return bool(
+            self.balance_alert_enabled
+            and self.tokenhub_access_token
+            and self.balance_alert_resolved_webhook_url
+        )
 
     @property
     def feishu_spreadsheet_configured(self) -> bool:

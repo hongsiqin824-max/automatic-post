@@ -33,6 +33,7 @@ from .services.pipeline import RunController, recheck_article
 from .services.scheduler import Scheduler
 from .services.feishu_report import FeishuReportController, FeishuReportScheduler
 from .services.publish_alert import PublishAlertController, PublishAlertScheduler
+from .services.balance_alert import BalanceAlertController, BalanceAlertScheduler
 from .services.league_clicks import LeagueClicksController, LeagueClicksScheduler
 from .services.league_clicks_weekly import LeagueClicksWeeklyController, LeagueClicksWeeklyScheduler
 from .services.competition_tags import (
@@ -813,6 +814,11 @@ def create_app(test_config: dict | None = None) -> Flask:
         publish_alert_controller,
         cfg.publish_alert_check_interval_seconds,
     )
+    balance_alert_controller = BalanceAlertController(cfg)
+    balance_alert_scheduler = BalanceAlertScheduler(
+        balance_alert_controller,
+        cfg.balance_alert_check_interval_seconds,
+    )
     league_clicks_controller = LeagueClicksController(cfg)
     league_clicks_scheduler = LeagueClicksScheduler(
         league_clicks_controller,
@@ -853,6 +859,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.extensions["source_report_scheduler"] = source_report_scheduler
     app.extensions["publish_alert_controller"] = publish_alert_controller
     app.extensions["publish_alert_scheduler"] = publish_alert_scheduler
+    app.extensions["balance_alert_controller"] = balance_alert_controller
+    app.extensions["balance_alert_scheduler"] = balance_alert_scheduler
     app.extensions["league_clicks_controller"] = league_clicks_controller
     app.extensions["league_clicks_scheduler"] = league_clicks_scheduler
     app.extensions["league_clicks_weekly_controller"] = league_clicks_weekly_controller
@@ -870,6 +878,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         source_report_scheduler.start()
     if cfg.publish_alert_configured and not app.config.get("TESTING") and not test_config:
         publish_alert_scheduler.start()
+    if cfg.balance_alert_configured and not app.config.get("TESTING") and not test_config:
+        balance_alert_scheduler.start()
     if cfg.league_clicks_enabled and not app.config.get("TESTING") and not test_config:
         league_clicks_scheduler.start()
     if cfg.feishu_spreadsheet_configured and not app.config.get("TESTING") and not test_config:
