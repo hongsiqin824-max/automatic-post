@@ -21,6 +21,7 @@ from .material_client import MaterialClient, MaterialClientError, normalize_item
 from .publisher import publish_ready_articles
 from .quality import (
     LLMService,
+    check_china_political,
     evaluate,
     is_photo_credit_advisory_plans,
     plan_local_repair,
@@ -781,6 +782,74 @@ def _second_quality_error(first_quality: dict[str, Any], error: Exception) -> di
     }
 
 
+def _china_political_gate(
+    article: dict[str, Any], config: AppConfig, connection, quality_claim_token: str
+) -> bool:
+    """First quality round: abandon China-political articles before anything else.
+
+    Returns True when the article was abandoned (claim released). A model outage
+    must not hold articles back, so failures are logged and the normal quality
+    flow continues.
+    """
+
+    llm = _make_llm(config)
+    if llm is None:
+        return False
+    article_id = int(article["id"])
+    title = str(article.get("title_final") or "")
+    try:
+        verdict = check_china_political(
+            title,
+            str(article.get("body_html") or ""),
+            llm,
+            _make_fallback_llm(config),
+        )
+    except Exception as exc:  # noqa: BLE001 - fail open into the normal quality flow
+        logger.warning("涉华政治判定失败，按未命中继续质检 article_id=%s: %s", article_id, exc)
+        repo.add_article_event(
+            article_id,
+            "CHINA_POLITICAL_CHECK_FAILED",
+            connection,
+            message=f"涉华政治判定调用失败，按未命中继续质检：{str(exc)[:200]}",
+            quality_claim_token=quality_claim_token,
+        )
+        return False
+    if not verdict["china_political"]:
+        return False
+    reason = "涉华政治内容，直接放弃" + (f"：{verdict['reason']}" if verdict["reason"] else "")
+    try:
+        repo.save_quality(
+            article_id,
+            {
+                "pass": False,
+                "needs_review": False,
+                "china_political": True,
+                "reason": reason,
+                "issues": {"china_political": [reason]},
+                "china_political_check": verdict,
+                "title_before": title,
+                "title_after": title,
+                "title_fix_method": "unchanged",
+            },
+            connection,
+            status="ABANDONED",
+            quality_claim_token=quality_claim_token,
+        )
+        repo.add_article_event(
+            article_id,
+            "ARTICLE_ABANDONED",
+            connection,
+            message=reason,
+            payload={"reason": "china_political", "china_political_check": verdict},
+            from_status="ABANDONED",
+            to_status="ABANDONED",
+            quality_claim_token=quality_claim_token,
+        )
+    finally:
+        repo.release_quality_claim(article_id, quality_claim_token, connection)
+    return True
+
+
 def _process_article(article: dict[str, Any], config: AppConfig, connection) -> str:
     article_id = int(article["id"])
     if not _quality_eligible(article):
@@ -795,6 +864,8 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
         return current.get("status", "") if current else ""
     article = claimed
     quality_claim_token = str(claimed.get("quality_claim_token") or "")
+    if _china_political_gate(article, config, connection, quality_claim_token):
+        return "ABANDONED"
     if not article.get("tabs") and not article.get("tab_id"):
         try:
             quality = {
@@ -886,7 +957,6 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             channels=current.get("channels", []),
             llm=_make_llm(config),
             llm_fallback=_make_fallback_llm(config),
-            home_country=config.national_team_home_country(current.get("source")),
         )
         _record_quality_result(
             article_id,
@@ -896,29 +966,6 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             status="QUALITY_CHECKING",
             quality_claim_token=quality_claim_token,
         )
-        if first_quality.get("abandon") is True:
-            repo.save_quality(
-                article_id,
-                first_quality,
-                connection,
-                status="ABANDONED",
-                quality_claim_token=quality_claim_token,
-            )
-            repo.add_article_event(
-                article_id,
-                "ARTICLE_ABANDONED",
-                connection,
-                message=str(first_quality.get("reason") or "质检判定直接放弃"),
-                payload={
-                    "reason": first_quality.get("abandon_code"),
-                    "national_team_home_country": first_quality.get("national_team_home_country"),
-                    "semantic_check": first_quality.get("semantic_check"),
-                },
-                from_status="ABANDONED",
-                to_status="ABANDONED",
-                quality_claim_token=quality_claim_token,
-            )
-            return "ABANDONED"
 
         first_failed = not _quality_passes(first_quality)
         body_before = str(current.get("body_html") or "")

@@ -1,12 +1,14 @@
-"""涉华政治稿：质检模型判 china_political=true 时直接放弃。"""
+"""涉华政治轮：所有稿子进质检先单独判一次，命中直接放弃，其余流程不变。"""
 from __future__ import annotations
+
+import pytest
 
 from app import repository as repo
 from app.config import AppConfig
 from app.db import _connect
 from app.services.material_client import MaterialFetchResult
 from app.services.pipeline import run_once
-from app.services.quality import evaluate
+from app.services.quality import LLMCallError, check_china_political
 
 TITLE = "韩媒：姆巴佩称毛泽东独裁者后道歉"
 BODY = (
@@ -18,88 +20,48 @@ BODY = (
 class _FakeLLM:
     configured = True
     model = "fake"
-    timeout = 1
-    last_error = None
 
-    def __init__(self, answer: dict):
+    def __init__(self, answer=None, error: Exception | None = None):
         self.answer = answer
+        self.error = error
         self.prompts: list[str] = []
 
     def chat_json(self, prompt: str):
         self.prompts.append(prompt)
-        return dict(self.answer)
+        if self.error is not None:
+            raise self.error
+        return self.answer
 
 
-def _semantic(**overrides) -> dict:
-    return {
-        "title_complete": True,
-        "body_complete": True,
-        "has_ad_or_dirty": False,
-        "repairable": False,
-        "needs_review": False,
-        "reason": "内容正常",
-        "china_political": False,
-        "china_political_reason": "",
-        "dirty_targets": [],
-        "repair_plans": [],
-        **overrides,
-    }
-
-
-def test_semantic_prompt_carries_china_political_rule():
-    llm = _FakeLLM(_semantic())
-    evaluate(title=TITLE, body=BODY, channels=[1], llm=llm)
+def test_check_china_political_prompt_and_verdict():
+    llm = _FakeLLM({"china_political": True, "reason": "领导人评价争议"})
+    verdict = check_china_political(TITLE, BODY, llm)
+    assert verdict == {"china_political": True, "reason": "领导人评价争议"}
     prompt = llm.prompts[0]
-    assert "china_political" in prompt
-    # 国足/足协负面是正常体育新闻，必须在提示词里明确排除。
+    # 国足/足协负面是正常体育新闻，必须在提示词里明确排除；只判政治这一件事。
     assert "中国足协的人事和管理" in prompt
+    assert "只判断一件事" in prompt
+    assert "毛泽东" in prompt
 
 
-def test_evaluate_abandons_china_political_article():
-    llm = _FakeLLM(_semantic(china_political=True, china_political_reason="涉及领导人评价争议"))
-    result = evaluate(title=TITLE, body=BODY, channels=[1], llm=llm)
-    assert result["abandon"] is True
-    assert result["china_political"] is True
-    assert result["pass"] is False
-    assert "涉及领导人评价争议" in result["reason"]
-    assert result["repair_plans"] == []
+def test_check_china_political_ignores_non_strict_flag():
+    verdict = check_china_political(TITLE, BODY, _FakeLLM({"china_political": "true"}))
+    assert verdict["china_political"] is False
 
 
-def test_evaluate_ignores_non_strict_china_political_flag():
-    # 字段写成字符串等非布尔值时按未命中处理，不误放弃。
-    llm = _FakeLLM(_semantic(china_political="true"))
-    result = evaluate(title=TITLE, body=BODY, channels=[1], llm=llm)
-    assert result.get("abandon") is not True
-    assert result["pass"] is True
+def test_check_china_political_uses_fallback_model():
+    primary = _FakeLLM(error=LLMCallError("timeout", category="timeout", retryable=True))
+    fallback = _FakeLLM({"china_political": True, "reason": "外交部表态"})
+    assert check_china_political(TITLE, BODY, primary, fallback)["china_political"] is True
 
 
-def test_foreign_national_team_rule_only_for_home_sources():
-    llm = _FakeLLM(_semantic())
-    evaluate(title=TITLE, body=BODY, channels=[1], llm=llm)
-    evaluate(title=TITLE, body=BODY, channels=[1], llm=llm, home_country="日本")
-    assert "foreign_national_team" not in llm.prompts[0]
-    assert "foreign_national_team" in llm.prompts[1]
-    assert "本文来自日本媒体" in llm.prompts[1]
+def test_check_china_political_raises_without_answer():
+    primary = _FakeLLM(error=LLMCallError("timeout", category="timeout", retryable=True))
+    with pytest.raises(LLMCallError):
+        check_china_political(TITLE, BODY, primary)
 
 
-def test_evaluate_abandons_foreign_national_team_article_from_home_source():
-    llm = _FakeLLM(_semantic(foreign_national_team=True, foreign_national_team_reason="阿根廷国家队名单"))
-    result = evaluate(
-        title="日媒：阿根廷公布国家队名单", body=BODY, channels=[1], llm=llm, home_country="日本"
-    )
-    assert result["abandon"] is True
-    assert result["abandon_code"] == "foreign_national_team"
-    assert "日本媒体转述的外国国家队新闻" in result["reason"]
-
-
-def test_foreign_national_team_flag_ignored_without_home_country():
-    # 非日韩来源即使模型多输出了这个字段，也不放弃。
-    llm = _FakeLLM(_semantic(foreign_national_team=True))
-    result = evaluate(title=TITLE, body=BODY, channels=[1], llm=llm)
-    assert result.get("abandon") is not True
-
-
-def test_pipeline_marks_china_political_article_abandoned(app, monkeypatch):
+def _run(app, monkeypatch, verdict_fn):
     database = app.config["DATABASE"]
     conn = _connect(database)
     try:
@@ -119,19 +81,18 @@ def test_pipeline_marks_china_political_article_abandoned(app, monkeypatch):
         "app.services.pipeline.MaterialClient.fetch_all",
         lambda self, sources, **kwargs: MaterialFetchResult(items=[item], total=1, pages=1),
     )
-    calls: list[dict] = []
+    monkeypatch.setattr("app.services.pipeline.check_china_political", verdict_fn)
+    evaluate_calls: list[dict] = []
 
     def fake_evaluate(**kwargs):
-        calls.append(kwargs)
+        evaluate_calls.append(kwargs)
         return {
             "pass": False,
-            "needs_review": False,
-            "abandon": True,
-            "abandon_code": "china_political",
-            "china_political": True,
-            "reason": "涉华政治内容，直接放弃：领导人评价争议",
-            "issues": {"china_political": ["涉华政治内容"]},
-            "semantic_check": _semantic(china_political=True),
+            "needs_review": True,
+            "score": 50,
+            "level": "B",
+            "issues": {"semantic_problems": ["需人工确认"]},
+            "reason": "需人工确认",
             "title_before": TITLE,
             "title_after": TITLE,
             "title_fix_method": "unchanged",
@@ -142,11 +103,10 @@ def test_pipeline_marks_china_political_article_abandoned(app, monkeypatch):
         database_path=database,
         material_api_key="test-key",
         material_caller="test-caller",
-        llm_api_key="",
+        llm_api_key="test-llm-key",
         publisher_enabled=False,
         scheduler_enabled=False,
     ))
-
     conn = _connect(database)
     try:
         article = next(
@@ -156,8 +116,35 @@ def test_pipeline_marks_china_political_article_abandoned(app, monkeypatch):
         events = [event["event_type"] for event in repo.list_article_events(article["id"], conn)]
     finally:
         conn.close()
-    assert len(calls) == 1
-    # 日韩来源进质检第一轮就带上本国，外国国家队稿在这里直接过滤。
-    assert calls[0]["home_country"] == "韩国"
+    return article, events, evaluate_calls
+
+
+def test_china_political_article_abandoned_before_normal_quality(app, monkeypatch):
+    article, events, evaluate_calls = _run(
+        app, monkeypatch,
+        lambda *args, **kwargs: {"china_political": True, "reason": "领导人评价争议"},
+    )
     assert article["status"] == "ABANDONED"
     assert "ARTICLE_ABANDONED" in events
+    # 命中后原质检一次都不跑。
+    assert evaluate_calls == []
+
+
+def test_non_political_article_continues_normal_quality(app, monkeypatch):
+    article, events, evaluate_calls = _run(
+        app, monkeypatch,
+        lambda *args, **kwargs: {"china_political": False, "reason": ""},
+    )
+    assert len(evaluate_calls) == 1
+    assert article["status"] == "NEEDS_REVIEW"
+    assert "ARTICLE_ABANDONED" not in events
+
+
+def test_china_political_check_failure_falls_through(app, monkeypatch):
+    def _boom(*args, **kwargs):
+        raise LLMCallError("timeout", category="timeout", retryable=True)
+
+    article, events, evaluate_calls = _run(app, monkeypatch, _boom)
+    assert len(evaluate_calls) == 1
+    assert article["status"] == "NEEDS_REVIEW"
+    assert "CHINA_POLITICAL_CHECK_FAILED" in events

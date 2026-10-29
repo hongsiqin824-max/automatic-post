@@ -711,7 +711,6 @@ def _apply_ai_league_guard(
                         + f"，维持创建草稿：{verdict['reason']}"
                     )
 
-    # 日韩媒的外国国家队稿在质检第一轮就已放弃，走到这里的只剩本国队或非国家队稿件。
     # 目标栏目停用时只归档不发布——这是 enabled 的统一语义，压过 reassign 配置和
     # 「确认属于当前栏目」的升级意图。栏目仍然要改对，方便之后栏目恢复或扩展。
     if fallback_tab_id is not None:

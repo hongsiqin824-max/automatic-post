@@ -405,10 +405,10 @@ class AppConfig:
     relevance_guard_keep_upgrade: bool = _env_bool(
         "AUTOMATIC_POST_RELEVANCE_GUARD_KEEP_UPGRADE", True
     )
-    # 这些来源（日韩媒）只收本国国家队内容。质检第一轮就问 AI 是否外国国家队新闻，是就
-    # 直接放弃：日韩媒转述的外国国家队新闻（C罗 被葡足协处罚、阿根廷名单）没有信息增量，
-    # 德媒/葡媒/巴西媒各自会报。栏目护栏问归属时，国家队栏目的定义也换成只收本国队。
-    # 格式「来源:国家」逗号分隔，不写国家的按韩国处理（兼容旧配置）。留空关闭。
+    # 这些来源（日韩媒）的「国家队」栏目只收本国国家队：护栏问 AI 归属时把国家队栏目的
+    # 定义换成只收本国队的版本。日韩媒转述的外国国家队新闻（C罗 被葡足协处罚、阿根廷
+    # 名单）没有信息增量，德媒/葡媒/巴西媒各自会报，不该再挂进国家队栏目。格式「来源:国家」
+    # 逗号分隔，不写国家的按韩国处理（兼容旧配置）。留空关闭。
     national_team_home_sources: str = os.getenv(
         "AUTOMATIC_POST_NATIONAL_TEAM_HOME_SOURCES",
         "naversp:韩国,kbs:韩国,chosun:韩国,"

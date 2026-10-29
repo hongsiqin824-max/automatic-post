@@ -15,6 +15,16 @@ os.environ["AUTOMATIC_POST_RELEVANCE_GUARD_KEEP_UPGRADE"] = "true"
 from app.web import create_app  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _stub_china_political_check(monkeypatch):
+    """质检最前面的涉华政治轮会真调模型；默认判未命中，需要的测试自行覆盖。"""
+
+    monkeypatch.setattr(
+        "app.services.pipeline.check_china_political",
+        lambda *args, **kwargs: {"china_political": False, "reason": ""},
+    )
+
+
 @pytest.fixture()
 def app(tmp_path):
     database = tmp_path / "test.sqlite3"
