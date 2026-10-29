@@ -22,6 +22,7 @@ from .publisher import publish_ready_articles
 from .quality import (
     LLMService,
     check_china_political,
+    match_china_political_keywords,
     evaluate,
     is_photo_credit_advisory_plans,
     plan_local_repair,
@@ -792,18 +793,22 @@ def _china_political_gate(
     flow continues.
     """
 
+    article_id = int(article["id"])
+    title = str(article.get("title_final") or "")
+    body_html = str(article.get("body_html") or "")
+    keyword_hits = match_china_political_keywords(title, body_html)
+    if keyword_hits:
+        verdict = {
+            "china_political": True,
+            "reason": "命中硬规则关键词：" + "、".join(keyword_hits),
+            "hard_rule": keyword_hits,
+        }
+        return _abandon_china_political(article_id, title, verdict, connection, quality_claim_token)
     llm = _make_llm(config)
     if llm is None:
         return False
-    article_id = int(article["id"])
-    title = str(article.get("title_final") or "")
     try:
-        verdict = check_china_political(
-            title,
-            str(article.get("body_html") or ""),
-            llm,
-            _make_fallback_llm(config),
-        )
+        verdict = check_china_political(title, body_html, llm, _make_fallback_llm(config))
     except Exception as exc:  # noqa: BLE001 - fail open into the normal quality flow
         logger.warning("涉华政治判定失败，按未命中继续质检 article_id=%s: %s", article_id, exc)
         repo.add_article_event(
@@ -816,6 +821,12 @@ def _china_political_gate(
         return False
     if not verdict["china_political"]:
         return False
+    return _abandon_china_political(article_id, title, verdict, connection, quality_claim_token)
+
+
+def _abandon_china_political(
+    article_id: int, title: str, verdict: dict[str, Any], connection, quality_claim_token: str
+) -> bool:
     reason = "涉华政治内容，直接放弃" + (f"：{verdict['reason']}" if verdict["reason"] else "")
     try:
         repo.save_quality(

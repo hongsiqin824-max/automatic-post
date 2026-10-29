@@ -8,13 +8,15 @@ from app.config import AppConfig
 from app.db import _connect
 from app.services.material_client import MaterialFetchResult
 from app.services.pipeline import run_once
-from app.services.quality import LLMCallError, check_china_political
+from app.services.quality import LLMCallError, check_china_political, match_china_political_keywords
 
 TITLE = "韩媒：姆巴佩称毛泽东独裁者后道歉"
 BODY = (
     "<p>姆巴佩因调侃毛泽东引发争议，中国外交部发言人在例行记者会上批评其言论，"
     "多家中国企业随后宣布终止合作，央视暂停转播西甲。</p>"
 )
+NEUTRAL_TITLE = "韩媒：孙兴慜梅开二度，热刺客场取胜"
+NEUTRAL_BODY = "<p>孙兴慜上半场和下半场各进一球，帮助球队客场2-1取胜。</p>"
 
 
 class _FakeLLM:
@@ -61,7 +63,7 @@ def test_check_china_political_raises_without_answer():
         check_china_political(TITLE, BODY, primary)
 
 
-def _run(app, monkeypatch, verdict_fn):
+def _run(app, monkeypatch, verdict_fn, title=NEUTRAL_TITLE, body=NEUTRAL_BODY):
     database = app.config["DATABASE"]
     conn = _connect(database)
     try:
@@ -70,11 +72,11 @@ def _run(app, monkeypatch, verdict_fn):
     finally:
         conn.close()
     item = {
-        "translate_title": TITLE,
+        "translate_title": title,
         "archive_id": 0,
-        "translate_body": BODY,
+        "translate_body": body,
         "source": "naversp",
-        "source_url": "https://example.com/naversp/mbappe",
+        "source_url": "https://example.com/naversp/article",
         "channels": [100],
     }
     monkeypatch.setattr(
@@ -93,8 +95,8 @@ def _run(app, monkeypatch, verdict_fn):
             "level": "B",
             "issues": {"semantic_problems": ["需人工确认"]},
             "reason": "需人工确认",
-            "title_before": TITLE,
-            "title_after": TITLE,
+            "title_before": title,
+            "title_after": title,
             "title_fix_method": "unchanged",
         }
 
@@ -148,3 +150,25 @@ def test_china_political_check_failure_falls_through(app, monkeypatch):
     assert len(evaluate_calls) == 1
     assert article["status"] == "NEEDS_REVIEW"
     assert "CHINA_POLITICAL_CHECK_FAILED" in events
+
+
+def test_hard_keywords_match_leaders_and_mbappe():
+    assert match_china_political_keywords("姆巴佩梅开二度", "") == ["姆巴佩"]
+    assert match_china_political_keywords("标题", "<p>他引用了習近平的话</p>") == ["習近平"]
+    assert match_china_political_keywords("孙兴慜梅开二度", "<p>热刺取胜</p>") == []
+    assert match_china_political_keywords("韩媒：KT队与李强喆续约3年", "") == []
+
+
+def test_hard_keyword_abandons_without_calling_model(app, monkeypatch):
+    calls: list = []
+
+    def _verdict(*args, **kwargs):
+        calls.append(args)
+        return {"china_political": False, "reason": ""}
+
+    article, events, evaluate_calls = _run(app, monkeypatch, _verdict, title=TITLE, body=BODY)
+    assert article["status"] == "ABANDONED"
+    assert "ARTICLE_ABANDONED" in events
+    # 命中硬规则：既不问涉华政治模型，也不跑原质检。
+    assert calls == []
+    assert evaluate_calls == []

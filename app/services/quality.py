@@ -242,6 +242,36 @@ def _check_sensitive_regions(title: str, body: str) -> tuple[str | None, str | N
 # 国足、足协的负面报道是正常体育新闻，不拦。
 CHINA_POLITICAL_BODY_LIMIT = 3000
 
+# 硬规则：标题或正文出现即直接放弃，不再问模型。领导人用全名（含繁体/日文写法），
+# 姆巴佩是用户明确要求整体屏蔽（涉毛泽东言论风波）。
+CHINA_POLITICAL_HARD_KEYWORDS: tuple[str, ...] = (
+    "毛泽东", "毛澤東", "毛沢東",
+    "周恩来", "周恩來",
+    "刘少奇", "劉少奇",
+    "邓小平", "鄧小平",
+    "江泽民", "江澤民", "江沢民",
+    "胡锦涛", "胡錦濤",
+    "温家宝", "溫家寶",
+    "李克强", "李克強",
+    "习近平", "習近平",
+    "李强", "李強",
+    "赵乐际", "趙樂際", "趙楽際",
+    "王沪宁", "王滬寧",
+    "蔡奇",
+    "丁薛祥",
+    "李希",
+    "姆巴佩",
+)
+# 包含领导人名字的无关人名，匹配前先剔除（韩国棒球运动员李强喆）。
+CHINA_POLITICAL_KEYWORD_EXCLUSIONS: tuple[str, ...] = ("李强喆", "李強喆")
+
+
+def match_china_political_keywords(title: str, body: str) -> list[str]:
+    text = f"{title}\n{html_to_text(body)}"
+    for exclusion in CHINA_POLITICAL_KEYWORD_EXCLUSIONS:
+        text = text.replace(exclusion, "")
+    return [keyword for keyword in dict.fromkeys(CHINA_POLITICAL_HARD_KEYWORDS) if keyword in text]
+
 
 def check_china_political(
     title: str,
