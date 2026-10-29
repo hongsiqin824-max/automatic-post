@@ -886,6 +886,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             channels=current.get("channels", []),
             llm=_make_llm(config),
             llm_fallback=_make_fallback_llm(config),
+            home_country=config.national_team_home_country(current.get("source")),
         )
         _record_quality_result(
             article_id,
@@ -895,6 +896,29 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             status="QUALITY_CHECKING",
             quality_claim_token=quality_claim_token,
         )
+        if first_quality.get("abandon") is True:
+            repo.save_quality(
+                article_id,
+                first_quality,
+                connection,
+                status="ABANDONED",
+                quality_claim_token=quality_claim_token,
+            )
+            repo.add_article_event(
+                article_id,
+                "ARTICLE_ABANDONED",
+                connection,
+                message=str(first_quality.get("reason") or "质检判定直接放弃"),
+                payload={
+                    "reason": first_quality.get("abandon_code"),
+                    "national_team_home_country": first_quality.get("national_team_home_country"),
+                    "semantic_check": first_quality.get("semantic_check"),
+                },
+                from_status="ABANDONED",
+                to_status="ABANDONED",
+                quality_claim_token=quality_claim_token,
+            )
+            return "ABANDONED"
 
         first_failed = not _quality_passes(first_quality)
         body_before = str(current.get("body_html") or "")

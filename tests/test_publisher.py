@@ -2326,6 +2326,42 @@ def test_national_team_home_only_sources_can_be_disabled(app, monkeypatch):
     assert updated["quality"]["league_guard"]["national_team_home_only"] is False
 
 
+def test_japanese_media_sees_japan_only_national_team_definition(app, monkeypatch):
+    _GuardClient.captured = []
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _GuardClient)
+    _enable_guard_llm(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.publisher.check_league_membership",
+        lambda *args, **kwargs: {"belongs": False, "confidence": 0.99, "reason": "不属于"},
+    )
+    seen: dict[str, str] = {}
+
+    def _classify(title, body, candidates, llm):
+        seen.update({
+            str(row.get("name") or ""): str(row.get("ai_league_guard_definition") or "")
+            for row in candidates
+        })
+        return {"tab_id": None, "confidence": 0.95, "reason": "x"}
+
+    monkeypatch.setattr("app.services.publisher.classify_article_tab", _classify)
+
+    with app.app_context():
+        conn = get_db()
+        _setup_korean_media_tabs(conn, "yahoojp")
+        article = repo.upsert_material({
+            **_ready_article(),
+            "source": "yahoojp",
+            "source_url": "https://example.com/yahoojp/japan",
+        }, conn)["article"]
+        repo.transition_status(article["id"], "READY_TO_PUBLISH", conn)
+        create_draft_for_article(_open_config(app.config["DATABASE"]), conn, article["id"])
+        updated = repo.get_article(article["id"], conn)
+
+    assert "日本各级国家队" in seen["国家队"]
+    assert "韩国各级国家队" not in seen["国家队"]
+    assert updated["quality"]["league_guard"]["national_team_home_country"] == "日本"
+
+
 def test_classifier_files_into_disabled_column_as_draft(app, monkeypatch):
     """AI 判到停用栏目时改挂过去，但只创建草稿。
 

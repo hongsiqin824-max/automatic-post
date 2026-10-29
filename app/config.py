@@ -405,13 +405,14 @@ class AppConfig:
     relevance_guard_keep_upgrade: bool = _env_bool(
         "AUTOMATIC_POST_RELEVANCE_GUARD_KEEP_UPGRADE", True
     )
-    # 这些来源（韩媒）的文章，「国家队」栏目只收本国（韩国）国家队内容：护栏问 AI 时
-    # 把国家队栏目的定义换成「只收韩国队」版本。韩媒转述的外国国家队新闻（C罗 被葡
-    # 足协处罚、阿根廷名单）本身没有信息增量，德媒/葡媒/巴西媒各自会报，再从韩媒进
-    # 一遍只会在国家队栏目堆同一条新闻。判不属于后走原有分支：草稿稿留草稿，直发稿
-    # 降级草稿。留空关闭。
+    # 这些来源（日韩媒）只收本国国家队内容。质检第一轮就问 AI 是否外国国家队新闻，是就
+    # 直接放弃：日韩媒转述的外国国家队新闻（C罗 被葡足协处罚、阿根廷名单）没有信息增量，
+    # 德媒/葡媒/巴西媒各自会报。栏目护栏问归属时，国家队栏目的定义也换成只收本国队。
+    # 格式「来源:国家」逗号分隔，不写国家的按韩国处理（兼容旧配置）。留空关闭。
     national_team_home_sources: str = os.getenv(
-        "AUTOMATIC_POST_NATIONAL_TEAM_HOME_SOURCES", "naversp,kbs,chosun"
+        "AUTOMATIC_POST_NATIONAL_TEAM_HOME_SOURCES",
+        "naversp:韩国,kbs:韩国,chosun:韩国,"
+        "nikkan:日本,sponichi:日本,yahoojp:日本,skj:日本,mcsai:日本,jleague:日本",
     ).strip()
 
     # Concurrent quality workers per ingestion run; 1 keeps serial behavior.
@@ -437,6 +438,18 @@ class AppConfig:
     @property
     def material_configured(self) -> bool:
         return bool(self.material_api_key and self.material_caller)
+
+    def national_team_home_country(self, source: Any) -> str | None:
+        """Home country of a source in ``national_team_home_sources``, else None."""
+
+        code = str(source or "").strip().lower()
+        if not code:
+            return None
+        for entry in self.national_team_home_sources.split(","):
+            name, _, country = entry.partition(":")
+            if name.strip().lower() == code:
+                return country.strip() or "韩国"
+        return None
 
     @property
     def llm_configured(self) -> bool:

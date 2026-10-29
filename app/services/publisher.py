@@ -360,41 +360,34 @@ def _apply_language_publish_guard(
 
 NATIONAL_TEAM_TAB_NAME = "国家队"
 
-# 韩媒来源看到的「国家队」栏目定义。与 DB 里的通用定义（收一切国家队/热身赛）不同，
-# 这里只收韩国队；韩媒转述的外国国家队新闻按「不属于」处理。
-_NATIONAL_TEAM_HOME_DEFINITION = (
-    "本栏目只收录以韩国各级国家队为主要报道对象的文章：韩国成年男足/女足国家队、"
-    "U23/U20/U17 等各级梯队、韩国队的征召名单/热身赛/世预赛/亚洲杯等国家队赛事、"
-    "韩国足协（KFA）的国家队事务、韩国国脚以国家队身份的表现与言论。判定要点："
-    "1. 只看文章的主要报道对象，不做关键词匹配；仅顺带提及韩国队不算。"
-    "2. 主要报道对象是其他国家或地区的国家队（如葡萄牙、阿根廷、日本、英格兰）的，"
-    "不收录，即使由韩国媒体报道、即使涉及韩国球员所在联赛。"
-    "3. 主要内容属于俱乐部赛事（联赛、杯赛、亚冠等）的，不收录，即使涉及韩国国脚。"
-    "4. 正文信息不足以确认是否为韩国国家队内容时，按“不属于”处理。"
-)
+# 日韩媒来源看到的「国家队」栏目定义。与 DB 里的通用定义（收一切国家队/热身赛）不同，
+# 这里只收本国队；日韩媒转述的外国国家队新闻按「不属于」处理。
+def _national_team_home_definition(country: str) -> str:
+    examples = "、".join(
+        name for name in ("葡萄牙", "阿根廷", "日本", "韩国", "英格兰") if name != country
+    )
+    return (
+        f"本栏目只收录以{country}各级国家队为主要报道对象的文章：{country}成年男足/女足国家队、"
+        f"U23/U20/U17 等各级梯队、{country}队的征召名单/热身赛/世预赛/亚洲杯等国家队赛事、"
+        f"{country}足协的国家队事务、{country}国脚以国家队身份的表现与言论。判定要点："
+        f"1. 只看文章的主要报道对象，不做关键词匹配；仅顺带提及{country}队不算。"
+        f"2. 主要报道对象是其他国家或地区的国家队（如{examples}）的，"
+        f"不收录，即使由{country}媒体报道、即使涉及{country}球员所在联赛。"
+        f"3. 主要内容属于俱乐部赛事（联赛、杯赛、亚冠等）的，不收录，即使涉及{country}国脚。"
+        f"4. 正文信息不足以确认是否为{country}国家队内容时，按“不属于”处理。"
+    )
 
 
-def _national_team_home_only(article: dict[str, Any], config: AppConfig) -> bool:
-    """Whether this article's source sees the home-only national team definition."""
-
-    codes = {
-        code.strip().lower()
-        for code in str(getattr(config, "national_team_home_sources", "") or "").split(",")
-        if code.strip()
-    }
-    return str(article.get("source") or "").strip().lower() in codes
-
-
-def _guard_tab_view(tab: dict[str, Any], home_only: bool) -> dict[str, Any]:
+def _guard_tab_view(tab: dict[str, Any], home_country: str | None) -> dict[str, Any]:
     """The tab row as the guard should see it for this article.
 
     Only the national team column changes, and only for home-only sources; the
     DB definition itself is untouched so other sources keep the generic one.
     """
 
-    if not home_only or str(tab.get("name") or "").strip() != NATIONAL_TEAM_TAB_NAME:
+    if not home_country or str(tab.get("name") or "").strip() != NATIONAL_TEAM_TAB_NAME:
         return tab
-    return {**tab, "ai_league_guard_definition": _NATIONAL_TEAM_HOME_DEFINITION}
+    return {**tab, "ai_league_guard_definition": _national_team_home_definition(home_country)}
 
 
 def _make_league_guard_llm(config: AppConfig) -> LLMService | None:
@@ -491,9 +484,10 @@ def _apply_ai_league_guard(
         return configured_mode, article
 
     tab_name = str(guard_tab.get("name") or "")
-    home_only = _national_team_home_only(article, config)
+    home_country = config.national_team_home_country(article.get("source"))
+    home_only = home_country is not None
     definition = str(
-        _guard_tab_view(guard_tab, home_only).get("ai_league_guard_definition") or ""
+        _guard_tab_view(guard_tab, home_country).get("ai_league_guard_definition") or ""
     )
     upgrade_reason: str | None = None
     keep_reason: str | None = None
@@ -575,7 +569,7 @@ def _apply_ai_league_guard(
                 )
                 article_body = str(article.get("body_html") or "")
                 choices = [
-                    _guard_tab_view(row, home_only)
+                    _guard_tab_view(row, home_country)
                     for row in repo.list_guard_candidate_tabs(connection)
                     if configured_mode != 0
                     or int(row.get("id") or 0) != int(guard_tab.get("id") or 0)
@@ -717,6 +711,7 @@ def _apply_ai_league_guard(
                         + f"，维持创建草稿：{verdict['reason']}"
                     )
 
+    # 日韩媒的外国国家队稿在质检第一轮就已放弃，走到这里的只剩本国队或非国家队稿件。
     # 目标栏目停用时只归档不发布——这是 enabled 的统一语义，压过 reassign 配置和
     # 「确认属于当前栏目」的升级意图。栏目仍然要改对，方便之后栏目恢复或扩展。
     if fallback_tab_id is not None:
@@ -785,6 +780,7 @@ def _apply_ai_league_guard(
         "actual_competition_raw": raw_competition,
         "min_confidence": config.league_guard_min_confidence,
         "national_team_home_only": home_only,
+        "national_team_home_country": home_country,
         "verdict": verdict,
         "fallback_verdict": fallback_verdict,
         "fallback_tab_name": fallback_tab_name,
