@@ -1,106 +1,105 @@
-"""重新质检因 AI 服务失败而待审的文章（分批安全执行）"""
-import sqlite3
+"""批量重新质检「AI 服务调用失败」而落待审的文章（一次性运维脚本）。
+
+场景：LLM 账户欠费 / 网络中断期间，质检全部失败落 NEEDS_REVIEW，自动瞬时重试
+（AUTOMATIC_POST_TRANSIENT_RECHECK_*）也在故障期内耗尽了次数。服务恢复后用它把
+这批文章按批放回 RECEIVED，由后台 worker 的历史遗留扫描（每 10 分钟、最多 200 篇）
+重新跑完整质检。走的是页面「重新质检」按钮同一条路径（repo.claim_quality_recheck），
+会写 QUALITY_RECHECK_REQUESTED 事件。
+
+用法：
+    python3 scripts/recheck_ai_failed.py --since 2026-10-25T18:00            # 预览
+    python3 scripts/recheck_ai_failed.py --since 2026-10-25T18:00 --execute  # 一批
+    python3 scripts/recheck_ai_failed.py --since 2026-10-25T18:00 --execute --wait  # 逐批跑完
+"""
+import argparse
+import sys
+import time
 from pathlib import Path
-from datetime import datetime
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app import repository as repo
+from app.config import AppConfig
+from app.db import _connect
 
 
-def recheck_ai_failed_articles(batch_size: int = 30, dry_run: bool = True):
-    """
-    重新质检因 AI 服务失败的文章
+def _pending_ids(conn, since: str, limit: int) -> list[int]:
+    rows = conn.execute(
+        """
+        SELECT id FROM articles
+        WHERE status='NEEDS_REVIEW'
+          AND created_at >= ?
+          AND json_extract(quality_json, '$.reason') LIKE '%AI 服务%'
+        ORDER BY id
+        LIMIT ?
+        """,
+        (since, limit),
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
 
-    Args:
-        batch_size: 每批处理的文章数量（默认 30）
-        dry_run: 是否只查看不执行（默认 True，安全起见）
-    """
-    db_path = Path(__file__).parent.parent / "instance" / "automatic_post.sqlite3"
 
-    if not db_path.exists():
-        print(f"❌ 数据库文件不存在: {db_path}")
-        return
+def _received_count(conn) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM articles WHERE status='RECEIVED'").fetchone()[0])
 
-    conn = sqlite3.connect(str(db_path))
 
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--since", required=True, help="created_at 下限（UTC ISO，如 2026-10-25T18:00）")
+    parser.add_argument("--batch", type=int, default=30, help="每批重置多少篇")
+    parser.add_argument("--execute", action="store_true", help="不加则只预览")
+    parser.add_argument("--wait", action="store_true", help="等 worker 消化完再放下一批，直到全部跑完")
+    parser.add_argument("--idle-threshold", type=int, default=10, help="RECEIVED 少于多少篇视为消化完")
+    args = parser.parse_args()
+
+    config = AppConfig()
+    conn = _connect(config.database_path)
     try:
-        # 1. 统计总数
-        cursor = conn.execute("""
-            SELECT COUNT(*)
-            FROM articles
-            WHERE status = 'NEEDS_REVIEW'
-              AND quality_json LIKE '%AI 服务%'
-        """)
-        total = cursor.fetchone()[0]
-        print(f"📊 总共有 {total} 篇因 AI 服务失败的文章")
-
+        total = len(_pending_ids(conn, args.since, 100000))
+        print(f"待重跑 {total} 篇（created_at >= {args.since}）", flush=True)
         if total == 0:
-            print("✅ 没有需要重新质检的文章")
-            return
+            return 0
+        if not args.execute:
+            for article_id in _pending_ids(conn, args.since, 5):
+                row = repo.get_article(article_id, conn)
+                print(f"  #{article_id} {row['source']} {row['title_final'][:40]}")
+            print("预览模式，加 --execute 执行", flush=True)
+            return 0
 
-        # 2. 查看本批文章详情
-        cursor = conn.execute(f"""
-            SELECT id, source, title_final, created_at
-            FROM articles
-            WHERE status = 'NEEDS_REVIEW'
-              AND quality_json LIKE '%AI 服务%'
-            ORDER BY created_at
-            LIMIT {batch_size}
-        """)
-        articles = cursor.fetchall()
-
-        print(f"\n本批将处理 {len(articles)} 篇文章：")
-        print(f"{'ID':<8} {'来源':<15} {'创建时间':<20} 标题")
-        print("-" * 80)
-        for article_id, source, title, created_at in articles[:5]:
-            title_display = (title or "")[:30]
-            print(f"{article_id:<8} {source:<15} {created_at:<20} {title_display}...")
-        if len(articles) > 5:
-            print(f"... 还有 {len(articles) - 5} 篇")
-
-        # 3. 执行重置
-        if dry_run:
-            print(f"\n⚠️  DRY RUN 模式 - 未实际修改数据")
-            print(f"执行命令：python scripts/recheck_ai_failed.py --execute")
-            return
-
-        article_ids = [row[0] for row in articles]
-        placeholders = ",".join("?" * len(article_ids))
-
-        cursor = conn.execute(f"""
-            UPDATE articles
-            SET status = 'RECEIVED',
-                quality_json = '{{}}'
-            WHERE id IN ({placeholders})
-        """, article_ids)
-
-        conn.commit()
-
-        print(f"\n✅ 已重置 {cursor.rowcount} 篇文章状态为 RECEIVED")
-        print(f"⏳ 这些文章将在下次质检任务中重新处理（通常 1-2 分钟内）")
-        print(f"📈 剩余待处理：{total - len(articles)} 篇")
-
-    except Exception as e:
-        print(f"\n❌ 执行失败：{e}")
-        import traceback
-        traceback.print_exc()
-        conn.rollback()
-        raise
+        done = 0
+        batch_no = 0
+        while True:
+            ids = _pending_ids(conn, args.since, args.batch)
+            if not ids:
+                break
+            batch_no += 1
+            ok = 0
+            for article_id in ids:
+                if repo.claim_quality_recheck(article_id, conn) is not None:
+                    ok += 1
+            done += ok
+            print(
+                f"[{time.strftime('%H:%M:%S')}] 第 {batch_no} 批：重置 {ok}/{len(ids)} 篇 → RECEIVED，"
+                f"累计 {done}/{total}",
+                flush=True,
+            )
+            if not args.wait:
+                break
+            # 等 worker 把这批消化掉（历史遗留扫描每 10 分钟一次，只收 updated_at 超 10 分钟的）
+            deadline = time.time() + 40 * 60
+            while time.time() < deadline:
+                time.sleep(60)
+                remaining = _received_count(conn)
+                print(f"[{time.strftime('%H:%M:%S')}]   RECEIVED 还剩 {remaining}", flush=True)
+                if remaining <= args.idle_threshold:
+                    break
+            else:
+                print("等待超时，停止放下一批；可稍后再跑一次", flush=True)
+                return 1
+        print(f"完成：共重置 {done} 篇", flush=True)
+        return 0
     finally:
         conn.close()
 
 
 if __name__ == "__main__":
-    import sys
-
-    # 第一次运行：先看看情况（dry_run=True）
-    # python scripts/recheck_ai_failed.py
-
-    # 确认没问题后执行
-    # python scripts/recheck_ai_failed.py --execute
-
-    execute = "--execute" in sys.argv
-
-    if execute:
-        print("🚀 开始执行重置...\n")
-        recheck_ai_failed_articles(batch_size=30, dry_run=False)
-    else:
-        print("🔍 预览模式（不会修改数据）\n")
-        recheck_ai_failed_articles(batch_size=30, dry_run=True)
+    raise SystemExit(main())
