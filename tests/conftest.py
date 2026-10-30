@@ -11,6 +11,13 @@ os.environ["AUTOMATIC_POST_RELEVANCE_GUARD_ENABLED"] = "true"
 os.environ["AUTOMATIC_POST_RELEVANCE_GUARD_SCOPE"] = "intl"
 os.environ["AUTOMATIC_POST_RELEVANCE_GUARD_MIN_CONFIDENCE"] = "0.9"
 os.environ["AUTOMATIC_POST_RELEVANCE_GUARD_KEEP_UPGRADE"] = "true"
+# 详情页的直接发布按钮是否可点击取决于这两个开关，不钉死的话测试结果会随
+# 本机 .env 漂移：服务器上没有 .env 时发布开关默认关闭，按钮变成禁用，
+# 确认提示文案不会渲染，test_article_detail_warns_before_direct_publish 就失败。
+os.environ["AUTOMATIC_POST_PUBLISHER"] = "true"
+os.environ["DQD_OPEN_APPID"] = "test-appid"
+os.environ["DQD_OPEN_APPSECRET"] = "test-appsecret"
+os.environ["DQD_OPEN_ENNAME"] = "test-enname"
 
 from app.web import create_app  # noqa: E402
 
