@@ -54,11 +54,21 @@ health_url() {
   echo "http://127.0.0.1:$(env_value AUTOMATIC_POST_PORT 8890)/health"
 }
 
+main_pid() {
+  $SYSTEMCTL show -p MainPID --value "$SERVICE" 2>/dev/null || echo 0
+}
+
 wait_healthy() {
-  local url deadline
+  # old_pid 非空时，还要求服务进程已换新：防止新版本没起来、旧进程仍在应答而误判成功
+  local old_pid="${1:-}" url deadline pid
   url="$(health_url)"
   deadline=$((SECONDS + HEALTH_TIMEOUT))
   while (( SECONDS < deadline )); do
+    pid="$(main_pid)"
+    if [[ -n "$old_pid" && ( -z "$pid" || "$pid" == "0" || "$pid" == "$old_pid" ) ]]; then
+      sleep 2
+      continue
+    fi
     if curl -fsS -m 5 "$url" 2>/dev/null | grep -q '"ok": *true'; then
       return 0
     fi
@@ -103,10 +113,13 @@ run_tests() {
 }
 
 restart_and_check() {
+  local old_pid
+  old_pid="$(main_pid)"
+  [[ "$old_pid" != "0" ]] || old_pid=""
   step "重启服务 $SERVICE"
   $SYSTEMCTL restart "$SERVICE"
   step "健康检查 $(health_url)（最多 ${HEALTH_TIMEOUT}s）"
-  wait_healthy
+  wait_healthy "$old_pid"
 }
 
 record() {
