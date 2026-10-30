@@ -162,3 +162,51 @@ def test_not_configured_without_token_or_webhook(monkeypatch):
     )
     assert fallback.balance_alert_resolved_webhook_url == "https://x"
     assert calls == []
+
+
+def _aigw_config(database: str = ":memory:", **overrides) -> AppConfig:
+    return _config(
+        database,
+        aigw_base_url="https://aigw.invalid",
+        aigw_access_token="aigw-token",
+        aigw_balance_alert_webhook_url="https://example.invalid/aigw",
+        aigw_balance_alert_threshold_usd=100.0,
+        **overrides,
+    )
+
+
+def test_aigw_low_balance_alerts_in_usd_to_its_own_robot(app, monkeypatch):
+    calls: list = []
+    gets: list = []
+    _capture_posts(monkeypatch, calls)
+    _mock_tokenhub(monkeypatch, _user(40000000), gets)  # $80，¥584 —— 按美元判断才会告警
+    config = _aigw_config(app.config["DATABASE"])
+    with app.app_context():
+        conn = get_db()
+        result = ba.check_and_alert(config, conn, wallet=ba.aigw_wallet(config))
+        assert result["sent"] is True and result["wallet"] == "AIGW"
+        assert repo.get_setting(ba.AIGW_LAST_SENT_SETTING, default="", connection=conn)
+        assert repo.get_setting(ba.LAST_SENT_SETTING, default="", connection=conn) == ""
+    url, kwargs = calls[0]
+    text = kwargs["json"]["content"]["text"]
+    assert url == "https://example.invalid/aigw"
+    assert "AIGW 余额 $80.00，低于 $100.00" in text
+    assert "https://aigw.invalid/wallet" in text
+    assert gets[1] == ("https://aigw.invalid/api/user/self", {"Authorization": "Bearer aigw-token"})
+
+
+def test_aigw_requires_its_own_webhook():
+    config = _config(aigw_access_token="t", aigw_balance_alert_webhook_url="")
+    assert config.aigw_balance_alert_configured is False
+    assert config.any_balance_alert_configured is True
+
+
+def test_controller_checks_every_configured_wallet(app, monkeypatch):
+    calls: list = []
+    _capture_posts(monkeypatch, calls)
+    _mock_tokenhub(monkeypatch, _user(5000000))  # ¥73 / $10，两边都低
+    controller = ba.BalanceAlertController(_aigw_config(app.config["DATABASE"]))
+    controller._run()
+    assert [r["wallet"] for r in controller.last_result] == ["TokenHub", "AIGW"]
+    assert [url for url, _ in calls] == ["https://example.invalid/alert", "https://example.invalid/aigw"]
+

@@ -878,7 +878,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         source_report_scheduler.start()
     if cfg.publish_alert_configured and not app.config.get("TESTING") and not test_config:
         publish_alert_scheduler.start()
-    if cfg.balance_alert_configured and not app.config.get("TESTING") and not test_config:
+    if cfg.any_balance_alert_configured and not app.config.get("TESTING") and not test_config:
         balance_alert_scheduler.start()
     if cfg.league_clicks_enabled and not app.config.get("TESTING") and not test_config:
         league_clicks_scheduler.start()

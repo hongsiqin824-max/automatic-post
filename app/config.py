@@ -258,6 +258,16 @@ class AppConfig:
     balance_alert_timeout_seconds: int = max(
         5, _env_int("BALANCE_ALERT_TIMEOUT_SECONDS", 15)
     )
+    # AIGW 钱包余额告警：与 TokenHub 同一套接口，余额按美元判断（网页即美元显示），
+    # 机器人必须单独配置，不回退到其他群；冷却/间隔/超时沿用 BALANCE_ALERT_*。
+    aigw_base_url: str = os.getenv(
+        "AIGW_BASE_URL", "https://aigw.dongqiudi.com"
+    ).strip().rstrip("/")
+    aigw_access_token: str = os.getenv("AIGW_ACCESS_TOKEN", "").strip()
+    aigw_balance_alert_webhook_url: str = os.getenv("AIGW_BALANCE_ALERT_WEBHOOK_URL", "").strip()
+    aigw_balance_alert_threshold_usd: float = max(
+        0.0, _env_float("AIGW_BALANCE_ALERT_THRESHOLD_USD", 100.0)
+    )
 
     # 联赛 tab 点击数据：每天凌晨从 StarRocks 拉前一天的结果存进本地累积表。
     # 上游实时表只保留约 30 天，所以补数窗口也就只能是 30 天。
@@ -498,6 +508,18 @@ class AppConfig:
             and self.tokenhub_access_token
             and self.balance_alert_resolved_webhook_url
         )
+
+    @property
+    def aigw_balance_alert_configured(self) -> bool:
+        return bool(
+            self.balance_alert_enabled
+            and self.aigw_access_token
+            and self.aigw_balance_alert_webhook_url
+        )
+
+    @property
+    def any_balance_alert_configured(self) -> bool:
+        return self.balance_alert_configured or self.aigw_balance_alert_configured
 
     @property
     def feishu_spreadsheet_configured(self) -> bool:
