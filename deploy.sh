@@ -12,7 +12,18 @@
 #   - 跳过测试：SKIP_TESTS=1 ./deploy.sh（只在紧急修复时用）。
 set -euo pipefail
 
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# git 拉代码会改写本文件。bash 边读边执行，原地改写可能读串，所以总是从一份临时
+# 副本执行；拉完代码后再用新版本的 deploy.sh 执行后半程（见 cmd_deploy）。
+if [[ -z "${DEPLOY_APP_DIR:-}" ]]; then
+  DEPLOY_APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  self_copy="$(mktemp "${TMPDIR:-/tmp}/automatic-post-deploy.XXXXXX")"
+  cp "${BASH_SOURCE[0]}" "$self_copy"
+  DEPLOY_APP_DIR="$DEPLOY_APP_DIR" exec bash "$self_copy" "$@"
+fi
+# 已在副本里运行：bash 持有文件句柄，删掉副本不影响继续执行
+[[ "${BASH_SOURCE[0]}" == "$DEPLOY_APP_DIR/deploy.sh" ]] || rm -f "${BASH_SOURCE[0]}"
+
+APP_DIR="$DEPLOY_APP_DIR"
 SERVICE="${SERVICE:-automatic-post}"
 REMOTE="${REMOTE:-origin}"
 BRANCH="${BRANCH:-main}"
@@ -135,8 +146,14 @@ cmd_deploy() {
       || die "无法快进合并（服务器分支与 Gitee 分叉），已停止，代码未改动"
     echo "本次更新："
     git log --format='  %h %s' "$prev..$new"
+    # 后半程（装依赖/测试/重启/回退）交给刚拉下来的新版本 deploy.sh
+    exec env -u DEPLOY_APP_DIR bash "$APP_DIR/deploy.sh" _after_pull "$prev" "$new"
   fi
+  cmd_after_pull "$prev" "$new"
+}
 
+cmd_after_pull() {
+  local prev="$1" new="$2"
   install_requirements_if_needed "$prev" "$new"
 
   if ! run_tests; then
@@ -211,6 +228,7 @@ cmd_status() {
 
 case "${1:-deploy}" in
   deploy) cmd_deploy ;;
+  _after_pull) cmd_after_pull "$2" "$3" ;;
   rollback) cmd_rollback "${2:-}" ;;
   status) cmd_status ;;
   test) run_tests ;;
