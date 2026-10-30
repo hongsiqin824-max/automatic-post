@@ -31,8 +31,13 @@ VENV="$APP_DIR/.venv"
 PY="$VENV/bin/python"
 HISTORY="$APP_DIR/instance/deploy_history.log"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"
-SYSTEMCTL="${SYSTEMCTL:-sudo systemctl}"
-JOURNALCTL="${JOURNALCTL:-sudo journalctl}"
+# root 身份下直接调用，非 root 走 sudo；需要时可用环境变量覆盖
+if [[ -z "${SYSTEMCTL:-}" ]]; then
+  [[ "$(id -u)" == "0" ]] && SYSTEMCTL="systemctl" || SYSTEMCTL="sudo systemctl"
+fi
+if [[ -z "${JOURNALCTL:-}" ]]; then
+  [[ "$(id -u)" == "0" ]] && JOURNALCTL="journalctl" || JOURNALCTL="sudo journalctl"
+fi
 
 cd "$APP_DIR"
 

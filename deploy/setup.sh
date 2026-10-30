@@ -29,14 +29,21 @@ green() { printf '\033[32m%s\033[0m\n' "$*"; }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die() { red "✗ $*"; exit 1; }
 
-[[ "$(id -u)" != "0" ]] || die "请用普通用户运行（脚本内部需要时会 sudo），不要直接用 root"
 cd "$APP_DIR"
 
 step "检查基础命令"
-for cmd in git curl sudo systemctl; do
+# root 身份下不需要 sudo；非 root 必须有 sudo 才能装 systemd 服务
+for cmd in git curl systemctl; do
   command -v "$cmd" >/dev/null || die "缺少命令：$cmd"
 done
-green "✓ git / curl / sudo / systemctl 都在"
+if [[ "$(id -u)" == "0" ]]; then
+  SUDO=""
+  green "✓ git / curl / systemctl 都在（以 root 运行）"
+else
+  command -v sudo >/dev/null || die "缺少命令：sudo"
+  SUDO="sudo"
+  green "✓ git / curl / sudo / systemctl 都在"
+fi
 
 step "查找 Python 3.9+"
 pick_python() {
@@ -88,16 +95,16 @@ green "✓ 测试通过"
 
 step "安装 systemd 服务 ${SERVICE}（用户 ${RUN_USER}）"
 sed -e "s#__USER__#${RUN_USER}#g" -e "s#__APP_DIR__#${APP_DIR}#g" deploy/automatic-post.service \
-  | sudo tee "/etc/systemd/system/${SERVICE}.service" >/dev/null
-sudo systemctl daemon-reload
-sudo systemctl enable "$SERVICE" >/dev/null 2>&1
+  | $SUDO tee "/etc/systemd/system/${SERVICE}.service" >/dev/null
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable "$SERVICE" >/dev/null 2>&1
 green "✓ 已安装并设为开机自启（尚未启动）"
 
 step "安装每日备份（每天 04:30，保留 7 份）"
 chmod +x deploy/backup.sh deploy.sh
 echo "30 4 * * * ${RUN_USER} /bin/bash '${APP_DIR}/deploy/backup.sh' >> '${APP_DIR}/instance/backup.log' 2>&1" \
-  | sudo tee "/etc/cron.d/${SERVICE}-backup" >/dev/null
-sudo chmod 644 "/etc/cron.d/${SERVICE}-backup"
+  | $SUDO tee "/etc/cron.d/${SERVICE}-backup" >/dev/null
+$SUDO chmod 644 "/etc/cron.d/${SERVICE}-backup"
 green "✓ /etc/cron.d/${SERVICE}-backup"
 
 if [[ -n "$DOMAIN" ]]; then
@@ -106,8 +113,8 @@ if [[ -n "$DOMAIN" ]]; then
     red "! 未安装 nginx。Ubuntu: sudo apt install nginx；CentOS/Rocky: sudo dnf install nginx。装好后重跑本脚本"
   else
     sed -e "s#__DOMAIN__#${DOMAIN}#g" -e "s#__PORT__#${PORT}#g" deploy/nginx-automatic-post.conf \
-      | sudo tee "/etc/nginx/conf.d/${SERVICE}.conf" >/dev/null
-    sudo nginx -t && sudo systemctl enable --now nginx >/dev/null 2>&1 && sudo systemctl reload nginx
+      | $SUDO tee "/etc/nginx/conf.d/${SERVICE}.conf" >/dev/null
+    $SUDO nginx -t && $SUDO systemctl enable --now nginx >/dev/null 2>&1 && $SUDO systemctl reload nginx
     green "✓ /etc/nginx/conf.d/${SERVICE}.conf"
   fi
 fi

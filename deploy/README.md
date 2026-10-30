@@ -27,7 +27,24 @@ Python 要求 3.9 及以上（已在 3.9.6、3.11.15 上全量测试通过；set
 cat /etc/os-release | head -2; uname -m; python3 --version; git --version; sudo -n true 2>/dev/null && echo "sudo: 免密可用" || echo "sudo: 需要密码或无权限"; systemctl --version | head -1; timedatectl 2>/dev/null | grep "Time zone"; df -h ~ | tail -1; for u in https://gitee.com https://aigc-core.dongqiudi.com https://aigw.dongqiudi.com https://tokenhub.dongqiudi.com https://platform.dongqiudi.com https://dadmin.dongqiudi.com https://matchgif.aisportsapp.com https://open.feishu.cn https://pypi.org https://mirrors.aliyun.com/pypi/simple/; do printf "%-45s" "$u"; curl -s -o /dev/null -m 8 -w "%{http_code}\n" "$u" || echo "不通"; done; (timeout 5 bash -c "</dev/tcp/172.21.0.148/9030" && echo "StarRocks 9030 通") || echo "StarRocks 9030 不通"
 ```
 
+### 本次服务器实测结论（2026-10-30）
+
+Rocky Linux 9.8 / x86_64、Python 3.9.25、systemd 252、时区 Asia/Shanghai、磁盘剩余 66G、sudo 免密、StarRocks 9030 通。
+以 root 身份部署（脚本已支持，不需要额外建账号）。
+
+| 外部地址 | 结果 | 说明 |
+|---|---|---|
+| gitee.com / aigw.dongqiudi.com / platform.dongqiudi.com | 通 | 拉代码、大模型、发稿都正常 |
+| aigc-core.dongqiudi.com / open.feishu.cn | 404 | 网络通，首页本身就返回 404（Mac 上同样） |
+| matchgif.aisportsapp.com | 首页 502 | `/token-service/auth/status` 返回 `AUTHORIZED`，开放平台授权正常 |
+| dadmin.dongqiudi.com | 不通 | **不影响**，对应旧发布方式，`.env` 未配置、代码不会调用 |
+| tokenhub.dongqiudi.com | 不通 | **不影响发稿**。大模型已迁 AIGW；需把服务器 `.env` 的 `TOKENHUB_ACCESS_TOKEN` 留空，关掉 TokenHub 余额告警，只保留 AIGW 余额告警 |
+
+缺 git 时先装：`dnf install -y git`。
+
 ## 二、首次安装（迁移前一天做即可，不影响 Mac 上正在跑的服务）
+
+脚本支持 root 直接运行，也支持普通用户（内部自动用 sudo）。下面命令以 root 为例。
 
 ### 1. 配置 Gitee 部署公钥（只读）
 
