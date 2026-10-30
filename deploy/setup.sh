@@ -86,7 +86,7 @@ step "运行测试（临时库，不碰线上数据、不发真实消息）"
 bash ./deploy.sh test || die "测试未通过，请把输出发给开发排查"
 green "✓ 测试通过"
 
-step "安装 systemd 服务 $SERVICE（用户 $RUN_USER）"
+step "安装 systemd 服务 ${SERVICE}（用户 ${RUN_USER}）"
 sed -e "s#__USER__#${RUN_USER}#g" -e "s#__APP_DIR__#${APP_DIR}#g" deploy/automatic-post.service \
   | sudo tee "/etc/systemd/system/${SERVICE}.service" >/dev/null
 sudo systemctl daemon-reload

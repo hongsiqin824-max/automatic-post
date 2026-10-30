@@ -104,5 +104,5 @@ cat <<EOF
      cd ~/automatic-post && mv env .env && chmod 600 .env
      bash deploy/import_db.sh automatic_post.sqlite3.gz
      sudo systemctl start automatic-post && ./deploy.sh status
-3. 上传完成后可删除本地的 $OUT（env 里有密钥）。
+3. 上传完成后可删除本地的 ${OUT}（env 里有密钥）。
 EOF

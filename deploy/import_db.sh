@@ -54,5 +54,5 @@ if [[ -f "$DB" ]]; then
 fi
 rm -f "$DB-journal" "$DB-wal" "$DB-shm"
 mv "$tmp" "$DB"
-green "✓ 导入完成：$DB（$(du -h "$DB" | cut -f1)）"
+green "✓ 导入完成：${DB}（$(du -h "$DB" | cut -f1)）"
 echo "确认 Mac 上的服务已停止后启动：sudo systemctl start $SERVICE && ./deploy.sh status"

@@ -80,7 +80,7 @@ wait_healthy() {
 install_requirements_if_needed() {
   local from="$1" to="$2"
   if [[ ! -x "$PY" ]]; then
-    die "缺少虚拟环境 $VENV，请先运行 deploy/setup.sh"
+    die "缺少虚拟环境 ${VENV}，请先运行 deploy/setup.sh"
   fi
   if [[ "$from" == "$to" ]] || ! git diff --quiet "$from" "$to" -- requirements.txt; then
     step "安装依赖（requirements.txt 有变化）"
