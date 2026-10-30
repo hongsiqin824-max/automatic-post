@@ -1,0 +1,20 @@
+[Unit]
+Description=Automatic Post（文章质检与发布服务）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/.venv/bin/python run.py web
+# 单进程：定时抓稿/发布/告警都在进程内线程里，绝不能起多个实例。
+Restart=always
+RestartSec=5
+# 给正在进行的质检/发布留出收尾时间
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Shanghai
+
+[Install]
+WantedBy=multi-user.target
