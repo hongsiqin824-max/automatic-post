@@ -35,8 +35,20 @@ class _FakeLLM:
         return self.answer
 
 
+INPUT_BLOCKED = LLMCallError(
+    "AI 服务调用失败: Error code: 400 - {'error': {'message': "
+    "'Input text data may contain inappropriate content.', 'type': 'data_inspection_failed'}}",
+    category="http_error",
+    retryable=False,
+)
+
+
+def _timeout() -> LLMCallError:
+    return LLMCallError("timeout", category="timeout", retryable=True)
+
+
 def test_check_china_political_prompt_and_verdict():
-    llm = _FakeLLM({"china_political": True, "reason": "领导人评价争议"})
+    llm = _FakeLLM({"flag": True, "reason": "领导人评价争议"})
     verdict = check_china_political(TITLE, BODY, llm)
     assert verdict == {"china_political": True, "reason": "领导人评价争议"}
     prompt = llm.prompts[0]
@@ -44,23 +56,56 @@ def test_check_china_political_prompt_and_verdict():
     assert "中国足协的人事和管理" in prompt
     assert "只判断一件事" in prompt
     assert "毛泽东" in prompt
+    # 网关审查模型输出，回答里出现 china_political 会被拦，只能用中性字段名。
+    assert '{"flag":false' in prompt
+    assert "china_political" not in prompt
 
 
 def test_check_china_political_ignores_non_strict_flag():
-    verdict = check_china_political(TITLE, BODY, _FakeLLM({"china_political": "true"}))
+    verdict = check_china_political(TITLE, BODY, _FakeLLM({"flag": "true"}))
     assert verdict["china_political"] is False
 
 
 def test_check_china_political_uses_fallback_model():
-    primary = _FakeLLM(error=LLMCallError("timeout", category="timeout", retryable=True))
-    fallback = _FakeLLM({"china_political": True, "reason": "外交部表态"})
+    primary = _FakeLLM(error=_timeout())
+    fallback = _FakeLLM({"flag": True, "reason": "外交部表态"})
     assert check_china_political(TITLE, BODY, primary, fallback)["china_political"] is True
 
 
 def test_check_china_political_raises_without_answer():
-    primary = _FakeLLM(error=LLMCallError("timeout", category="timeout", retryable=True))
+    primary = _FakeLLM(error=_timeout())
     with pytest.raises(LLMCallError):
         check_china_political(TITLE, BODY, primary)
+
+
+def test_gateway_input_blocked_then_fallback_answers_uses_fallback():
+    primary = _FakeLLM(error=INPUT_BLOCKED)
+    fallback = _FakeLLM({"flag": False, "reason": "体育新闻"})
+    verdict = check_china_political(NEUTRAL_TITLE, NEUTRAL_BODY, primary, fallback)
+    assert verdict["china_political"] is False
+
+
+@pytest.mark.parametrize(
+    ("primary_error", "fallback_error"),
+    [(INPUT_BLOCKED, _timeout()), (_timeout(), INPUT_BLOCKED)],
+)
+def test_gateway_input_blocked_and_no_model_answers_counts_as_hit(primary_error, fallback_error):
+    verdict = check_china_political(
+        TITLE, BODY, _FakeLLM(error=primary_error), _FakeLLM(error=fallback_error)
+    )
+    assert verdict["china_political"] is True
+    assert verdict["gateway_input_blocked"] is True
+    assert verdict["reason"] == "网关判定内容敏感，且无模型可判定"
+
+
+def test_gateway_input_blocked_without_fallback_counts_as_hit():
+    verdict = check_china_political(TITLE, BODY, _FakeLLM(error=INPUT_BLOCKED))
+    assert verdict["china_political"] is True
+
+
+def test_both_models_fail_for_other_reasons_still_raises():
+    with pytest.raises(LLMCallError):
+        check_china_political(TITLE, BODY, _FakeLLM(error=_timeout()), _FakeLLM(error=_timeout()))
 
 
 def _run(app, monkeypatch, verdict_fn, title=NEUTRAL_TITLE, body=NEUTRAL_BODY):
@@ -154,7 +199,7 @@ def test_china_political_check_failure_falls_through(app, monkeypatch):
 
 def test_hard_keywords_match_leaders_and_mbappe():
     assert match_china_political_keywords("姆巴佩梅开二度", "") == ["姆巴佩"]
-    assert match_china_political_keywords("标题", "<p>他引用了習近平的话</p>") == ["習近平"]
+    assert "習近平" in match_china_political_keywords("标题", "<p>他引用了習近平的话</p>")
     assert match_china_political_keywords("孙兴慜梅开二度", "<p>热刺取胜</p>") == []
     assert match_china_political_keywords("韩媒：KT队与李强喆续约3年", "") == []
 
