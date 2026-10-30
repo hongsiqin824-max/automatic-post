@@ -89,6 +89,13 @@ class _AttributeFinder(HTMLParser):
         if not self._raw_text_depth:
             self.unparsed_text.append(data)
 
+    def close(self) -> None:
+        # 结尾未闭合的标签：旧版 Python 在 close() 时当作文本交给 handle_data，
+        # 打过安全补丁的新版（如 3.11.15）会直接丢弃。先把残留原文收下，两种行为都能检测到。
+        if self.rawdata and not self._raw_text_depth:
+            self.unparsed_text.append(self.rawdata)
+        super().close()
+
 
 def _safe_image_attribute(name: str, value: str | None) -> bool:
     lowered = name.lower()
