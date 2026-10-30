@@ -79,9 +79,10 @@ run_tests() {
   fi
   local tmp status=0
   tmp="$(mktemp -d)"
-  # 测试用临时库，并清空所有外部凭据：任何测试都不可能碰到线上库或真实发消息。
+  # 测试用临时库，并清空模型/飞书/余额等外部凭据：任何测试都不可能碰到线上库或真实发消息。
+  # 开放平台凭据保留：临时库里没有授权 token，发不出稿；部分页面测试依赖它判断「已配置」。
   env AUTOMATIC_POST_DB="$tmp/test.sqlite3" \
-    LLM_API_KEY= LLM_API_KEY2= MATERIAL_API_KEY= DQD_OPEN_APPSECRET= \
+    LLM_API_KEY= LLM_API_KEY2= MATERIAL_API_KEY= \
     FEISHU_REPORT_WEBHOOK_URL= SOURCE_REPORT_WEBHOOK_URL= PUBLISH_ALERT_WEBHOOK_URL= \
     BALANCE_ALERT_WEBHOOK_URL= AIGW_BALANCE_ALERT_WEBHOOK_URL= \
     TOKENHUB_ACCESS_TOKEN= AIGW_ACCESS_TOKEN= FEISHU_APP_SECRET= TOKEN_SERVICE_URL= \
