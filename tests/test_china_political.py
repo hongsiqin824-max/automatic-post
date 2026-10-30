@@ -103,6 +103,20 @@ def test_gateway_input_blocked_without_fallback_counts_as_hit():
     assert verdict["china_political"] is True
 
 
+def test_aigw_gateway_input_blocked_wording_counts_as_hit():
+    aigw_blocked = LLMCallError(
+        "AI 服务调用失败: Error code: 400 - {'error': {'message': "
+        "'Input data may contain inappropriate content. For details, see: https://x'}}",
+        category="http_error",
+        retryable=False,
+    )
+    verdict = check_china_political(
+        TITLE, BODY, _FakeLLM(error=_timeout()), _FakeLLM(error=aigw_blocked)
+    )
+    assert verdict["china_political"] is True
+    assert verdict["gateway_input_blocked"] is True
+
+
 def test_both_models_fail_for_other_reasons_still_raises():
     with pytest.raises(LLMCallError):
         check_china_political(TITLE, BODY, _FakeLLM(error=_timeout()), _FakeLLM(error=_timeout()))

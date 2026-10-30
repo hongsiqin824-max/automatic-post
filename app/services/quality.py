@@ -273,8 +273,10 @@ def match_china_political_keywords(title: str, body: str) -> list[str]:
     return [keyword for keyword in dict.fromkeys(CHINA_POLITICAL_HARD_KEYWORDS) if keyword in text]
 
 
-# 网关（TokenHub）对输入做内容审查，命中时返回 400 且带这句话；说明文章本身被判敏感。
-GATEWAY_INPUT_BLOCKED_MARKER = "Input text data may contain inappropriate content"
+# 网关对输入做内容审查，命中时返回 400 且带这句话；说明文章本身被判敏感。
+# TokenHub 原文是「Input text data may contain …」，AIGW 是「Input data may contain …」，
+# 只匹配共同的后半句，两个平台都能识别。
+GATEWAY_INPUT_BLOCKED_MARKER = "may contain inappropriate content"
 CHINA_POLITICAL_GATEWAY_BLOCKED_REASON = "网关判定内容敏感，且无模型可判定"
 
 
