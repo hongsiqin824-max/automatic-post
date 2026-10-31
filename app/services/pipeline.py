@@ -631,6 +631,15 @@ def _quality_allows_followup_body_repair(
         "social_promotion",
         "sponsorship_promotion",
         "video_promotion",
+        # 与首轮规划器可用的类别保持一致：首轮能执行的计划，后续轮不该因类别名被拦下。
+        "standalone_program_promotion",
+        "standalone_media_promotion",
+        "standalone_ad_promotion",
+        "standalone_external_promotion",
+        "minor_text_defect",
+        "节目推广",
+        "频道推广",
+        "轻微文本缺陷",
         "无关内容",
         "重复内容",
         "模板残留",
@@ -699,6 +708,80 @@ def _quality_allows_followup_body_repair(
             # 链接删除没有可比对的替换文本，保留原来的措辞检查作为额外约束。
             return False
     return True
+
+
+def _quality_allows_followup_replanning(quality: dict[str, Any]) -> bool:
+    """Allow asking the planner when a later round reports only removable dirt.
+
+    The quality model often says "dirt remains" without attaching a plan that
+    passes the follow-up gate.  A dedicated planning call may supply one, but
+    only when title/body are explicitly complete and dirt is the sole issue.
+    """
+
+    if not isinstance(quality, dict) or quality.get("semantic_error"):
+        return False
+    if not _quality_repair_scope_is_dirty_only(quality):
+        return False
+    semantic = quality.get("semantic_check")
+    return bool(
+        isinstance(semantic, dict)
+        and semantic.get("title_complete") is True
+        and semantic.get("body_complete") is True
+    )
+
+
+def _replan_followup_round(
+    config: AppConfig,
+    *,
+    title: str,
+    body: str,
+    quality: dict[str, Any],
+    verifier: "_RemovalVerifier",
+    validation_error: str | None,
+    rejected_plans: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]], str | None, dict[str, Any] | None]:
+    """Re-plan one follow-up round against the current candidate body.
+
+    Returns ``(body, matches, error, record)``.  ``record`` is ``None`` when no
+    planner call was made (no model configured).  The new plan goes through the
+    same ``apply_repair_plan`` validation as every other round.
+    """
+
+    planner_llm = _make_llm(config)
+    if planner_llm is None:
+        return body, [], validation_error, None
+    record: dict[str, Any] = {
+        "trigger_error": str(validation_error)[:300] if validation_error else None,
+        "rejected_plans": _audit_repair_plans(rejected_plans),
+    }
+    try:
+        result = plan_local_repair(
+            title=title,
+            body=body,
+            first_quality=quality,
+            llm=planner_llm,
+            llm_fallback=_make_fallback_llm(config),
+            validation_error=validation_error,
+            rejected_plans=rejected_plans,
+        )
+    except Exception as exc:  # planning outage keeps the candidate unchanged
+        record.update({"repairable": False, "repair_plan_error": str(exc)[:300]})
+        return body, [], str(exc)[:300], record
+    planned = result.get("repair_plans")
+    plans = [item for item in planned if isinstance(item, dict)] if isinstance(planned, list) else []
+    plan_error = result.get("repair_plan_error")
+    record.update({
+        "repairable": result.get("repairable") is True,
+        "reason": str(result.get("reason") or "")[:500],
+        "repair_plans": _audit_repair_plans(plans),
+        "repair_plan_error": str(plan_error)[:300] if plan_error else None,
+    })
+    if result.get("repairable") is not True or not plans or plan_error:
+        return body, [], str(plan_error or "AI 重新规划未提供可执行的局部修复计划")[:300], record
+    verifier.body = body
+    new_body, matches, error = apply_repair_plan(body, plans, verifier=verifier)
+    record["validation_error"] = str(error)[:300] if error else None
+    return new_body, matches, error, record
 
 
 def _followup_body_is_safe(before: str, after: str) -> tuple[bool, dict[str, Any], dict[str, Any]]:
@@ -1103,75 +1186,85 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             ai_body_after, ai_plan_matches, ai_plan_error = apply_repair_plan(
                 body_before, repair_plans, verifier=removal_verifier
             )
-            if (
-                _repair_validation_error_allows_replan(ai_plan_error)
+            # 定位或格式类校验错误可以带着错误原因重新规划。第一次重规划常因同类定位
+            # 失误再次失败，因此最多重规划 MAX_AI_REPAIR_ROUNDS - 1 次，每次都把最新的
+            # 校验错误和被拒计划交给模型。安全类拒绝不在白名单内，不会进入这里。
+            replan_attempts = 0
+            while (
+                replan_attempts < MAX_AI_REPAIR_ROUNDS - 1
+                and _repair_validation_error_allows_replan(ai_plan_error)
                 and (
                     first_quality.get("decision") == "repairable"
                     or _quality_allows_body_repair_planning(first_quality)
                 )
             ):
-                rejected_plans = [dict(item) for item in repair_plans]
                 replanner_llm = _make_llm(config)
-                if replanner_llm is not None:
-                    trigger_error = str(ai_plan_error)[:300]
-                    try:
-                        replanner_result = plan_local_repair(
-                            title=current.get("title_final", ""),
-                            body=body_before,
-                            first_quality=first_quality,
-                            llm=replanner_llm,
-                            llm_fallback=_make_fallback_llm(config),
-                            validation_error=trigger_error,
-                            rejected_plans=rejected_plans,
+                if replanner_llm is None:
+                    break
+                replan_attempts += 1
+                rejected_plans = [dict(item) for item in repair_plans]
+                trigger_error = str(ai_plan_error)[:300]
+                try:
+                    replanner_result = plan_local_repair(
+                        title=current.get("title_final", ""),
+                        body=body_before,
+                        first_quality=first_quality,
+                        llm=replanner_llm,
+                        llm_fallback=_make_fallback_llm(config),
+                        validation_error=trigger_error,
+                        rejected_plans=rejected_plans,
+                    )
+                    replanned = replanner_result.get("repair_plans")
+                    replanned_plans = (
+                        [item for item in replanned if isinstance(item, dict)]
+                        if isinstance(replanned, list) else []
+                    )
+                    replanner_error = replanner_result.get("repair_plan_error")
+                    repair_replanner = {
+                        "attempted": True,
+                        "attempts": replan_attempts,
+                        "trigger_error": trigger_error,
+                        "rejected_plans": _audit_repair_plans(rejected_plans),
+                        "repairable": replanner_result.get("repairable") is True,
+                        "reason": str(replanner_result.get("reason") or "")[:500],
+                        "repair_plans": _audit_repair_plans(replanned_plans),
+                        "repair_plan_error": (
+                            str(replanner_error)[:300] if replanner_error else None
+                        ),
+                    }
+                    if (
+                        replanner_result.get("repairable") is True
+                        and replanned_plans
+                        and not replanner_error
+                    ):
+                        repair_plans = replanned_plans
+                        ai_body_after, ai_plan_matches, ai_plan_error = apply_repair_plan(
+                            body_before,
+                            repair_plans,
+                            verifier=removal_verifier,
                         )
-                        replanned = replanner_result.get("repair_plans")
-                        replanned_plans = (
-                            [item for item in replanned if isinstance(item, dict)]
-                            if isinstance(replanned, list) else []
+                        repair_replanner["validation_error"] = (
+                            str(ai_plan_error)[:300] if ai_plan_error else None
                         )
-                        replanner_error = replanner_result.get("repair_plan_error")
-                        repair_replanner = {
-                            "attempted": True,
-                            "trigger_error": trigger_error,
-                            "rejected_plans": _audit_repair_plans(rejected_plans),
-                            "repairable": replanner_result.get("repairable") is True,
-                            "reason": str(replanner_result.get("reason") or "")[:500],
-                            "repair_plans": _audit_repair_plans(replanned_plans),
-                            "repair_plan_error": (
-                                str(replanner_error)[:300] if replanner_error else None
-                            ),
-                        }
-                        if (
-                            replanner_result.get("repairable") is True
-                            and replanned_plans
-                            and not replanner_error
-                        ):
-                            repair_plans = replanned_plans
-                            ai_body_after, ai_plan_matches, ai_plan_error = apply_repair_plan(
-                                body_before,
-                                repair_plans,
-                                verifier=removal_verifier,
-                            )
-                            repair_replanner["validation_error"] = (
-                                str(ai_plan_error)[:300] if ai_plan_error else None
-                            )
-                        else:
-                            ai_plan_error = str(
-                                replanner_error
-                                or "AI 重新规划未提供可执行的局部修复计划"
-                            )[:300]
-                    except Exception as exc:  # one failed re-plan still preserves the original body
-                        logger.warning("AI 局部修复重新规划失败 article_id=%s: %s", article_id, exc)
-                        repair_replanner = {
-                            "attempted": True,
-                            "trigger_error": trigger_error,
-                            "rejected_plans": _audit_repair_plans(rejected_plans),
-                            "repairable": False,
-                            "reason": "AI 局部修复重新规划调用失败",
-                            "repair_plans": [],
-                            "repair_plan_error": str(exc)[:300],
-                        }
-                        ai_plan_error = str(exc)[:300]
+                    else:
+                        ai_plan_error = str(
+                            replanner_error
+                            or "AI 重新规划未提供可执行的局部修复计划"
+                        )[:300]
+                except Exception as exc:  # one failed re-plan still preserves the original body
+                    logger.warning("AI 局部修复重新规划失败 article_id=%s: %s", article_id, exc)
+                    repair_replanner = {
+                        "attempted": True,
+                        "attempts": replan_attempts,
+                        "trigger_error": trigger_error,
+                        "rejected_plans": _audit_repair_plans(rejected_plans),
+                        "repairable": False,
+                        "reason": "AI 局部修复重新规划调用失败",
+                        "repair_plans": [],
+                        "repair_plan_error": str(exc)[:300],
+                    }
+                    ai_plan_error = str(exc)[:300]
+                    break
             if (
                 ai_plan_error is None
                 and repair_replanner is None
@@ -1578,24 +1671,60 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
         followup_before_stats: dict[str, Any] = {}
         followup_after_stats: dict[str, Any] = {}
         followup_rounds = 0
+        followup_replans: list[dict[str, Any]] = []
         quality_round = 2
         # 模型每轮只稳定地看到一部分脏内容：第一轮删掉引流块，第二轮才报出段尾的图片
-        # 署名。只要上一轮质检明确给出可执行的局部修复计划，就再修一轮，直到通过、
-        # 出错或用完 MAX_AI_REPAIR_ROUNDS 轮。每轮都跑同一套逐字校验、正文与图片安全
-        # 不变量和累计删除字数上限，最后仍须整体通过质检才提交。
+        # 署名。只要上一轮质检仍只剩可删的脏内容，就再修一轮，直到通过、出错或用完
+        # MAX_AI_REPAIR_ROUNDS 轮。质检自带的计划未通过定位校验、或只报脏不给计划时，
+        # 带着失败原因对当前候选正文重新规划一次。每轮都跑同一套逐字校验、正文与图片
+        # 安全不变量和累计删除字数上限，最后仍须整体通过质检才提交。
         while (
             second_error is None
             and not second_passed
             and followup_error is None
             and followup_rounds + 1 < MAX_AI_REPAIR_ROUNDS
-            and _quality_allows_followup_body_repair(second_quality)
         ):
             removal_verifier.body = body_after
-            round_body, round_matches, round_error = apply_repair_plan(
-                body_after,
-                second_quality.get("repair_plans"),
-                verifier=removal_verifier,
-            )
+            if _quality_allows_followup_body_repair(second_quality):
+                round_plans = [
+                    dict(item) for item in second_quality.get("repair_plans") or []
+                    if isinstance(item, dict)
+                ]
+                round_body, round_matches, round_error = apply_repair_plan(
+                    body_after,
+                    second_quality.get("repair_plans"),
+                    verifier=removal_verifier,
+                )
+                replan_trigger = (
+                    round_error
+                    if _repair_validation_error_allows_replan(round_error)
+                    else None
+                )
+            elif _quality_allows_followup_replanning(second_quality):
+                round_plans = []
+                round_body, round_matches, round_error = body_after, [], None
+                replan_trigger = ""
+            else:
+                break
+            if replan_trigger is not None:
+                replan_body, replan_matches, replan_error, replan_record = _replan_followup_round(
+                    config,
+                    title=current.get("title_final", ""),
+                    body=body_after,
+                    quality=second_quality,
+                    verifier=removal_verifier,
+                    validation_error=replan_trigger or None,
+                    rejected_plans=round_plans,
+                )
+                if replan_record is not None:
+                    replan_record["quality_round"] = quality_round
+                    followup_replans.append(replan_record)
+                    round_body, round_matches, round_error = (
+                        replan_body, replan_matches, replan_error
+                    )
+                if not round_plans and (replan_record is None or not round_matches):
+                    # 质检没给计划、重新规划也给不出可执行计划：照旧转人工，不记作修复错误。
+                    break
             round_safe, round_before_stats, round_after_stats = _followup_body_is_safe(
                 body_after, round_body
             )
@@ -1603,7 +1732,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                 round_error = round_error or "二次局部修复未通过正文或图片安全校验"
                 round_matches = []
             if round_error is not None or not round_matches:
-                # 这一轮修不动就停下：再调用一次模型也只会拿到同一份计划。
+                # 这一轮（含重新规划）仍修不动就停下。
                 followup_error = round_error
                 if followup_quality is None:
                     followup_quality = second_quality
@@ -1756,6 +1885,8 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     cumulative_removed_visible_chars > MAX_AI_REPAIR_REMOVED_CHARS
                 ),
             }
+        if followup_replans:
+            repair["followup_replans"] = followup_replans
         if followup_error:
             repair["error"] = followup_error
         elif second_error is not None:

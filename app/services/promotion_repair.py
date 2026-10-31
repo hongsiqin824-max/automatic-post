@@ -194,7 +194,7 @@ MAX_AI_REPAIR_ROUNDS = 3
 # 这篇文章的唯一一次修复机会——否则校验规则升级后，旧文章永远停在人工审核。幂等因此
 # 记录 {正文指纹, 规则版本}：同一份正文在同一规则版本下只尝试一次，规则版本提升后允许
 # 再尝试一次。升级校验逻辑时必须同时提升这个数字。
-REPAIR_RULE_VERSION = 3
+REPAIR_RULE_VERSION = 4
 
 # The model is allowed to describe a new promotion wording without waiting
 # for a new regular expression.  These are content categories, rather than

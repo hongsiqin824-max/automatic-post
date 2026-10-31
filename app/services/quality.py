@@ -828,7 +828,7 @@ def plan_local_repair(
                 if item.get(key) is not None
             })
         retry_context = (
-            "这是唯一一次重新规划机会。上一次计划未通过程序定位校验，"
+            "这是重新规划。上一次计划未通过程序定位校验，"
             "请根据校验错误重新选择下方当前正文中真实存在的 block_id、segment_id、link_id 或 empty_block_id，"
             "不得再次使用不存在的目标，也不得扩大修改范围。\n"
             f"上次校验错误：{str(validation_error)[:300]}\n"

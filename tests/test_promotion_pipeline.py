@@ -2585,3 +2585,277 @@ def test_pipeline_synthesized_inline_plan_needs_fact_verification(app, monkeypat
         assert repair["removal_verification"][0]["safe"] is False
     finally:
         conn.close()
+
+
+ORPHAN = "里尔前锋上田绮世"
+MULTI_ROUND_BODY = f"<p>{ARTICLE_TEXT}</p><p>{ORPHAN}</p>{IMAGE}<p>{PROMOTION}</p>"
+
+
+def _repairable_dirty(plans: list[dict]) -> dict:
+    quality = deepcopy(FIRST_DIRTY)
+    quality.update({
+        "decision": "repairable",
+        "semantic_check": {
+            "title_complete": True,
+            "body_complete": True,
+            "has_ad_or_dirty": True,
+            "repairable": True,
+            "needs_review": False,
+        },
+        "repair_plans": plans,
+        "repair_plan_error": None,
+    })
+    return quality
+
+
+def _remove_plan(block_id: str, evidence: str, issue_type: str = "promotion") -> dict:
+    return {
+        "block_id": block_id,
+        "action": "remove_block",
+        "evidence": evidence,
+        "issue_type": issue_type,
+        "reason": "独立推广或孤立片段，与新闻事实无关",
+        "confidence": 0.99,
+    }
+
+
+def _sequenced_evaluate(monkeypatch, answers: list[dict]) -> list[dict]:
+    calls: list[dict] = []
+    remaining = iter(answers)
+
+    def fake_evaluate(**kwargs):
+        calls.append(kwargs)
+        return next(remaining)
+
+    monkeypatch.setattr("app.services.pipeline.evaluate", fake_evaluate)
+    return calls
+
+
+def test_followup_round_replans_invalid_locator_on_current_body(app, monkeypatch) -> None:
+    """后续轮质检给的计划定位错了，应带着错误重新规划，而不是直接转人工。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    _fetch(monkeypatch, [_item("followup-replan-locator", body=MULTI_ROUND_BODY)])
+    calls = _sequenced_evaluate(monkeypatch, [
+        _repairable_dirty([_remove_plan("b3", PROMOTION)]),
+        _repairable_dirty([_remove_plan("b2", ORPHAN + "。", "template_artifact")]),
+        deepcopy(SECOND_PASS),
+    ])
+    replanner_calls: list[dict] = []
+
+    def fake_replanner(**kwargs):
+        replanner_calls.append(kwargs)
+        return {
+            "repairable": True,
+            "reason": "按真实正文块重新定位孤立片段",
+            "repair_plans": [_remove_plan("b2", ORPHAN, "template_artifact")],
+            "repair_plan_error": None,
+        }
+
+    monkeypatch.setattr("app.services.pipeline._make_llm", lambda config: object())
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", fake_replanner)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(replanner_calls) == 1
+    assert "证据与目标正文块不一致" in replanner_calls[0]["validation_error"]
+    assert replanner_calls[0]["rejected_plans"][0]["evidence"].endswith("。")
+    # 重新规划针对的是第一轮修复后的候选正文，而不是原文。
+    assert PROMOTION not in replanner_calls[0]["body"]
+    assert len(calls) == 3
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert PROMOTION not in article["body_html"]
+        assert ORPHAN not in article["body_html"]
+        assert IMAGE in article["body_html"]
+        assert article["title_final"] == TITLE
+        repair = article["quality"]["promotion_repair"]
+        assert repair["outcome"] == "passed"
+        assert repair["followup_replans"][0]["validation_error"] is None
+        assert repair["followup_replans"][0]["quality_round"] == 2
+        events = _event_map(article["id"], conn)
+        assert [e["payload"]["quality_round"] for e in events["QUALITY_RESULT"]] == [1, 2, 3]
+    finally:
+        conn.close()
+
+
+def test_followup_round_plans_when_quality_reports_dirt_without_plan(app, monkeypatch) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    _fetch(monkeypatch, [_item("followup-plan-missing", body=MULTI_ROUND_BODY)])
+    calls = _sequenced_evaluate(monkeypatch, [
+        _repairable_dirty([_remove_plan("b3", PROMOTION)]),
+        _repairable_dirty([]),
+        deepcopy(SECOND_PASS),
+    ])
+    replanner_calls: list[dict] = []
+
+    def fake_planner(**kwargs):
+        replanner_calls.append(kwargs)
+        return {
+            "repairable": True,
+            "reason": "孤立片段可整块删除",
+            "repair_plans": [_remove_plan("b2", ORPHAN, "template_artifact")],
+            "repair_plan_error": None,
+        }
+
+    monkeypatch.setattr("app.services.pipeline._make_llm", lambda config: object())
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", fake_planner)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(replanner_calls) == 1
+    assert replanner_calls[0]["validation_error"] is None
+    assert len(calls) == 3
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert ORPHAN not in article["body_html"]
+        assert PROMOTION not in article["body_html"]
+    finally:
+        conn.close()
+
+
+def test_followup_round_accepts_standalone_promotion_issue_type(app, monkeypatch) -> None:
+    """首轮规划器可用的 standalone_* 类别，后续轮也必须能执行。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    _fetch(monkeypatch, [_item("followup-standalone-type", body=MULTI_ROUND_BODY)])
+    _sequenced_evaluate(monkeypatch, [
+        _repairable_dirty([_remove_plan("b3", PROMOTION)]),
+        _repairable_dirty([_remove_plan("b2", ORPHAN, "standalone_program_promotion")]),
+        deepcopy(SECOND_PASS),
+    ])
+
+    def unexpected_planner(**kwargs):
+        raise AssertionError("计划本身可执行时不应重新规划")
+
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", unexpected_planner)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert ORPHAN not in article["body_html"]
+        assert article["quality"]["promotion_repair"]["followup_repair"]["rounds"] == 1
+    finally:
+        conn.close()
+
+
+def test_first_round_replans_twice_before_giving_up(app, monkeypatch) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{PROMOTION}</p>"
+    _fetch(monkeypatch, [_item("first-round-two-replans", body=body)])
+    calls = _sequenced_evaluate(monkeypatch, [
+        _repairable_dirty([_remove_plan("b2", PROMOTION + "。")]),
+        deepcopy(SECOND_PASS),
+    ])
+    replanned = iter([
+        [_remove_plan("b2", PROMOTION + "！")],
+        [_remove_plan("b2", PROMOTION)],
+    ])
+    replanner_calls: list[dict] = []
+
+    def fake_replanner(**kwargs):
+        replanner_calls.append(kwargs)
+        return {
+            "repairable": True,
+            "reason": "重新定位",
+            "repair_plans": next(replanned),
+            "repair_plan_error": None,
+        }
+
+    monkeypatch.setattr("app.services.pipeline._make_llm", lambda config: object())
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", fake_replanner)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"READY_TO_PUBLISH": 1}
+    assert len(replanner_calls) == 2
+    # 第二次重新规划拿到的是第一次重规划被拒的计划和它的错误。
+    assert replanner_calls[1]["rejected_plans"][0]["evidence"].endswith("！")
+    assert len(calls) == 2
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert PROMOTION not in article["body_html"]
+        assert article["quality"]["promotion_repair"]["repair_replanner"]["attempts"] == 2
+    finally:
+        conn.close()
+
+
+def test_first_round_replan_stops_after_cap(app, monkeypatch) -> None:
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    body = f"<p>{ARTICLE_TEXT}</p>{IMAGE}<p>{PROMOTION}</p>"
+    _fetch(monkeypatch, [_item("first-round-replan-cap", body=body)])
+    calls = _sequenced_evaluate(monkeypatch, [
+        _repairable_dirty([_remove_plan("b2", PROMOTION + "。")]),
+    ])
+    replanner_calls: list[dict] = []
+
+    def always_wrong(**kwargs):
+        replanner_calls.append(kwargs)
+        return {
+            "repairable": True,
+            "reason": "重新定位",
+            "repair_plans": [_remove_plan("b2", PROMOTION + "。")],
+            "repair_plan_error": None,
+        }
+
+    monkeypatch.setattr("app.services.pipeline._make_llm", lambda config: object())
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", always_wrong)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"NEEDS_REVIEW": 1}
+    assert len(replanner_calls) == 2
+    assert len(calls) == 1
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert PROMOTION in article["body_html"]
+    finally:
+        conn.close()
+
+
+def test_followup_does_not_plan_for_non_dirt_problems(app, monkeypatch) -> None:
+    """后续轮只剩标题/事实类问题时不调用规划器，照旧转人工、正文不改。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    _fetch(monkeypatch, [_item("followup-semantic-only", body=MULTI_ROUND_BODY)])
+    semantic_only = _repairable_dirty([])
+    semantic_only["decision"] = "manual_review"
+    semantic_only["issues"]["dirty_content"] = []
+    semantic_only["issues"]["semantic_problems"] = ["标题与正文主体不一致，需人工确认"]
+    calls = _sequenced_evaluate(monkeypatch, [
+        _repairable_dirty([_remove_plan("b3", PROMOTION)]),
+        semantic_only,
+    ])
+
+    def unexpected_planner(**kwargs):
+        raise AssertionError("非脏内容问题不应进入局部修复规划")
+
+    monkeypatch.setattr("app.services.pipeline._make_llm", lambda config: object())
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", unexpected_planner)
+
+    result = run_once(_config(database))
+
+    assert result["status_counts"] == {"NEEDS_REVIEW": 1}
+    assert len(calls) == 2
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["body_html"] == MULTI_ROUND_BODY
+        assert article["title_final"] == TITLE
+    finally:
+        conn.close()
