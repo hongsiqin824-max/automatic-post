@@ -465,6 +465,47 @@ class _RemovalVerifier:
             "error": result.get("error"),
         }
 
+    def last_fact_rejection(self) -> dict[str, Any] | None:
+        """Return the latest model verdict that a deletion would drop a fact."""
+
+        for record in reversed(self.records):
+            if (
+                record.get("channel") == "fact_verification"
+                and record.get("safe") is False
+                and not record.get("error")
+                and record.get("verifier_reason")
+            ):
+                return record
+        return None
+
+
+REMOVAL_VERIFICATION_ERROR = "AI 删除内容未通过信息保全核验"
+
+
+def _replan_feedback(error: Any, verifier: "_RemovalVerifier") -> str | None:
+    """Return the validation error to hand to a re-plan, or ``None`` if none is allowed.
+
+    Besides locator/format errors, an information-preservation rejection may
+    be re-planned: the verifier's reason tells the model which fact sits inside
+    the fragment, so it can delete only the promotional part.  The narrower
+    plan goes through the same verifier again, so a re-plan cannot widen the
+    edit past the safety gate.
+    """
+
+    if _repair_validation_error_allows_replan(error):
+        return str(error)
+    if str(error or "") != REMOVAL_VERIFICATION_ERROR:
+        return None
+    rejection = verifier.last_fact_rejection()
+    if rejection is None:
+        return None
+    return (
+        f"{REMOVAL_VERIFICATION_ERROR}：被删片段「{str(rejection.get('removed_text') or '')[:120]}」"
+        f"含有事实信息（{str(rejection.get('verifier_reason') or '')[:200]}）。"
+        "请缩小删除范围：只删除其中的推广、引流或格式残留部分，用 replace_text 保留时间、日期、比分、"
+        "人名等事实；无法把事实和推广分开时返回 repairable=false。"
+    )
+
 
 def _repair_fingerprint(body: str) -> dict[str, Any]:
     return {
@@ -751,7 +792,7 @@ def _replan_followup_round(
     if planner_llm is None:
         return body, [], validation_error, None
     record: dict[str, Any] = {
-        "trigger_error": str(validation_error)[:300] if validation_error else None,
+        "trigger_error": str(validation_error)[:600] if validation_error else None,
         "rejected_plans": _audit_repair_plans(rejected_plans),
     }
     try:
@@ -1186,13 +1227,13 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
             ai_body_after, ai_plan_matches, ai_plan_error = apply_repair_plan(
                 body_before, repair_plans, verifier=removal_verifier
             )
-            # 定位或格式类校验错误可以带着错误原因重新规划。第一次重规划常因同类定位
-            # 失误再次失败，因此最多重规划 MAX_AI_REPAIR_ROUNDS - 1 次，每次都把最新的
-            # 校验错误和被拒计划交给模型。安全类拒绝不在白名单内，不会进入这里。
+            # 定位、格式类校验错误，以及信息保全核验拒绝（附核验理由），都可以带着错误
+            # 原因重新规划。最多重规划 MAX_AI_REPAIR_ROUNDS - 1 次，每次都把最新的校验
+            # 错误和被拒计划交给模型；新计划仍要过同一套逐字校验和信息保全核验。
             replan_attempts = 0
             while (
                 replan_attempts < MAX_AI_REPAIR_ROUNDS - 1
-                and _repair_validation_error_allows_replan(ai_plan_error)
+                and _replan_feedback(ai_plan_error, removal_verifier) is not None
                 and (
                     first_quality.get("decision") == "repairable"
                     or _quality_allows_body_repair_planning(first_quality)
@@ -1203,7 +1244,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     break
                 replan_attempts += 1
                 rejected_plans = [dict(item) for item in repair_plans]
-                trigger_error = str(ai_plan_error)[:300]
+                trigger_error = str(_replan_feedback(ai_plan_error, removal_verifier))[:600]
                 try:
                     replanner_result = plan_local_repair(
                         title=current.get("title_final", ""),
@@ -1695,11 +1736,7 @@ def _process_article(article: dict[str, Any], config: AppConfig, connection) -> 
                     second_quality.get("repair_plans"),
                     verifier=removal_verifier,
                 )
-                replan_trigger = (
-                    round_error
-                    if _repair_validation_error_allows_replan(round_error)
-                    else None
-                )
+                replan_trigger = _replan_feedback(round_error, removal_verifier)
             elif _quality_allows_followup_replanning(second_quality):
                 round_plans = []
                 round_body, round_matches, round_error = body_after, [], None

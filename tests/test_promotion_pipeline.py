@@ -2383,9 +2383,25 @@ def test_pipeline_keeps_body_when_fact_verification_declines(app, monkeypatch) -
             "reason": "被删片段含删除后无法找回的信息",
         },
     )
+    replanner_calls: list[dict] = []
+
+    def declining_replanner(**kwargs):
+        replanner_calls.append(kwargs)
+        return {
+            "repairable": False,
+            "reason": "事实与无关内容无法分开",
+            "repair_plans": [],
+            "repair_plan_error": None,
+        }
+
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", declining_replanner)
 
     run_once(_llm_config(database))
 
+    # 核验拒绝后带着核验理由重新规划一次；规划器放弃时仍保持 fail-closed。
+    assert len(replanner_calls) == 1
+    assert "被删片段含删除后无法找回的信息" in replanner_calls[0]["validation_error"]
+    assert EXTRANEOUS_FRAGMENT[:20] in replanner_calls[0]["validation_error"]
     conn = _connect(database)
     try:
         article = repo.list_articles(conn)[0]
@@ -2393,8 +2409,81 @@ def test_pipeline_keeps_body_when_fact_verification_declines(app, monkeypatch) -
         assert article["body_html"] == body
         repair = article["quality"]["promotion_repair"]
         assert repair["applied"] is False
-        assert repair["plan_error"] == "AI 删除内容未通过信息保全核验"
+        assert repair["plan_error"] == "AI 重新规划未提供可执行的局部修复计划"
+        assert repair["repair_replanner"]["trigger_error"].startswith(
+            "AI 删除内容未通过信息保全核验"
+        )
         assert repair["removal_verification"][0]["safe"] is False
+    finally:
+        conn.close()
+
+
+def test_fact_rejection_replan_keeps_fact_and_removes_only_promotion(
+    app, monkeypatch
+) -> None:
+    """核验因夹带开球时间拒绝整段删除后，缩小范围的新计划应能通过并保留时间。"""
+
+    database = app.config["DATABASE"]
+    _enable_source(database)
+    news = "拜仁将在周末客场挑战多特蒙德，双方目前积分相同"
+    promo = "（周日13:30，在kicker直播！）"
+    body = f"<p>{news}{promo}</p>{IMAGE}"
+    _fetch(monkeypatch, [_item("fact-rejection-narrow", body=body)])
+    first = _dirty_with_repair_plan([{
+        "block_id": "b1",
+        "action": "replace_text",
+        "evidence": news + promo,
+        "after": news,
+        "issue_type": "media_promotion",
+        "reason": "段尾括号内为直播推广",
+        "confidence": 0.98,
+    }])
+    answers = iter([first, deepcopy(SECOND_PASS)])
+    monkeypatch.setattr("app.services.pipeline.evaluate", lambda **kwargs: next(answers))
+    verified: list[str] = []
+
+    def fake_verification(**kwargs):
+        removed = kwargs["removed_text"]
+        verified.append(removed)
+        if "13:30" in removed:
+            return {"safe": False, "loses_fact": True, "confidence": 0.95,
+                    "reason": "被删片段包含开球时间“周日13:30”"}
+        return {"safe": True, "loses_fact": False, "confidence": 0.97, "reason": "仅为直播推广"}
+
+    monkeypatch.setattr("app.services.pipeline.verify_removal_keeps_facts", fake_verification)
+    replanner_calls: list[dict] = []
+
+    def narrowing_replanner(**kwargs):
+        replanner_calls.append(kwargs)
+        return {
+            "repairable": True,
+            "reason": "只删直播推广，保留开球时间",
+            "repair_plans": [{
+                "block_id": "b1",
+                "action": "replace_text",
+                "evidence": news + promo,
+                "after": news + "（周日13:30）",
+                "issue_type": "media_promotion",
+                "reason": "删除括号内的直播推广，保留开球时间",
+                "confidence": 0.98,
+            }],
+            "repair_plan_error": None,
+        }
+
+    monkeypatch.setattr("app.services.pipeline.plan_local_repair", narrowing_replanner)
+
+    run_once(_llm_config(database))
+
+    assert len(replanner_calls) == 1
+    assert "开球时间" in replanner_calls[0]["validation_error"]
+    conn = _connect(database)
+    try:
+        article = repo.list_articles(conn)[0]
+        assert article["status"] == "READY_TO_PUBLISH"
+        assert "周日13:30" in article["body_html"]
+        assert "kicker直播" not in article["body_html"]
+        assert news in article["body_html"]
+        assert IMAGE in article["body_html"]
     finally:
         conn.close()
 
@@ -2422,6 +2511,15 @@ def test_failed_repair_retries_after_rule_version_bump(app, monkeypatch) -> None
     monkeypatch.setattr(
         "app.services.pipeline.verify_removal_keeps_facts",
         lambda **kwargs: {"safe": False, "loses_fact": True, "confidence": 0.95, "reason": "保守拒绝"},
+    )
+    monkeypatch.setattr(
+        "app.services.pipeline.plan_local_repair",
+        lambda **kwargs: {
+            "repairable": False,
+            "reason": "无法缩小删除范围",
+            "repair_plans": [],
+            "repair_plan_error": None,
+        },
     )
 
     run_once(_llm_config(database))

@@ -828,10 +828,11 @@ def plan_local_repair(
                 if item.get(key) is not None
             })
         retry_context = (
-            "这是重新规划。上一次计划未通过程序定位校验，"
+            "这是重新规划。上一次计划未通过程序校验。如果是定位错误，"
             "请根据校验错误重新选择下方当前正文中真实存在的 block_id、segment_id、link_id 或 empty_block_id，"
-            "不得再次使用不存在的目标，也不得扩大修改范围。\n"
-            f"上次校验错误：{str(validation_error)[:300]}\n"
+            "不得再次使用不存在的目标；如果是信息保全核验未通过，说明被删片段里夹着事实，"
+            "只能缩小删除范围、保留事实，不得改写事实。任何情况下都不得扩大修改范围。\n"
+            f"上次校验错误：{str(validation_error)[:600]}\n"
             f"上次计划：{json.dumps(rejected_summary, ensure_ascii=False)[:1800]}\n"
         )
     prompt = (
