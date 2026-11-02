@@ -303,6 +303,13 @@ class AppConfig:
     feishu_app_secret: str = os.getenv("FEISHU_APP_SECRET", "").strip()
     feishu_spreadsheet_token: str = os.getenv("FEISHU_SPREADSHEET_TOKEN", "").strip()
     feishu_api_timeout_seconds: int = max(5, _env_int("FEISHU_API_TIMEOUT_SECONDS", 30))
+    # 审核页飞书登录，复用上面的 FEISHU_APP_ID/SECRET（企业自建应用，只有本企业
+    # 成员能授权）。回调地址须与飞书后台「重定向 URL」完全一致；https 开头时
+    # 登录 cookie 会带 Secure 标记。TENANT_KEY 可选，填了再额外核对一次企业。
+    feishu_login_enabled: bool = _env_bool("FEISHU_LOGIN_ENABLED", False)
+    feishu_login_redirect_uri: str = os.getenv("FEISHU_LOGIN_REDIRECT_URI", "").strip()
+    feishu_login_tenant_key: str = os.getenv("FEISHU_LOGIN_TENANT_KEY", "").strip()
+    feishu_login_session_days: int = max(1, _env_int("FEISHU_LOGIN_SESSION_DAYS", 7))
 
     # 栏目标签白名单：每天从 StarRocks 按「进行中赛季」拉取各联赛的球队/球员
     # 标签，写进本地表后在提交懂球帝前把文章标签过滤到所属栏目联赛的范围内，

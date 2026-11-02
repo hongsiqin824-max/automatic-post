@@ -458,6 +458,14 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .error-actions { display: flex; gap: 8px; margin-top: 22px; }
 .error-state > small { margin-top: 28px; font-size: 10px; }
 
+.login-page { display: grid; place-items: center; min-height: 100vh; margin: 0; background: var(--bg, #f4f6f8); }
+.login-card { display: grid; justify-items: center; gap: 14px; width: min(360px, calc(100vw - 32px)); margin: 0; padding: 36px 28px; text-align: center; }
+.login-card h1 { margin: 0; font-size: 20px; }
+.login-card p { margin: 0; font-size: 13px; }
+.sidebar-user { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; color: #b5c4cf; font-size: 11px; }
+.sidebar-user a { color: #8596a4; }
+.sidebar-user a:hover { color: #dae3ea; }
+
 .flash-stack { display: grid; gap: 8px; margin-bottom: 17px; }
 .flash { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); color: var(--ink-soft); font-size: 12px; }
 .flash svg { width: 16px; height: 16px; }

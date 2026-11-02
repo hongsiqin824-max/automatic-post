@@ -18,6 +18,8 @@ os.environ["AUTOMATIC_POST_PUBLISHER"] = "true"
 os.environ["DQD_OPEN_APPID"] = "test-appid"
 os.environ["DQD_OPEN_APPSECRET"] = "test-appsecret"
 os.environ["DQD_OPEN_ENNAME"] = "test-enname"
+# 服务器 .env 会开启飞书登录；其余测试不关心登录，统一关掉，登录测试自行打开。
+os.environ["FEISHU_LOGIN_ENABLED"] = "false"
 
 from app.web import create_app  # noqa: E402
 

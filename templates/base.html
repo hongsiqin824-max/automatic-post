@@ -50,6 +50,12 @@
             <strong>{% if settings is defined and settings.scheduler_enabled %}自动任务运行中{% else %}自动任务已暂停{% endif %}</strong>
           </span>
         </div>
+        {% if current_user %}
+        <div class="sidebar-user">
+          <span>{{ current_user.name }}</span>
+          <a href="{{ url_for('logout') }}">退出</a>
+        </div>
+        {% endif %}
       </div>
     </aside>
 

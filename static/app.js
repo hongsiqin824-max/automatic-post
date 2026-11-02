@@ -34,6 +34,10 @@
     if (raw) {
       try { data = JSON.parse(raw); } catch { data = { message: raw }; }
     }
+    if (response.status === 401 && data.login_required) {
+      window.location.href = `/login?next=${encodeURIComponent(window.location.pathname + window.location.search)}`;
+      throw new Error("登录已失效，正在跳转登录");
+    }
     if (!response.ok || data.success === false) {
       throw new Error(data.error || data.message || `请求失败（${response.status}）`);
     }

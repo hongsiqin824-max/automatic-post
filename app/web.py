@@ -5,17 +5,18 @@ from __future__ import annotations
 import html
 import json
 import os
+import secrets
 import sqlite3
 from urllib.parse import urlparse
 
 import requests as _requests
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from flask import Flask, abort, jsonify, render_template, request
+from flask import Flask, abort, jsonify, redirect, render_template, request, session, url_for
 
 from . import db, repository as repo
 from .catalog import seed_catalog
@@ -51,6 +52,7 @@ from .services.publisher import (
     create_draft_for_article,
 )
 from .services.preview_html import sanitize_preview_html
+from .services.feishu_login import FeishuLoginError, build_authorize_url, fetch_login_user
 from .services.source_report import SourceReportController, SourceReportScheduler
 from .services.quality import NON_COMPETITION_LABEL, html_to_text
 from .statuses import STATUS_LABELS
@@ -787,6 +789,10 @@ def create_app(test_config: dict | None = None) -> Flask:
         SECRET_KEY=_secret_key,
         DATABASE=cfg.database_path,
         TESTING=bool(test_config and test_config.get("TESTING")),
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=cfg.feishu_login_redirect_uri.startswith("https://"),
+        PERMANENT_SESSION_LIFETIME=timedelta(days=cfg.feishu_login_session_days),
     )
     if test_config:
         app.config.update(test_config)
@@ -1060,6 +1066,86 @@ def create_app(test_config: dict | None = None) -> Flask:
         return fallback
 
     app.jinja_env.globals["safe_back_url"] = _safe_back_url
+
+    # 飞书登录：开启后除下列端点外一律要求登录。页面跳登录，接口返回 401。
+    _LOGIN_EXEMPT_ENDPOINTS = {"static", "health", "login", "feishu_login_callback", "logout"}
+
+    def _login_redirect_uri() -> str:
+        cfg: AppConfig = app.extensions["app_config"]
+        return cfg.feishu_login_redirect_uri or url_for("feishu_login_callback", _external=True)
+
+    def _safe_next(value: str | None) -> str:
+        if value and value.startswith("/") and not value.startswith("//") and "\\" not in value:
+            return value
+        return url_for("dashboard")
+
+    @app.before_request
+    def require_login():
+        cfg: AppConfig = app.extensions["app_config"]
+        if not cfg.feishu_login_enabled or request.endpoint in _LOGIN_EXEMPT_ENDPOINTS:
+            return None
+        if session.get("user"):
+            return None
+        if request.path.startswith("/api/"):
+            return jsonify({"success": False, "error": "登录已失效，请刷新页面重新登录", "login_required": True}), 401
+        next_url = request.full_path.rstrip("?") if request.method == "GET" else None
+        return redirect(url_for("login", next=next_url))
+
+    @app.context_processor
+    def inject_current_user():
+        cfg: AppConfig = app.extensions["app_config"]
+        return {"current_user": session.get("user") if cfg.feishu_login_enabled else None}
+
+    def _login_error(message: str, status: int):
+        return render_template("login.html", message=message), status
+
+    @app.get("/login")
+    def login():
+        cfg: AppConfig = app.extensions["app_config"]
+        next_url = _safe_next(request.args.get("next"))
+        if not cfg.feishu_login_enabled or session.get("user"):
+            return redirect(next_url)
+        if not (cfg.feishu_app_id and cfg.feishu_app_secret):
+            return _login_error("服务器未配置飞书应用（FEISHU_APP_ID / FEISHU_APP_SECRET）。", 500)
+        state = secrets.token_urlsafe(24)
+        session["login_state"] = state
+        session["login_next"] = next_url
+        return redirect(build_authorize_url(cfg.feishu_app_id, _login_redirect_uri(), state))
+
+    @app.get("/auth/feishu/callback")
+    def feishu_login_callback():
+        cfg: AppConfig = app.extensions["app_config"]
+        expected_state = session.pop("login_state", None)
+        next_url = _safe_next(session.pop("login_next", None))
+        code = request.args.get("code", "")
+        if not code:
+            return _login_error("你取消了飞书授权。", 400)
+        if not expected_state or not secrets.compare_digest(expected_state, request.args.get("state", "")):
+            return _login_error("登录请求已过期或无效，请重新登录。", 400)
+        try:
+            user = fetch_login_user(
+                cfg.feishu_app_id,
+                cfg.feishu_app_secret,
+                code,
+                _login_redirect_uri(),
+                timeout=cfg.feishu_api_timeout_seconds,
+            )
+        except FeishuLoginError as exc:
+            app.logger.warning("飞书登录失败：%s", exc)
+            return _login_error(str(exc), 502)
+        if cfg.feishu_login_tenant_key and user["tenant_key"] != cfg.feishu_login_tenant_key:
+            app.logger.warning("非本企业飞书账号尝试登录：%s", user["tenant_key"])
+            return _login_error("只允许本企业飞书账号登录。", 403)
+        session.clear()
+        session.permanent = True
+        session["user"] = {"open_id": user["open_id"], "name": user["name"]}
+        app.logger.info("飞书登录：%s (%s)", user["name"], user["open_id"])
+        return redirect(next_url)
+
+    @app.get("/logout")
+    def logout():
+        session.clear()
+        return render_template("login.html", message="已退出登录。", logged_out=True)
 
     @app.context_processor
     def inject_navigation_context():

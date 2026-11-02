@@ -111,6 +111,9 @@ if [[ -n "$DOMAIN" ]]; then
   step "安装 Nginx 反向代理 $DOMAIN → 127.0.0.1:$PORT"
   if ! command -v nginx >/dev/null; then
     red "! 未安装 nginx。Ubuntu: sudo apt install nginx；CentOS/Rocky: sudo dnf install nginx。装好后重跑本脚本"
+  elif [[ -f "/etc/nginx/conf.d/${SERVICE}.conf" ]]; then
+    # 线上配置已被 certbot 改过（443 + 证书），用模板覆盖会把 HTTPS 弄丢。
+    green "✓ /etc/nginx/conf.d/${SERVICE}.conf 已存在，保留不覆盖（要重建请先手动删除）"
   else
     sed -e "s#__DOMAIN__#${DOMAIN}#g" -e "s#__PORT__#${PORT}#g" deploy/nginx-automatic-post.conf \
       | $SUDO tee "/etc/nginx/conf.d/${SERVICE}.conf" >/dev/null

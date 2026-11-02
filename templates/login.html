@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>登录 · 文章质检台</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body class="login-page">
+  <section class="panel login-card">
+    <h1>文章质检台</h1>
+    <p class="muted">{{ message }}</p>
+    <a class="button button-primary" href="{{ url_for('login') }}">{% if logged_out %}重新登录{% else %}使用飞书重新登录{% endif %}</a>
+  </section>
+</body>
+</html>
