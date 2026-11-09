@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Optional
 
+from .catalog import EXCLUDED_BACKEND_TAB_IDS
 from .db import get_db, _prepare_connection
 from .origin_identity import source_origin_key
 from .services.article_images import _usable_image_src
@@ -1547,8 +1548,10 @@ GENERIC_SOURCE_BACKEND_TAB_ID = 58
 # abandon target, so neither should ever be submitted. No source maps them
 # anymore, but articles ingested while they were still routed keep the mapping
 # in article_tabs, so publish-time reads filter them out instead of trusting
-# the stored mapping to be clean.
-NON_PUBLISHABLE_BACKEND_TAB_IDS = frozenset({GENERIC_SOURCE_BACKEND_TAB_ID, 12})
+# the stored mapping to be clean. 「转会」/「世界杯」见 EXCLUDED_BACKEND_TAB_IDS。
+NON_PUBLISHABLE_BACKEND_TAB_IDS = frozenset(
+    {GENERIC_SOURCE_BACKEND_TAB_ID, 12, *EXCLUDED_BACKEND_TAB_IDS}
+)
 
 
 def is_publishable_tab(tab: Mapping[str, Any]) -> bool:
@@ -1637,7 +1640,8 @@ def list_guard_candidate_tabs(connection=None) -> list[dict]:
     the name to go on. The generic「精选」column is excluded because it is not an
     event column — every article keeps it alongside its event column, so
     offering it would let the classifier "reassign" an article to where it
-    already is.
+    already is. 「转会」/「世界杯」also never appear: every article is kept out
+    of them, so the classifier must not pick them either.
 
     Switched-off columns stay in the list on purpose. The classifier should be
     able to say "this is a CBA story" even while CBA is paused; the article is
@@ -1646,11 +1650,12 @@ def list_guard_candidate_tabs(connection=None) -> list[dict]:
     """
 
     conn = _conn(connection)
+    excluded = sorted({GENERIC_SOURCE_BACKEND_TAB_ID, *EXCLUDED_BACKEND_TAB_IDS})
     return _rows(conn.execute(
         "SELECT * FROM tabs "
         "WHERE TRIM(COALESCE(ai_league_guard_definition,'')) <> '' "
-        "AND backend_tab_id <> ? ORDER BY id",
-        (GENERIC_SOURCE_BACKEND_TAB_ID,),
+        f"AND backend_tab_id NOT IN ({','.join('?' * len(excluded))}) ORDER BY id",
+        excluded,
     ).fetchall())
 
 

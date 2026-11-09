@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 import requests
 
+from ..catalog import EXCLUDED_BACKEND_TAB_IDS
 from ..config import AppConfig
 from .article_images import (
     ArticleImageError,
@@ -68,14 +69,22 @@ class DqdOpenDraftResult:
 def _backend_tab_ids(tabs: Mapping[str, Any] | Iterable[Mapping[str, Any]]) -> list[int]:
     values = [tabs] if isinstance(tabs, Mapping) else list(tabs)
     result: list[int] = []
+    excluded = False
     for tab in values:
         backend_tab_id = tab.get("backend_tab_id")
         if backend_tab_id in (None, ""):
             raise DqdOpenClientError("栏目未绑定后台 tab，不能创建草稿")
         numeric = int(backend_tab_id)
+        # 发布侧（publisher._current_tabs）已经去掉了；这里是提交前最后一道兜底，
+        # 防止以后新加的提交路径绕过它。
+        if numeric in EXCLUDED_BACKEND_TAB_IDS:
+            excluded = True
+            continue
         if numeric not in result:
             result.append(numeric)
     if not result:
+        if excluded:
+            raise DqdOpenClientError("文章只挂了世界杯 / 转会栏目，这两个栏目一律不发，不能创建草稿")
         raise DqdOpenClientError("文章未配置栏目，不能创建草稿")
     return result
 
@@ -128,8 +137,13 @@ def build_create_article_form(
         raise DqdOpenClientError("正文为空，不能创建草稿")
     # Materialize iterables once because the same tab rows are needed for the
     # backend IDs and for selecting the primary fallback cover.
-    normalized_tabs = tabs if isinstance(tabs, Mapping) else list(tabs)
+    normalized_tabs = [tabs] if isinstance(tabs, Mapping) else list(tabs)
     backend_tab_ids = _backend_tab_ids(normalized_tabs)
+    # 世界杯 / 转会不提交，也不能拿它们配的兜底封面。上面已校验过每个 ID 都能转 int。
+    normalized_tabs = [
+        tab for tab in normalized_tabs
+        if int(tab["backend_tab_id"]) not in EXCLUDED_BACKEND_TAB_IDS
+    ]
 
     publish_status = status if status is not None else config.dqd_open_status
     if isinstance(publish_status, bool):

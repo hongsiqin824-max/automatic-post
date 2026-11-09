@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 
+# 「转会」(110)、「世界杯」(114) 两个后台栏目：所有稿件一律不进（用户 11-09 定）。
+# 配置或旧映射即使挂上了，提交前也会去掉，AI 改挂也不会选它们；只挂了它们的文章按
+# 「仅绑定不可发布栏目」拦下。下面种子里仍保留这两行（只影响全新库），留着 ID 对照。
+EXCLUDED_BACKEND_TAB_IDS = frozenset({110, 114})
+
+
 # ``backend_tab_id`` values are the IDs used by the DQD publishing backend.
 DEFAULT_TABS = (
     {"backend_tab_id": 1, "name": "头条"},

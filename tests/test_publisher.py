@@ -182,6 +182,110 @@ def test_create_article_form_submits_all_unique_backend_tabs(app):
     assert [value for key, value in form if key == "tabs[]"] == ["58", "349"]
 
 
+def test_create_article_form_drops_world_cup_and_transfer_tabs(app):
+    """世界杯(114)、转会(110) 一律不发；转会话题也不能出现在表单里（用户 11-09 定）。"""
+
+    config = _open_config(":memory:")
+    article = {
+        "title_final": "混挂世界杯和转会栏目的文章",
+        "body_html": "<p>完整正文，信息充分。</p>",
+        "litpic": "/fastdfs8/cover.jpg",
+        "channels": [],
+        # 上游哪怕带了话题，我们也不转发。
+        "archivetopic": "转会",
+    }
+
+    form = build_create_article_form(
+        article,
+        [
+            {"backend_tab_id": 110},
+            {"backend_tab_id": 349},
+            {"backend_tab_id": 114},
+        ],
+        config,
+    )
+
+    assert [value for key, value in form if key == "tabs[]"] == ["349"]
+    assert not [key for key, _ in form if key == "archivetopic"]
+
+
+def test_create_article_form_ignores_world_cup_and_transfer_fallback_cover(app):
+    """文章没图时用栏目兜底封面，转会 / 世界杯栏目配的那张不能被拿来用。"""
+
+    config = _open_config(":memory:")
+    article = {
+        "title_final": "没有封面的文章",
+        "body_html": "<p>完整正文，信息充分。</p>",
+        "litpic": "",
+        "channels": [],
+    }
+
+    form = build_create_article_form(
+        article,
+        [
+            {"backend_tab_id": 110, "fallback_litpic": "https://cdn.example.com/transfer.jpg"},
+            {"backend_tab_id": 349, "fallback_litpic": "https://cdn.example.com/jleague.jpg"},
+        ],
+        config,
+    )
+
+    assert ("litpic", "https://cdn.example.com/jleague.jpg") in form
+
+
+def test_create_article_form_rejects_only_world_cup_or_transfer_tabs(app):
+    config = _open_config(":memory:")
+    article = {
+        "title_final": "只挂了世界杯和转会栏目的文章",
+        "body_html": "<p>完整正文，信息充分。</p>",
+        "litpic": "/fastdfs8/cover.jpg",
+        "channels": [],
+    }
+
+    with pytest.raises(DqdOpenClientError, match="世界杯 / 转会"):
+        build_create_article_form(
+            article, [{"backend_tab_id": 110}, {"backend_tab_id": 114}], config
+        )
+
+
+def test_publish_ready_article_never_submits_world_cup_or_transfer_tab(app, monkeypatch):
+    submitted: list[list[int]] = []
+
+    class FakeClient:
+        def __init__(self, config):
+            self.config = config
+
+        def create_article(self, article, tabs, **kwargs):
+            values = [tabs] if isinstance(tabs, dict) else list(tabs)
+            submitted.append([tab["backend_tab_id"] for tab in values])
+            return DqdOpenDraftResult(
+                archive_id=3806677,
+                payload={"code": 0, "data": {"archive_id": 3806677}},
+                request_url="https://platform.dongqiudi.com/open/v1/do",
+                form_fields=[("tabs[]", "349")],
+            )
+
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", FakeClient)
+    with app.app_context():
+        tabs_by_backend_id = {
+            tab["backend_tab_id"]: tab for tab in repo.list_tabs()
+        }
+        article = repo.upsert_material(_ready_article())["article"]
+        repo.assign_article_tabs(
+            article["id"],
+            [
+                tabs_by_backend_id[110]["id"],
+                tabs_by_backend_id[349]["id"],
+                tabs_by_backend_id[114]["id"],
+            ],
+        )
+        repo.transition_status(article["id"], "READY_TO_PUBLISH")
+
+        result = publish_ready_articles(_open_config(app.config["DATABASE"]), get_db())
+
+    assert result["draft_created"] == 1
+    assert submitted == [[349]]
+
+
 def test_publish_ready_article_passes_all_snapshot_tabs(app, monkeypatch):
     class FakeClient:
         def __init__(self, config):
@@ -250,11 +354,21 @@ def test_publish_ready_article_never_submits_featured_tab(app, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("backend_tab_id", "tab_name"), [(58, "精选"), (12, "法甲")]
+    ("backend_tab_id", "tab_name"),
+    [(58, "精选"), (12, "法甲"), (110, "转会"), (114, "世界杯")],
 )
 def test_publish_ready_article_with_only_blocked_tab_is_mapping_blocked(
-    app, backend_tab_id, tab_name
+    app, monkeypatch, backend_tab_id, tab_name
 ):
+    class _NoSubmitClient:
+        def __init__(self, config):
+            self.config = config
+
+        def create_article(self, article, tabs, **kwargs):
+            raise AssertionError("只挂了不可发布栏目的文章不该提交")
+
+    # 拦截失效时也不能真的打到开放平台。
+    monkeypatch.setattr("app.services.publisher.DqdOpenClient", _NoSubmitClient)
     with app.app_context():
         blocked = {
             tab["backend_tab_id"]: tab for tab in repo.list_tabs()
@@ -2741,6 +2855,21 @@ def test_guard_candidate_tabs_keep_disabled_but_drop_generic_and_undefined(app):
     assert "无定义栏目" not in names
     # 停用栏目仍是合法的归档目标。
     assert "停用栏目" in names
+
+
+def test_guard_candidate_tabs_exclude_world_cup_and_transfer(app):
+    """AI 改挂不能选世界杯 / 转会：所有稿都不进这两个栏目，写了判定说明也一样。"""
+
+    with app.app_context():
+        conn = get_db()
+        for backend_id in (110, 114):
+            tab = repo.get_tab_by_backend_id(backend_id, conn)
+            repo.update_tab(tab["id"], conn, ai_league_guard_definition="判定说明")
+        backend_ids = {
+            row["backend_tab_id"] for row in repo.list_guard_candidate_tabs(conn)
+        }
+
+    assert not backend_ids & {110, 114}
 
 
 def _routed_article(conn, marker_code: str, tab_id: int, *, ai_guard_enabled: bool):

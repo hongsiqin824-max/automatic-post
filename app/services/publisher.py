@@ -196,7 +196,7 @@ def _existing_draft_result(
 def _current_tabs(article: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the columns that may be submitted for *article*.
 
-    Non-publishable columns (「精选」/「法甲」) are dropped here so a legacy
+    Non-publishable columns (「精选」/「法甲」/「转会」/「世界杯」) are dropped here so a legacy
     mapping left on an article ingested before those columns stopped being
     routed can never be sent to the backend.
 
